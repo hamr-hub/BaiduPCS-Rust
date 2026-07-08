@@ -929,17 +929,47 @@ impl NetdiskClient {
         page: u32,
         page_size: u32,
     ) -> Result<FileListResponse> {
-        info!("获取文件列表: dir={}, page={}", dir, page);
+        // 默认按文件名升序（保持既有行为）
+        self.get_file_list_ordered(dir, page, page_size, "name", false)
+            .await
+    }
+
+    /// 获取文件列表（可指定排序）
+    ///
+    /// # 参数
+    /// * `order` - 排序字段：`name`（文件名）/ `time`（修改时间）/ `size`（大小）
+    /// * `desc` - `true` 降序，`false` 升序
+    ///
+    /// 说明：`order` / `desc` 由百度 `xpan/file?method=list` 接口原生支持。
+    pub async fn get_file_list_ordered(
+        &self,
+        dir: &str,
+        page: u32,
+        page_size: u32,
+        order: &str,
+        desc: bool,
+    ) -> Result<FileListResponse> {
+        info!(
+            "获取文件列表: dir={}, page={}, order={}, desc={}",
+            dir, page, order, desc
+        );
 
         let url = "https://pan.baidu.com/rest/2.0/xpan/file";
+
+        // 仅允许百度支持的三个排序字段，其余回退到 name
+        let order = match order {
+            "time" | "size" | "name" => order,
+            _ => "name",
+        };
+        let desc_str = if desc { "1" } else { "0" };
 
         let response = self
             .client
             .get(url)
             .query(&[
                 ("method", "list"),
-                ("order", "name"),
-                ("desc", "0"),
+                ("order", order),
+                ("desc", desc_str),
                 ("showempty", "0"),
                 ("web", "1"),
                 ("page", &page.to_string()),

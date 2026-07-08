@@ -67,16 +67,23 @@ export interface CreateFolderData {
   isdir: number
 }
 
+/** 网盘排序字段（百度接口支持的三个） */
+export type FileSortOrder = 'name' | 'time' | 'size'
+
 /**
  * 获取文件列表
+ * @param order 排序字段：name/time/size（由百度接口原生支持）
+ * @param desc 是否降序
  */
 export async function getFileList(
     dir: string = '/',
     page: number = 1,
-    pageSize: number = 50
+    pageSize: number = 50,
+    order: FileSortOrder = 'name',
+    desc: boolean = false
 ): Promise<FileListData> {
   const response = await apiClient.get<ApiResponse<FileListData>>('/files', {
-    params: { dir, page, page_size: pageSize }
+    params: { dir, page, page_size: pageSize, order, desc }
   })
 
   if (response.data.code !== 0 || !response.data.data) {

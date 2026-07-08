@@ -220,10 +220,12 @@
           style="width: 100%"
           @row-click="handleRowClick"
           @selection-change="handleSelectionChange"
+          @sort-change="handleSortChange"
+          :default-sort="{ prop: 'server_filename', order: 'ascending' }"
           :row-class-name="getRowClassName"
       >
         <el-table-column type="selection" width="55" />
-        <el-table-column label="文件名" min-width="400">
+        <el-table-column label="文件名" min-width="400" prop="server_filename" sortable="custom">
           <template #default="{ row }">
             <div class="file-name" :title="(row.is_encrypted || row.is_encrypted_folder) ? `加密${row.isdir === 1 ? '文件夹' : '文件'}: ${row.server_filename}` : ''">
               <el-icon :size="20" class="file-icon">
@@ -238,14 +240,14 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="大小" width="120">
+        <el-table-column label="大小" width="120" prop="size" sortable="custom">
           <template #default="{ row }">
             <span v-if="row.isdir === 0">{{ formatFileSize(row.size) }}</span>
             <span v-else>-</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="修改时间" width="180">
+        <el-table-column label="修改时间" width="180" prop="server_mtime" sortable="custom">
           <template #default="{ row }">
             {{ formatTime(row.server_mtime) }}
           </template>
@@ -493,6 +495,7 @@ import {
   type FileItem,
   type FileOperationItem,
   type FileOperationOutcomeDto,
+  type FileSortOrder,
 } from '@/api/file'
 import NetdiskFolderPickerModal from '@/components/NetdiskFolderPickerModal.vue'
 import {useIsMobile} from '@/utils/responsive'
@@ -529,6 +532,9 @@ const fileList = ref<FileItem[]>([])
 const currentDir = ref('/')
 const currentPage = ref(1)
 const hasMore = ref(true)
+// 排序状态（透传给百度接口：name/time/size + 升降序）
+const sortOrder = ref<FileSortOrder>('name')
+const sortDesc = ref(false)
 const fileListRef = ref<HTMLElement | null>(null)
 const downloadingFolders = ref<Set<string>>(new Set())
 const createFolderDialogVisible = ref(false)
@@ -620,7 +626,7 @@ async function loadFiles(dir: string, append: boolean = false) {
   const requestPage = append ? currentPage.value + 1 : 1
 
   try {
-    const data = await getFileList(dir, requestPage, 50)
+    const data = await getFileList(dir, requestPage, 50, sortOrder.value, sortDesc.value)
     if (version !== fileRequestVersion) return
 
     if (append) {
@@ -644,6 +650,21 @@ async function loadFiles(dir: string, append: boolean = false) {
       loadingMore.value = false
     }
   }
+}
+
+// 表头排序变化（服务端排序，重新从第一页加载）
+const SORT_PROP_MAP: Record<string, FileSortOrder> = {
+  server_filename: 'name',
+  size: 'size',
+  server_mtime: 'time',
+}
+function handleSortChange({ prop, order }: { prop: string; order: 'ascending' | 'descending' | null }) {
+  // 搜索模式下不改变排序（搜索结果由搜索接口返回）
+  if (isSearchMode.value) return
+  // order 为 null（取消排序）时回退到默认：文件名升序
+  sortOrder.value = order ? (SORT_PROP_MAP[prop] ?? 'name') : 'name'
+  sortDesc.value = order === 'descending'
+  loadFiles(currentDir.value)
 }
 
 // 加载下一页

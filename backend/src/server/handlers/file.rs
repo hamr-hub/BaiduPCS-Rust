@@ -25,10 +25,20 @@ pub struct FileListQuery {
     /// 每页数量
     #[serde(default = "default_page_size")]
     pub page_size: u32,
+    /// 排序字段：name（文件名）/ time（修改时间）/ size（大小）
+    #[serde(default = "default_order")]
+    pub order: String,
+    /// 是否降序（true=降序）
+    #[serde(default)]
+    pub desc: bool,
 }
 
 fn default_dir() -> String {
     "/".to_string()
+}
+
+fn default_order() -> String {
+    "name".to_string()
 }
 
 fn default_page() -> u32 {
@@ -92,9 +102,15 @@ pub async fn get_file_list(
         }
     };
 
-    // 获取文件列表
+    // 获取文件列表（透传百度支持的排序参数）
     match client
-        .get_file_list(&params.dir, params.page, params.page_size)
+        .get_file_list_ordered(
+            &params.dir,
+            params.page,
+            params.page_size,
+            &params.order,
+            params.desc,
+        )
         .await
     {
         Ok(file_list) => {

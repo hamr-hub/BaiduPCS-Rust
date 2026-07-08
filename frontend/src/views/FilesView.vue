@@ -530,6 +530,8 @@ const loading = ref(false)
 const loadingMore = ref(false)
 const fileList = ref<FileItem[]>([])
 const currentDir = ref('/')
+// 正在加载（非追加）中的目标目录，用于目录点击防连点（同一目标加载中忽略重复点击）
+const pendingDir = ref<string | null>(null)
 const currentPage = ref(1)
 const hasMore = ref(true)
 // 排序状态（透传给百度接口：name/time/size + 升降序）
@@ -609,6 +611,14 @@ function getPathUpTo(index: number): string {
   return '/' + parts.join('/')
 }
 
+// 归一化目录路径用于比较：去掉末尾多余斜杠（根目录 "/" 除外），
+// 避免未来后端返回带尾斜杠等格式差异导致的字符串相等判断误差
+function normalizeDirPath(p: string): string {
+  if (!p) return '/'
+  const trimmed = p.replace(/\/+$/, '')
+  return trimmed === '' ? '/' : trimmed
+}
+
 // 加载文件列表
 async function loadFiles(dir: string, append: boolean = false) {
   if (append && (loadingMore.value || !hasMore.value)) return
@@ -618,6 +628,10 @@ async function loadFiles(dir: string, append: boolean = false) {
     loadingMore.value = true
   } else {
     loading.value = true
+    pendingDir.value = dir
+    // 切换目录/刷新时，清掉可能残留的分页 loading，避免被上一目录的在途分页请求
+    // 卡住（其回调因版本过期而不再复位 loadingMore）
+    loadingMore.value = false
     currentPage.value = 1
     hasMore.value = true
   }
@@ -630,6 +644,9 @@ async function loadFiles(dir: string, append: boolean = false) {
     if (version !== fileRequestVersion) return
 
     if (append) {
+      // 防御：追加结果必须仍属于当前目录，避免旧目录的分页请求覆盖/污染已跳转的目录
+      // 使用归一化比较，兼容潜在的尾斜杠等路径格式差异
+      if (normalizeDirPath(dir) !== normalizeDirPath(currentDir.value)) return
       fileList.value = [...fileList.value, ...data.list]
     } else {
       fileList.value = data.list
@@ -648,6 +665,7 @@ async function loadFiles(dir: string, append: boolean = false) {
     if (version === fileRequestVersion) {
       loading.value = false
       loadingMore.value = false
+      if (!append) pendingDir.value = null
     }
   }
 }
@@ -669,7 +687,9 @@ function handleSortChange({ prop, order }: { prop: string; order: 'ascending' | 
 
 // 加载下一页
 async function loadNextPage() {
-  if (loadingMore.value || !hasMore.value) return
+  // loading 为 true 表示正在切换目录/刷新（首屏加载中），此时 currentDir 仍是旧值，
+  // 不能触发分页，否则会用旧目录发出 page+1 请求并覆盖掉目录跳转结果
+  if (loading.value || loadingMore.value || !hasMore.value) return
   await loadFiles(currentDir.value, true)
 }
 
@@ -690,6 +710,15 @@ function handleScroll(event: Event) {
 
 // 导航到目录
 function navigateToDir(dir: string) {
+  // 防连点：同一目标目录正在加载中时忽略重复点击；
+  // 切换到不同目录仍允许（正确性由请求版本号保证，取最新结果）
+  if (
+      loading.value &&
+      pendingDir.value !== null &&
+      normalizeDirPath(dir) === normalizeDirPath(pendingDir.value)
+  ) {
+    return
+  }
   if (isSearchMode.value) {
     resetSearchState()
   }

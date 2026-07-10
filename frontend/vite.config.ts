@@ -1,9 +1,19 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
+import { readFileSync } from 'node:fs'
+
+// 版本号唯一来源：package.json。编译期注入到全局常量 __APP_VERSION__，
+// 前端界面统一引用它，避免在多个组件里硬编码版本号。
+const pkg = JSON.parse(
+    readFileSync(fileURLToPath(new URL('./package.json', import.meta.url)), 'utf-8')
+)
 
 // https://vitejs.dev/config/
 export default defineConfig({
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version)
+  },
   plugins: [vue()],
   resolve: {
     alias: {

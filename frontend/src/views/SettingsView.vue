@@ -871,7 +871,7 @@
                     </div>
                     <div class="about-item">
                       <span class="label">版本:</span>
-                      <span class="value">v2.1.2</span>
+                      <span class="value">{{ APP_VERSION_LABEL }}</span>
                     </div>
                     <div class="about-item">
                       <span class="label">后端技术:</span>
@@ -950,6 +950,7 @@ import { ref, reactive, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { useIsMobile } from '@/utils/responsive'
+import { APP_VERSION_LABEL } from '@/utils/version'
 import { useConfigStore } from '@/stores/config'
 import type { AppConfig, ProxyType, ProxyRuntimeStatus } from '@/api/config'
 import { getRecommendedConfig, resetToRecommended, getProxyStatus, testProxyConnection } from '@/api/config'

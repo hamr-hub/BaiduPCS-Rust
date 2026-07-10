@@ -17,6 +17,29 @@
         />
       </div>
       <div class="header-right">
+        <!-- 排序控件 -->
+        <div class="sort-control">
+          <el-select
+              v-model="sortField"
+              size="default"
+              class="sort-select"
+              :teleported="false"
+          >
+            <el-option
+                v-for="opt in sortOptions"
+                :key="opt.value"
+                :label="opt.label"
+                :value="opt.value"
+            />
+          </el-select>
+          <el-button
+              :title="sortOrder === 'asc' ? '升序' : '降序'"
+              @click="toggleSortOrder"
+          >
+            <el-icon><SortUp v-if="sortOrder === 'asc'"/><SortDown v-else/></el-icon>
+            <span v-if="!isMobile">{{ sortOrder === 'asc' ? '升序' : '降序' }}</span>
+          </el-button>
+        </div>
         <el-button @click="refreshTasks" :circle="isMobile">
           <el-icon><Refresh/></el-icon>
           <span v-if="!isMobile">刷新</span>
@@ -50,11 +73,25 @@
       </div>
     </div>
 
+    <!-- 状态筛选栏 -->
+    <div class="status-filter-bar">
+      <el-radio-group v-model="statusFilter" size="default">
+        <el-radio-button
+            v-for="opt in statusFilterOptions"
+            :key="opt.value"
+            :value="opt.value"
+        >
+          {{ opt.label }}
+          <span class="status-count">{{ statusFilterCounts[opt.value] }}</span>
+        </el-radio-button>
+      </el-radio-group>
+    </div>
+
     <!-- 下载任务列表 -->
     <div class="task-container">
       <el-empty
           v-if="!loading && displayedItems.length === 0"
-          :description="ownerFilter === null ? '暂无下载任务' : '当前过滤条件下暂无下载任务'"
+          :description="(ownerFilter === null && statusFilter === 'all') ? '暂无下载任务' : '当前过滤条件下暂无下载任务'"
       />
 
       <div v-else class="task-list">
@@ -420,6 +457,8 @@ import {
   Lock,
   Unlock,
   ArrowDown,
+  SortUp,
+  SortDown,
 } from '@element-plus/icons-vue'
 import {useRouter, useRoute} from 'vue-router'
 import {useIsMobile} from '@/utils/responsive'
@@ -438,6 +477,51 @@ import type {DownloadEvent, FolderEvent} from '@/types/events'
 // 多账号状态
 const authStore = useAuthStore()
 const ownerFilter = ref<number | null>(null)
+
+// 排序控件状态
+type SortField = 'created_at' | 'name' | 'size' | 'progress' | 'status' | 'speed'
+const sortField = ref<SortField>('created_at')
+const sortOrder = ref<'asc' | 'desc'>('desc')
+const sortOptions: { label: string; value: SortField }[] = [
+  { label: '创建时间', value: 'created_at' },
+  { label: '名称', value: 'name' },
+  { label: '大小', value: 'size' },
+  { label: '进度', value: 'progress' },
+  { label: '状态', value: 'status' },
+  { label: '速度', value: 'speed' },
+]
+function toggleSortOrder() {
+  sortOrder.value = sortOrder.value === 'asc' ? 'desc' : 'asc'
+}
+
+// 状态筛选控件
+type StatusFilter = 'all' | 'active' | 'waiting' | 'completed' | 'failed'
+const statusFilter = ref<StatusFilter>('all')
+const statusFilterOptions: { label: string; value: StatusFilter }[] = [
+  { label: '全部', value: 'all' },
+  { label: '下载中', value: 'active' },
+  { label: '等待中', value: 'waiting' },
+  { label: '已完成', value: 'completed' },
+  { label: '失败', value: 'failed' },
+]
+// 把细分状态归入筛选分组
+function statusGroup(status?: string): Exclude<StatusFilter, 'all'> | 'other' {
+  switch (status) {
+    case 'downloading':
+    case 'scanning':
+    case 'decrypting':
+      return 'active'
+    case 'pending':
+    case 'paused':
+      return 'waiting'
+    case 'completed':
+      return 'completed'
+    case 'failed':
+      return 'failed'
+    default:
+      return 'other'
+  }
+}
 
 // 路由
 const router = useRouter()
@@ -498,10 +582,100 @@ const hasActiveTasks = computed(() => {
   })
 })
 
-// 多账号过滤后的展示列表
-const displayedItems = computed(() => {
+// 排序时状态的排列优先级（进行中的排前面）
+const STATUS_SORT_RANK: Record<string, number> = {
+  downloading: 0,
+  scanning: 1,
+  decrypting: 2,
+  pending: 3,
+  paused: 4,
+  failed: 5,
+  completed: 6,
+}
+
+// 提取用于排序的名称
+function sortName(item: DownloadItemFromBackend): string {
+  if (item.type === 'folder') {
+    return (item.name || getFilename(item.remote_root || item.local_root || '')).toLowerCase()
+  }
+  return getDisplayFilename(item).toLowerCase()
+}
+
+// 提取用于排序的进度（0-1）
+function sortProgress(item: DownloadItemFromBackend): number {
+  if (item.type === 'folder') {
+    const total = item.total_files || 0
+    if (total <= 0) return 0
+    return (item.completed_files || 0) / total
+  }
+  const total = item.total_size || 0
+  if (total <= 0) return 0
+  return (item.downloaded_size || 0) / total
+}
+
+// 单个排序字段的比较值
+function sortValue(item: DownloadItemFromBackend, field: SortField): number | string {
+  switch (field) {
+    case 'name':
+      return sortName(item)
+    case 'size':
+      return item.total_size || 0
+    case 'progress':
+      return sortProgress(item)
+    case 'speed':
+      return item.speed || 0
+    case 'status':
+      return STATUS_SORT_RANK[item.status ?? ''] ?? 99
+    case 'created_at':
+    default:
+      return item.created_at || 0
+  }
+}
+
+// 仅按账号过滤后的列表（状态筛选与计数的基准）
+const accountFilteredItems = computed(() => {
   if (ownerFilter.value === null) return downloadItems.value
   return downloadItems.value.filter((item) => item.owner_uid === ownerFilter.value)
+})
+
+// 各状态分组的数量（基于账号过滤后的列表）
+const statusFilterCounts = computed<Record<StatusFilter, number>>(() => {
+  const counts: Record<StatusFilter, number> = {
+    all: 0, active: 0, waiting: 0, completed: 0, failed: 0,
+  }
+  for (const item of accountFilteredItems.value) {
+    counts.all++
+    const g = statusGroup(item.status)
+    if (g !== 'other') counts[g]++
+  }
+  return counts
+})
+
+// 多账号 + 状态过滤后再排序的展示列表
+const displayedItems = computed(() => {
+  const base = accountFilteredItems.value
+  const filtered = statusFilter.value === 'all'
+      ? base
+      : base.filter((item) => statusGroup(item.status) === statusFilter.value)
+
+  const field = sortField.value
+  const dir = sortOrder.value === 'asc' ? 1 : -1
+  // 复制一份再排序，避免直接改动源数组
+  return [...filtered].sort((a, b) => {
+    const va = sortValue(a, field)
+    const vb = sortValue(b, field)
+    let cmp: number
+    if (typeof va === 'string' && typeof vb === 'string') {
+      cmp = va.localeCompare(vb, 'zh-Hans-CN')
+    } else {
+      cmp = (va as number) - (vb as number)
+    }
+    // 主排序值相等时用创建时间倒序作为稳定的次级排序
+    if (cmp === 0 && field !== 'created_at') {
+      cmp = ((b.created_at || 0) - (a.created_at || 0)) * dir
+    }
+    return cmp * dir
+  })
 })
 
 // 每个账号的任务数
@@ -1585,8 +1759,47 @@ onUnmounted(() => {
 
   .header-right {
     display: flex;
+    align-items: center;
     gap: 10px;
   }
+
+  .sort-control {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+
+    .sort-select {
+      width: 110px;
+    }
+  }
+}
+
+// 移动端：排序下拉收窄
+.downloads-container.is-mobile .toolbar .sort-control .sort-select {
+  width: 92px;
+}
+
+.status-filter-bar {
+  background: white;
+  border-bottom: 1px solid #e0e0e0;
+  padding: 10px 20px;
+  overflow-x: auto;
+  white-space: nowrap;
+
+  .status-count {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 0 5px;
+    border-radius: 8px;
+    font-size: 11px;
+    line-height: 16px;
+    background: rgba(0, 0, 0, 0.06);
+    color: inherit;
+  }
+}
+
+.downloads-container.is-mobile .status-filter-bar {
+  padding: 8px 12px;
 }
 
 .task-container {

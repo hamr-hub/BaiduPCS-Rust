@@ -25,11 +25,13 @@ use crate::share_sync::events::{
 use crate::share_sync::executor::{
     ApplyOutcome, ExecutorHooks, NetdiskTargetEntry, ShareSyncExecutor,
 };
-use crate::share_sync::persistence::ShareSyncPersistence;
+use crate::share_sync::persistence::{
+    ShareSyncPersistence, RUN_PHASE_DIFFING, RUN_PHASE_EXECUTING, RUN_PHASE_SCANNING,
+};
 use crate::share_sync::resolver::ShareSyncAccountResolver;
 use crate::share_sync::scheduler::SubscriptionScheduler;
 use crate::share_sync::snapshot::{
-    CapturedShare, ShareSnapshot, ShareSnapshotItem, SnapshotCollector,
+    CapturedShare, ScanCache, ScanProgressSink, ShareSnapshot, ShareSnapshotItem, SnapshotCollector,
 };
 use crate::share_sync::types::{ConflictStrategy, RunStatus};
 use crate::transfer::{TransferManager, TransferStatus};
@@ -37,6 +39,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -830,7 +833,59 @@ impl ShareSyncManager {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1000);
         let mut snapshot_attempt: u32 = 0;
+
+        // 跨「整轮重试」复用的目录缓存：只在**本次 run** 内有效。
+        // 让重试从「整棵树重爬」退化成「续爬剩余目录」——大分享一轮几百个目录、
+        // 上百秒，重爬既慢又因请求量翻倍更容易再次撞限流。
+        let scan_cache = Arc::new(ScanCache::new());
+
+        // 抓取阶段的进度广播：`RunStarted` 到 `DiffDetected` 之间是最长的一段静默，
+        // 没有它前端只能一直显示「运行中」，用户会以为卡死。
+        //
+        // 节流约 500ms 一帧：几百个目录逐个回调会刷爆 WS。用 Mutex<Instant> 记上次
+        // 发送时间，回调是同步闭包（在抓取的 async 上下文里被调），不能阻塞。
+        let scan_attempt = Arc::new(AtomicU32::new(1));
+        let scan_sink: ScanProgressSink = {
+            let publisher = Arc::clone(&self.publisher);
+            let run_id_for_sink = run_id.clone();
+            let sub_id_for_sink = id.to_string();
+            let attempt_for_sink = Arc::clone(&scan_attempt);
+            let last_emit = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+            Arc::new(move |p: crate::share_sync::snapshot::ScanProgress| {
+                {
+                    let mut guard = match last_emit.lock() {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    let now = std::time::Instant::now();
+                    if let Some(prev) = *guard {
+                        if now.duration_since(prev) < std::time::Duration::from_millis(500) {
+                            return;
+                        }
+                    }
+                    *guard = Some(now);
+                }
+                publisher.publish(ShareSyncEvent::ScanProgress {
+                    run_id: run_id_for_sink.clone(),
+                    subscription_id: sub_id_for_sink.clone(),
+                    dirs_done: p.dirs_done,
+                    dirs_pending: p.dirs_pending,
+                    files_seen: p.files_seen,
+                    current_dir: p.current_dir,
+                    attempt: attempt_for_sink.load(Ordering::Relaxed),
+                    cached_hits: p.cached_hits,
+                    owner_uid,
+                });
+            })
+        };
+
+        // 阶段落库：WS 断线 / 页面刷新后，REST 轮询仍能显示「扫描目录中」。
+        let _ = self
+            .persistence
+            .update_run_phase(&run_id, RUN_PHASE_SCANNING);
+
         let (captured, curr_snapshot) = loop {
+            scan_attempt.store(snapshot_attempt + 1, Ordering::Relaxed);
             let attempt_result = match SnapshotCollector::from_url(
                 netdisk.as_ref(),
                 &sub.share_url,
@@ -840,9 +895,14 @@ impl ShareSyncManager {
                 // 列目录抓快照与转存提交共用同一个全局风控限速器
                 self.rate_limiter.clone(),
             )
-            .await
+                .await
             {
-                Ok(collector) => collector.collect().await.map_err(|e| ("抓取失败", e)),
+                Ok(collector) => collector
+                    .with_progress(Arc::clone(&scan_sink))
+                    .with_cache(Arc::clone(&scan_cache))
+                    .collect()
+                    .await
+                    .map_err(|e| ("抓取失败", e)),
                 Err(e) => Err(("抓取初始化失败", e)),
             };
 
@@ -851,13 +911,15 @@ impl ShareSyncManager {
                 Err((stage, e)) if e.should_retry() && snapshot_attempt < snapshot_max_retries => {
                     let backoff = snapshot_base_delay_ms.saturating_mul(1u64 << snapshot_attempt);
                     warn!(
-                        "share-sync: {} 临时失败，{}ms 后重试 subscription={} run_id={} attempt={}/{} err={}",
+                        "share-sync: {} 临时失败，{}ms 后重试 subscription={} run_id={} attempt={}/{} cached_dirs={} err={}",
                         stage,
                         backoff,
                         id,
                         run_id,
                         snapshot_attempt + 1,
                         snapshot_max_retries,
+                        // 已缓存的目录数 = 下一轮可跳过的请求数，用来观察续爬是否生效
+                        scan_cache.len(),
                         e
                     );
                     if backoff > 0 {
@@ -874,6 +936,7 @@ impl ShareSyncManager {
         };
         // 成功抓取到分享内容 → 链接可用，归零失效计数（如曾标记失效也清除）。
         self.clear_link_failure(id);
+        let _ = self.persistence.update_run_phase(&run_id, RUN_PHASE_DIFFING);
 
         // 2) 绑定 subscription_id 后，先读"上次成功应用的快照"再计算 diff。
         //    当前快照必须等执行成功后才能推进基线；否则下载/转存失败会把
@@ -901,6 +964,9 @@ impl ShareSyncManager {
         });
 
         // 4) 执行
+        let _ = self
+            .persistence
+            .update_run_phase(&run_id, RUN_PHASE_EXECUTING);
         // 启动「子任务进度广播器」：run 期间约 1s 推一次 ItemProgress（走 share_sync 频道，
         // 不与自动备份 / 下载管理混淆）。run 结束后 abort。前端 WS 实时刷，REST 轮询兜底。
         let progress_handle = {
@@ -2028,8 +2094,8 @@ impl ExecutorHooks for ProductionHooks {
                     .collect();
                 let paused_resume_due = !paused_subtasks.is_empty()
                     && last_paused_resume_at
-                        .map(|last| now.duration_since(last) >= Duration::from_secs(10))
-                        .unwrap_or(true);
+                    .map(|last| now.duration_since(last) >= Duration::from_secs(10))
+                    .unwrap_or(true);
                 if paused_resume_due {
                     last_paused_resume_at = Some(now);
                     let restarted =

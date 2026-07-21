@@ -34,12 +34,12 @@ pub use manager::{
 };
 pub use persistence::{
     normalize_pagination, RunItemRecord, RunRecord, ShareSyncPersistence, DEFAULT_PAGE_SIZE,
-    MAX_PAGE_SIZE,
+    MAX_PAGE_SIZE, RUN_PHASE_DIFFING, RUN_PHASE_EXECUTING, RUN_PHASE_SCANNING,
 };
 pub use resolver::{ShareSyncAccountResolver, StaticAccountResolver};
 pub use snapshot::{
-    infer_share_root, normalize_share_path, CapturedShare, ShareSnapshot, ShareSnapshotItem,
-    SnapshotCollector,
+    infer_share_root, normalize_share_path, CapturedShare, ScanCache, ScanProgress,
+    ScanProgressSink, ShareSnapshot, ShareSnapshotItem, SnapshotCollector,
 };
 pub use types::{
     ConflictStrategy, DiffSummary, PollMode, RunItemStatus, RunStatus, SyncAction, TargetKind,

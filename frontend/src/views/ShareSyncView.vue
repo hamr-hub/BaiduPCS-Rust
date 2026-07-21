@@ -112,8 +112,43 @@
             </div>
           </div>
 
+          <!-- 抓取（递归列目录）阶段进度。
+               这一段在 run_started 到 diff_detected 之间，大分享可长达数分钟且
+               此前没有任何反馈，用户只能看到「运行中」并以为程序卡死 —— 这里把
+               目录扫描的实时计数摊开，重试时还会明确告知是网络在抖。 -->
+          <div v-if="scanOf(s.id)" class="active-task-container">
+            <div class="active-task-card">
+              <div class="task-progress-header">
+                <div class="task-status-info">
+                  <el-icon :size="16" class="status-icon text-blue-500"><Loading class="is-loading" /></el-icon>
+                  <span class="task-status-text">扫描分享目录中…</span>
+                </div>
+                <span class="scan-stat">{{ scanSummary(scanOf(s.id)!) }}</span>
+              </div>
+              <div class="scan-body">
+                <!-- BFS 边扫边发现新子目录，待扫描数会涨；给百分比会让进度条倒退，
+                     比没有进度更糟，所以固定用 indeterminate 动画表示「在动」。 -->
+                <el-progress
+                    :percentage="100"
+                    :stroke-width="6"
+                    :show-text="false"
+                    :indeterminate="true"
+                    :duration="1"
+                />
+                <div class="scan-current" :title="scanOf(s.id)!.current_dir">
+                  当前：{{ scanTail(scanOf(s.id)!.current_dir) }}
+                </div>
+                <div v-if="scanOf(s.id)!.attempt > 1" class="scan-retry">
+                  网络异常，正在第 {{ scanOf(s.id)!.attempt }} 次重试<span
+                    v-if="scanOf(s.id)!.cached_hits > 0"
+                >（已扫描过的 {{ scanOf(s.id)!.cached_hits }} 个目录直接复用，不会重爬）</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <!-- 进行中子任务（内联展示，无需展开；转存段 / 下载段各自独立进度条） -->
-          <div v-if="subtasksOf(s.id).length" class="active-task-container">
+          <div v-else-if="subtasksOf(s.id).length" class="active-task-container">
             <div class="active-task-card">
               <div class="task-progress-header is-toggle" @click.stop="toggleSubtasks(s.id)">
                 <div class="task-status-info">
@@ -331,7 +366,7 @@
       <div v-if="currentRun" class="run-detail">
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="状态">
-            <el-tag :type="runStatusType(currentRun.status)">{{ describeRunStatus(currentRun.status) }}</el-tag>
+            <el-tag :type="runStatusType(currentRun.status)">{{ describeRunStatus(currentRun.status, currentRun.phase) }}</el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="开始时间">{{ formatTime(currentRun.started_at) }}</el-descriptions-item>
           <el-descriptions-item label="结束时间">
@@ -384,7 +419,7 @@
             :type="runStatusType(r.status)"
         >
           <div @click="openRun(r.id)" class="run-item">
-            <strong>{{ describeRunStatus(r.status) }}</strong>
+            <strong>{{ describeRunStatus(r.status, r.phase) }}</strong>
             <div class="run-stats">
               总 {{ runTotalCount(r) }} / 需处理 {{ runChangedCount(r) }}
               <span> +{{ r.added_count }}</span>
@@ -494,6 +529,74 @@ const activeSubtasks = ref<Map<string, ShareSyncSubtask[]>>(new Map())
 
 function subtasksOf(id: string): ShareSyncSubtask[] {
   return activeSubtasks.value.get(id) ?? []
+}
+
+// ==================== 抓取阶段进度 ====================
+
+/**
+ * 抓取阶段进度：subscription_id -> 最近一帧 scan_progress。
+ *
+ * 纯 WS 驱动、不持久化——它只在扫描进行中有意义。WS 断线或页面刷新导致这里为空时，
+ * 由 run 记录上的 `phase` 字段兜底（见 `describeRunStatus`），用户至少还能看到
+ * 「扫描目录中」而不是裸的「运行中」。
+ */
+type ScanProgressState = {
+  run_id: string
+  dirs_done: number
+  dirs_pending: number
+  files_seen: number
+  current_dir: string
+  attempt: number
+  cached_hits: number
+  /** 本地收到该帧的时间戳，用于剔除「run 已死但结束事件没送达」的僵尸卡片 */
+  received_at: number
+}
+const scanProgress = ref<Map<string, ScanProgressState>>(new Map())
+
+function scanOf(id: string): ScanProgressState | undefined {
+  return scanProgress.value.get(id)
+}
+
+function setScanProgress(id: string, st: Omit<ScanProgressState, 'received_at'> | null) {
+  const next = new Map(scanProgress.value)
+  if (st) next.set(id, { ...st, received_at: Date.now() })
+  else next.delete(id)
+  scanProgress.value = next
+}
+
+// 后端每 ~500ms 推一帧；超过 20s 没有新帧，说明 run 早已结束或断连，
+// 而结束事件没送达（WS 掉线等）。留着会让卡片永远转圈，比没有进度更误导。
+const SCAN_STALE_MS = 20_000
+let scanStaleTimer: ReturnType<typeof setInterval> | null = null
+
+function pruneStaleScanProgress() {
+  if (scanProgress.value.size === 0) return
+  const now = Date.now()
+  const next = new Map(scanProgress.value)
+  let changed = false
+  for (const [k, v] of next) {
+    if (now - v.received_at > SCAN_STALE_MS) {
+      next.delete(k)
+      changed = true
+    }
+  }
+  if (changed) scanProgress.value = next
+}
+
+/** 计数式摘要。刻意不给百分比：BFS 的待扫描数会边扫边涨，百分比只会倒退。 */
+function scanSummary(p: ScanProgressState): string {
+  const parts = [`已扫描 ${p.dirs_done} 个目录`]
+  if (p.dirs_pending > 0) parts.push(`待扫描 ${p.dirs_pending}`)
+  parts.push(`发现 ${p.files_seen} 个文件`)
+  return parts.join(' · ')
+}
+
+/** 深目录路径只留末两级，避免把卡片撑爆；完整路径挂在 title 上。 */
+function scanTail(dir: string): string {
+  if (!dir) return '/'
+  const segs = dir.split('/').filter(Boolean)
+  if (segs.length <= 2) return '/' + segs.join('/')
+  return '…/' + segs.slice(-2).join('/')
 }
 
 // 子任务列表默认折叠（几千文件时不铺满卡片）；按订阅记忆展开态。
@@ -994,6 +1097,7 @@ async function removeSubscription(s?: ShareSubscription) {
       runs.value = []
     }
     activeSubtasks.value.delete(target.id)
+    setScanProgress(target.id, null)
     await refresh()
   } catch (e) {
     ElMessage.error(`删除失败: ${getApiErrorMessage(e)}`)
@@ -1156,7 +1260,23 @@ function strategyTagType(s: ConflictStrategy): 'success' | 'warning' | 'info' {
   return s === 'overwrite' ? 'success' : s === 'versioned' ? 'warning' : 'info'
 }
 
-function describeRunStatus(s: string): string {
+/**
+ * 运行中 run 的阶段文案。
+ *
+ * 之所以要落到 run 记录上而不是只靠 WS：`scan_progress` 是瞬时事件，页面刷新或
+ * WS 断线重连后就没了，只靠它用户又会退回看到裸的「运行中」。
+ */
+const RUN_PHASE_LABELS: Record<string, string> = {
+  scanning: '扫描目录中',
+  diffing: '计算差异中',
+  executing: '转存/下载中',
+}
+
+function describeRunStatus(s: string, phase?: string | null): string {
+  // 仅运行中的 run 展示阶段；终态 run 后端会把 phase 置空，这里再兜一层。
+  if (s === 'running' && phase && RUN_PHASE_LABELS[phase]) {
+    return RUN_PHASE_LABELS[phase]
+  }
   return s === 'running' ? '运行中' :
       s === 'completed' ? '已完成' :
           s === 'completed_with_errors' ? '完成（部分失败）' :
@@ -1440,6 +1560,18 @@ onMounted(async () => {
       })
       return
     }
+    if (evt.type === 'scan_progress') {
+      setScanProgress(sid, {
+        run_id: evt.run_id,
+        dirs_done: evt.dirs_done,
+        dirs_pending: evt.dirs_pending,
+        files_seen: evt.files_seen,
+        current_dir: evt.current_dir,
+        attempt: evt.attempt,
+        cached_hits: evt.cached_hits,
+      })
+      return
+    }
     if (['subscription_created', 'subscription_updated', 'subscription_deleted', 'status_changed'].includes(evt.type)) {
       refresh()
       return
@@ -1447,12 +1579,18 @@ onMounted(async () => {
     if (evt.type === 'run_started') {
       // 新一轮开始：清掉旧的进度残留，随后由 item_progress / 轮询补齐
       loadSubtasksFor(sid)
+      setScanProgress(sid, null)
+    }
+    if (evt.type === 'diff_detected') {
+      // 抓取阶段结束，进入执行段：撤掉扫描卡片，让位给子任务进度
+      setScanProgress(sid, null)
     }
     if (['run_completed', 'run_failed'].includes(evt.type)) {
-      // 一轮结束：清空该订阅的进行中子任务
+      // 一轮结束：清空该订阅的进行中子任务与扫描进度
       const next = new Map(activeSubtasks.value)
       next.delete(sid)
       activeSubtasks.value = next
+      setScanProgress(sid, null)
     }
     if (sid === selected.value?.id) {
       if (['run_started', 'run_completed', 'run_failed', 'diff_detected'].includes(evt.type)) {
@@ -1466,6 +1604,9 @@ onMounted(async () => {
   }
   unsubWs = ws.onShareSyncEvent(handler)
 
+  // 抓取进度是纯 WS 驱动的瞬时状态，需要定时剔除断连留下的僵尸卡片
+  scanStaleTimer = setInterval(pruneStaleScanProgress, 5000)
+
   // 连接状态：断线时启动轮询兜底，恢复后停止并刷新一次进行中子任务
   unsubConnState = ws.onConnectionStateChange((state: ConnectionState) => {
     const wasConnected = wsConnected.value
@@ -1473,6 +1614,13 @@ onMounted(async () => {
     updateSubtaskPolling()
     if (!wasConnected && wsConnected.value) {
       loadSubtasksForAll()
+      // 断连期间的扫描进度必然已过期；清掉等新帧，避免显示陈旧计数。
+      // 期间的展示由 run 记录的 phase 兜底。
+      scanProgress.value = new Map()
+    }
+    if (!wsConnected.value) {
+      // 断线立即丢弃：没有新帧还继续转圈会让用户以为仍在扫描
+      scanProgress.value = new Map()
     }
   })
   updateSubtaskPolling()
@@ -1482,6 +1630,10 @@ onUnmounted(() => {
   unsubWs?.()
   unsubConnState?.()
   subtaskPoller.stop()
+  if (scanStaleTimer) {
+    clearInterval(scanStaleTimer)
+    scanStaleTimer = null
+  }
 })
 </script>
 
@@ -1641,6 +1793,32 @@ onUnmounted(() => {
     min-width: 0;
   }
   .subtask-stat { font-size: 12px; color: #909399; flex-shrink: 0; }
+}
+
+// ===== 抓取（递归列目录）阶段进度 =====
+// 计数摘要靠右，与头部标题同一行
+.scan-stat {
+  margin-left: auto;
+  font-size: 12px;
+  color: #909399;
+  flex-shrink: 0;
+}
+.scan-body {
+  padding: 4px 12px 12px;
+}
+.scan-current {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #909399;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+// 重试提示用告警色：让用户一眼看出是网络在抖，而不是程序卡死
+.scan-retry {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #e6a23c;
 }
 
 .no-active-task {

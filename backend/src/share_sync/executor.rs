@@ -1268,6 +1268,33 @@ impl<'a> ShareSyncExecutor<'a> {
         if indices.is_empty() {
             return Ok(());
         }
+
+        // 过滤安全：抓快照时被 include/exclude 剔除了后代的目录（`subtree_pruned`）**不能**
+        // 当作单个目录 fs_id 整体提交 —— 百度服务端会按 fs_id 递归复制整目录，把被过滤的
+        // 子项也搬过去（过滤形同虚设）。这里在提交前迭代展开：把每个 pruned 目录替换为它
+        // 存活的子节点（被过滤的子项已不在 tree 中，自然跳过），直到工作集里不再有 pruned
+        // 目录。干净的兄弟子树仍保持"整目录 fs_id 高效转存"，只有含被过滤分支的目录才被
+        // 拆到子节点粒度。用迭代（而非递归）实现，避免消耗二分递归的 depth 预算。
+        let indices: Vec<usize> = {
+            let mut resolved: Vec<usize> = Vec::with_capacity(indices.len());
+            let mut queue: std::collections::VecDeque<usize> = indices.into_iter().collect();
+            while let Some(idx) = queue.pop_front() {
+                let n = tree.get(idx);
+                if n.is_dir && n.subtree_pruned && !n.is_placeholder() {
+                    // 展开到子节点；若该目录被过滤后已无存活子节点，则什么都不加（整目录跳过）。
+                    for &c in &n.children {
+                        queue.push_back(c);
+                    }
+                } else {
+                    resolved.push(idx);
+                }
+            }
+            resolved
+        };
+        if indices.is_empty() {
+            return Ok(());
+        }
+
         let items_to_submit = tree_mod::nodes_to_items(tree, &indices);
         if items_to_submit.is_empty() {
             // 全是 placeholder — 降级按叶子提交
@@ -2771,6 +2798,99 @@ mod tests {
             g.push((fs_ids, paths, dir.to_path_buf()));
             Ok(id)
         }
+    }
+
+    /// 回归：含被 exclude/include 剔除后代的目录（subtree_pruned=true）不得被整目录
+    /// fs_id 直传（否则百度会递归复制整目录、连带把被过滤子项搬过去）；干净的兄弟
+    /// 子目录仍应保持整目录高效转存。
+    #[test]
+    fn test_pruned_dir_not_transferred_wholesale_but_clean_children_are() {
+        let dir = tempdir().unwrap();
+        let s = {
+            let mut s = sub();
+            s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/dest".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            })];
+            s
+        };
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+
+        // 模拟抓快照后的结果：/root 因其后代 /root/00 被 exclude 剔除而标记 pruned；
+        // 被排除的 /root/00 子树不在快照里；干净子目录 /root/01、/root/02 各含 1 个文件。
+        let mut root = ShareSnapshotItem::new("/root", "root", 1, 0, true);
+        root.subtree_pruned = true;
+        let d01 = ShareSnapshotItem::new("/root/01", "01", 10, 0, true);
+        let f1 = item("/root/01/a.mp4", 11, 100);
+        let d02 = ShareSnapshotItem::new("/root/02", "02", 20, 0, true);
+        let f2 = item("/root/02/b.mp4", 21, 200);
+        let curr = ShareSnapshot::with_items(&s.id, vec![root, d01, f1, d02, f2]);
+
+        let diff = diff_snapshots(None, &curr);
+        let hooks = MockHooks::default();
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+        let outcome = futures::executor::block_on(ex.apply_with_run_id_tree(
+            "run-prune".into(),
+            &captured(),
+            &diff,
+        ));
+        assert_eq!(outcome.status, RunStatus::Completed);
+
+        let submitted: Vec<u64> = hooks
+            .batch_transfers
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(_, ids, _)| ids.clone())
+            .collect();
+        // 关键：pruned 父目录 /root(fs_id=1) 绝不能被整目录直传
+        assert!(
+            !submitted.contains(&1),
+            "pruned 父目录被整目录直传了: {:?}",
+            submitted
+        );
+        // 干净子目录应各自被整目录提交
+        assert!(submitted.contains(&10), "clean dir /root/01 未被转存: {:?}", submitted);
+        assert!(submitted.contains(&20), "clean dir /root/02 未被转存: {:?}", submitted);
+    }
+
+    /// pruned 目录若其后代也被逐层剔除、最终无存活子节点，则整目录被跳过（不提交）。
+    #[test]
+    fn test_fully_excluded_pruned_dir_submits_nothing() {
+        let dir = tempdir().unwrap();
+        let s = {
+            let mut s = sub();
+            s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/dest".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            })];
+            s
+        };
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+
+        // /root 标记 pruned，但其所有子项都被排除（快照里只剩它自己这个壳）。
+        let mut root = ShareSnapshotItem::new("/root", "root", 1, 0, true);
+        root.subtree_pruned = true;
+        let curr = ShareSnapshot::with_items(&s.id, vec![root]);
+
+        let diff = diff_snapshots(None, &curr);
+        let hooks = MockHooks::default();
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+        let outcome = futures::executor::block_on(ex.apply_with_run_id_tree(
+            "run-empty".into(),
+            &captured(),
+            &diff,
+        ));
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert!(
+            hooks.batch_transfers.lock().unwrap().is_empty(),
+            "被完全排除的目录不应产生任何转存"
+        );
+        assert!(hooks.transfers.lock().unwrap().is_empty());
     }
 
     #[test]

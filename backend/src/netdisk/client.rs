@@ -42,6 +42,24 @@ const DELETE_RISK_RETRIES: u32 = 3;
 /// 可用 `BAIDUPCS_DELETE_RISK_BACKOFF_MS` 覆盖。
 const DELETE_RISK_BACKOFF_MS: u64 = 1500;
 
+/// HTTP 建连超时（秒）。
+///
+/// reqwest 默认不设 `connect_timeout`,建连阶段直接沿用操作系统的 TCP 超时 ——
+/// Windows 上约 21s（失败时报 `os error 10060`）。网络抖动 / 百度侧限流时,
+/// 分享同步递归列目录的每个失败请求都要白等 21s,整轮抓取被严重拖长。
+/// 这里统一收到 8s:连不上就快速失败,交给上层的单请求重试。
+/// 可用 `BAIDUPCS_CONNECT_TIMEOUT_SECS` 覆盖（取值范围 1..=60,越界回退默认值）。
+const CONNECT_TIMEOUT_SECS: u64 = 8;
+
+/// 读取建连超时配置（env 覆盖 + 合法性兜底）。
+fn connect_timeout_secs() -> u64 {
+    std::env::var("BAIDUPCS_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| (1..=60).contains(v))
+        .unwrap_or(CONNECT_TIMEOUT_SECS)
+}
+
 /// 百度网盘客户端
 #[derive(Debug, Clone)]
 pub struct NetdiskClient {
@@ -149,6 +167,12 @@ impl NetdiskClient {
         let mut builder = Client::builder()
             .cookie_provider(Arc::clone(&jar))
             .timeout(std::time::Duration::from_secs(60))
+            // 建连超时单独设短：Windows 默认 TCP connect 超时约 21s（os error 10060），
+            // 网络抖动时每个请求要白等 21s 才失败，分享同步递归列目录会被整体拖垮。
+            // 8s 连不上就判失败交给上层重试，远比干等划算。
+            .connect_timeout(std::time::Duration::from_secs(
+                connect_timeout_secs(),
+            ))
             .redirect(reqwest::redirect::Policy::limited(10)); // 允许最多 10 次重定向
 
         // 应用代理配置
@@ -199,7 +223,11 @@ impl NetdiskClient {
         let mut builder = Client::builder()
             .cookie_store(false)
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(30));
+            .timeout(std::time::Duration::from_secs(30))
+            // 与主客户端一致：避免建连阶段干等系统级 21s 超时。
+            .connect_timeout(std::time::Duration::from_secs(
+                connect_timeout_secs(),
+            ));
         if let Some(ref proxy) = self.proxy_config {
             builder = proxy.apply_to_builder(builder)?;
         }

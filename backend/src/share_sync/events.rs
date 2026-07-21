@@ -43,6 +43,33 @@ pub enum ShareSyncEvent {
         #[serde(default)]
         owner_uid: u64,
     },
+    /// 抓取（递归列目录）阶段的实时进度
+    ///
+    /// `RunStarted` 到 `DiffDetected` 之间是纯抓取阶段，大分享可长达数分钟。
+    /// 没有这个事件的话前端只能一直显示「运行中」，用户无法区分「在爬目录」
+    /// 和「卡死了」。由 manager 节流（约 500ms 一帧）后广播。
+    ///
+    /// 注意：`dirs_pending` 会随 BFS 发现新子目录而增长，**不可**用它算百分比
+    /// （进度条会倒退）；前端按计数式文案展示。
+    ScanProgress {
+        run_id: String,
+        subscription_id: String,
+        /// 已完成列举的目录数
+        dirs_done: usize,
+        /// 待扫描目录数（动态增长）
+        dirs_pending: usize,
+        /// 累计发现文件数（不含目录）
+        files_seen: usize,
+        /// 当前正在扫描的目录（分享内路径）
+        current_dir: String,
+        /// 第几次整轮抓取尝试（1 = 首次）。>1 时前端提示"网络异常重试中"，
+        /// 让用户明白是网络在抖而不是程序卡死。
+        attempt: u32,
+        /// 本轮命中缓存、无需重新请求的目录数（整轮重试时体现"续爬"效果）
+        cached_hits: usize,
+        #[serde(default)]
+        owner_uid: u64,
+    },
     /// 检测到差异
     DiffDetected {
         run_id: String,
@@ -160,6 +187,9 @@ impl ShareSyncEvent {
             | Self::RunStarted {
                 subscription_id, ..
             }
+            | Self::ScanProgress {
+                subscription_id, ..
+            }
             | Self::DiffDetected {
                 subscription_id, ..
             }
@@ -189,6 +219,7 @@ impl ShareSyncEvent {
             | Self::SubscriptionDeleted { owner_uid, .. }
             | Self::StatusChanged { owner_uid, .. }
             | Self::RunStarted { owner_uid, .. }
+            | Self::ScanProgress { owner_uid, .. }
             | Self::DiffDetected { owner_uid, .. }
             | Self::ItemScheduled { owner_uid, .. }
             | Self::ItemStatusChanged { owner_uid, .. }
@@ -206,6 +237,7 @@ impl ShareSyncEvent {
             Self::SubscriptionDeleted { .. } => "subscription_deleted",
             Self::StatusChanged { .. } => "status_changed",
             Self::RunStarted { .. } => "run_started",
+            Self::ScanProgress { .. } => "scan_progress",
             Self::DiffDetected { .. } => "diff_detected",
             Self::ItemScheduled { .. } => "item_scheduled",
             Self::ItemStatusChanged { .. } => "item_status_changed",

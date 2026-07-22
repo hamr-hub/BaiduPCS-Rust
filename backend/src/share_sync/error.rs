@@ -141,6 +141,18 @@ const TRANSIENT_KEYWORDS: &[&str] = &[
     "解析验证响应失败",
     "解析文件列表响应失败",
     "解析子目录文件列表响应失败",
+    // 分享页 / 分享列表 / 提取码校验的**网络 send/read 层失败**（HTTP 发送失败或
+    // 读取响应体失败，通常是超时/连接抖动/风控限流）。这些属于临时错误，应重试、且
+    // **不能**计入「链接确定性失效」自动暂停。真·链接失效（分享被删/提取码错）由
+    // errno 分支产生各自的专属文案（如「已失效」「不存在」），不会命中这些 context。
+    "访问分享页面失败",
+    "读取分享页面失败",
+    "验证提取码请求失败",
+    "读取验证响应失败",
+    "获取分享文件列表失败",
+    "读取文件列表响应失败",
+    "获取分享子目录文件列表失败",
+    "读取子目录文件列表响应失败",
     "请求超时",
     "超时",
     "请稍后",
@@ -317,6 +329,37 @@ mod tests {
 
         let e = ShareSyncError::SubscriptionNotFound("xyz".into());
         assert_eq!(e.category(), ErrorCategory::NotFound);
+    }
+
+    /// 回归：抓快照阶段列目录/访问分享页的**网络 send/read 层失败**应判为
+    /// Transient（可重试），且**不得**计入「链接确定性失效」自动暂停。
+    #[test]
+    fn test_snapshot_network_failures_are_transient_not_link_invalid() {
+        for msg in [
+            "获取分享子目录文件列表失败",
+            "读取子目录文件列表响应失败",
+            "获取分享文件列表失败",
+            "读取文件列表响应失败",
+            "访问分享页面失败",
+            "读取分享页面失败",
+            "验证提取码请求失败",
+            "读取验证响应失败",
+        ] {
+            let e = ShareSyncError::ShareLinkError(msg.to_string());
+            assert_eq!(
+                e.category(),
+                ErrorCategory::Transient,
+                "{msg} 应判为 Transient"
+            );
+            assert!(e.should_retry(), "{msg} 应可重试");
+            assert!(!e.is_link_invalid(), "{msg} 不应计入链接失效自动暂停");
+        }
+
+        // 真·链接失效（errno 级专属文案）仍应触发暂停。
+        let e = ShareSyncError::ShareLinkError("分享资源不存在或已失效".into());
+        assert!(e.is_link_invalid());
+        let e = ShareSyncError::ShareLinkError("提取码错误".into());
+        assert!(e.is_link_invalid());
     }
 
     #[test]

@@ -170,6 +170,9 @@ impl ShareSyncPersistence {
                 skipped_count INTEGER NOT NULL DEFAULT 0,
                 overwritten_count INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
+                -- run 当前阶段（scanning / diffing / executing）；结束时置 NULL。
+                -- 供 REST 轮询在 WS 断线/页面刷新后仍能显示细化状态。
+                phase TEXT,
                 FOREIGN KEY (subscription_id) REFERENCES share_subscriptions(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_share_runs_sub_time
@@ -222,6 +225,11 @@ impl ShareSyncPersistence {
             "ALTER TABLE share_sync_runs ADD COLUMN unchanged_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE share_sync_runs ADD COLUMN skipped_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE share_sync_runs ADD COLUMN overwritten_count INTEGER NOT NULL DEFAULT 0",
+            // run 的当前阶段（scanning / diffing / executing）。
+            // ScanProgress 是瞬时 WS 事件，刷新页面或 WS 断线重连后就没了；把阶段
+            // 落库，REST 轮询才能兜底告诉用户「在扫描目录」而不是裸的「运行中」。
+            // run 结束时置回 NULL。
+            "ALTER TABLE share_sync_runs ADD COLUMN phase TEXT",
             // 多账号隔离：老库（含早期把 share_subscriptions 建在独立库的版本）补 owner_uid 列
             "ALTER TABLE share_subscriptions ADD COLUMN owner_uid INTEGER NOT NULL DEFAULT 0",
         ] {
@@ -430,6 +438,9 @@ impl ShareSyncPersistence {
                     size: size as u64,
                     is_dir: is_dir != 0,
                     name,
+                    // 派生字段，不持久化：基线快照仅用于 diff，转存决策用当前抓取的
+                    // 快照条目（其 subtree_pruned 每次重新计算）。
+                    subtree_pruned: false,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -456,14 +467,28 @@ impl ShareSyncPersistence {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO share_sync_runs
-             (id, subscription_id, started_at, status)
-             VALUES (?1, ?2, ?3, ?4)",
+             (id, subscription_id, started_at, status, phase)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 run_id,
                 subscription_id,
                 started_at,
-                RunStatus::Running.as_str()
+                RunStatus::Running.as_str(),
+                // run 一开始就进入抓取阶段；前端立刻能显示「扫描目录中」而非「运行中」
+                RUN_PHASE_SCANNING,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// 更新 run 的当前阶段（`scanning` / `diffing` / `executing`）。
+    ///
+    /// 阶段只是给用户看的展示信息，写失败不应中断同步 —— 调用方忽略返回值即可。
+    pub fn update_run_phase(&self, run_id: &str, phase: &str) -> Result<(), ShareSyncError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE share_sync_runs SET phase = ?1 WHERE id = ?2",
+            params![phase, run_id],
         )?;
         Ok(())
     }
@@ -486,7 +511,9 @@ impl ShareSyncPersistence {
                  removed_count = ?6, unchanged_count = ?7,
                  failed_count = ?8, skipped_count = ?9,
                  overwritten_count = ?10,
-                 error = ?11
+                 error = ?11,
+                 -- run 已结束，阶段信息失去意义，置空避免前端把终态 run 显示成「扫描中」
+                 phase = NULL
             WHERE id = ?12",
             params![
                 finished_at,
@@ -553,7 +580,8 @@ impl ShareSyncPersistence {
             "UPDATE share_sync_runs
              SET status = ?1,
                  finished_at = ?2,
-                 error = ?3
+                 error = ?3,
+                 phase = NULL
              WHERE status = ?4 AND started_at < ?5",
             params![
                 RunStatus::Failed.as_str(),
@@ -610,7 +638,8 @@ impl ShareSyncPersistence {
             "UPDATE share_sync_runs
              SET status = ?1,
                  finished_at = ?2,
-                 error = ?3
+                 error = ?3,
+                 phase = NULL
              WHERE status = ?4",
             params![
                 RunStatus::Interrupted.as_str(),
@@ -755,7 +784,8 @@ impl ShareSyncPersistence {
         let mut stmt = conn.prepare(
             "SELECT id, started_at, finished_at, status,
                     total_count, added_count, modified_count, removed_count,
-                    unchanged_count, failed_count, skipped_count, overwritten_count, error
+                    unchanged_count, failed_count, skipped_count, overwritten_count, error,
+                    phase
              FROM share_sync_runs
              WHERE subscription_id = ?1
              ORDER BY started_at DESC
@@ -776,6 +806,7 @@ impl ShareSyncPersistence {
                 skipped_count: row.get::<_, i64>(10)? as usize,
                 overwritten_count: row.get::<_, i64>(11)? as usize,
                 error: row.get(12)?,
+                phase: row.get(13)?,
             })
         })?;
         let mut out = Vec::new();
@@ -792,7 +823,8 @@ impl ShareSyncPersistence {
             .query_row(
                 "SELECT id, started_at, finished_at, status,
                         total_count, added_count, modified_count, removed_count,
-                        unchanged_count, failed_count, skipped_count, overwritten_count, error
+                        unchanged_count, failed_count, skipped_count, overwritten_count, error,
+                        phase
                  FROM share_sync_runs WHERE id = ?1",
                 params![run_id],
                 |row| {
@@ -810,6 +842,7 @@ impl ShareSyncPersistence {
                         skipped_count: row.get::<_, i64>(10)? as usize,
                         overwritten_count: row.get::<_, i64>(11)? as usize,
                         error: row.get(12)?,
+                        phase: row.get(13)?,
                     })
                 },
             )
@@ -906,7 +939,19 @@ pub struct RunRecord {
     pub skipped_count: usize,
     pub overwritten_count: usize,
     pub error: Option<String>,
+    /// 运行中 run 的当前阶段：`scanning`（递归列目录）/ `diffing`（算差异）/
+    /// `executing`（转存下载）。终态 run 为 `None`。
+    ///
+    /// 存在的意义是给 REST 轮询兜底：`ScanProgress` 是瞬时 WS 事件，页面刷新或
+    /// WS 断线重连后就没了，只靠它的话用户又会退回到裸的「运行中」。
+    #[serde(default)]
+    pub phase: Option<String>,
 }
+
+/// run 阶段常量。字符串直接进 DB 与 API，改动需同步前端 `describeRunStatus`。
+pub const RUN_PHASE_SCANNING: &str = "scanning";
+pub const RUN_PHASE_DIFFING: &str = "diffing";
+pub const RUN_PHASE_EXECUTING: &str = "executing";
 
 /// 启动自愈被收编的 stale running run 的描述,manager 用来广播 RunFailed 事件
 #[derive(Debug, Clone)]
@@ -1101,7 +1146,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+            .unwrap();
 
         mgr.delete_subscription(&s.id).unwrap();
         assert!(mgr.latest_snapshot(&s.id).unwrap().is_none());
@@ -1125,7 +1170,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+            .unwrap();
         mgr.finish_run(
             "run-1",
             1100,
@@ -1142,7 +1187,7 @@ mod tests {
             },
             None,
         )
-        .unwrap();
+            .unwrap();
 
         let rec = mgr.get_run("run-1").unwrap().unwrap();
         assert_eq!(rec.status, "completed_with_errors");
@@ -1151,6 +1196,62 @@ mod tests {
         let items = mgr.list_run_items("run-1").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].transfer_task_id.as_deref(), Some("tx-1"));
+    }
+
+    /// run 阶段（phase）:start_run 落 scanning → update_run_phase 推进 →
+    /// finish_run 置空。前端靠它在 WS 断线/页面刷新后仍能显示细化状态,
+    /// 终态 run 必须不带 phase,否则会被渲染成"扫描中"。
+    #[test]
+    fn test_run_phase_transitions_and_cleared_on_finish() {
+        let (_dir, mgr) = fresh();
+        let s = sub("phase");
+        mgr.upsert_subscription(&s).unwrap();
+
+        mgr.start_run("run-p", &s.id, 1000).unwrap();
+        assert_eq!(
+            mgr.get_run("run-p").unwrap().unwrap().phase.as_deref(),
+            Some(RUN_PHASE_SCANNING),
+            "run 一开始就应处于抓取阶段"
+        );
+
+        mgr.update_run_phase("run-p", RUN_PHASE_EXECUTING).unwrap();
+        assert_eq!(
+            mgr.get_run("run-p").unwrap().unwrap().phase.as_deref(),
+            Some(RUN_PHASE_EXECUTING)
+        );
+        // list_runs 与 get_run 必须一致（两处 SELECT 各写一份列，容易漏改）
+        let listed = mgr.list_runs(&s.id, 1, 10).unwrap();
+        assert_eq!(listed[0].phase.as_deref(), Some(RUN_PHASE_EXECUTING));
+
+        mgr.finish_run(
+            "run-p",
+            1100,
+            RunStatus::Completed,
+            &DiffSummary::default(),
+            None,
+        )
+            .unwrap();
+        assert!(
+            mgr.get_run("run-p").unwrap().unwrap().phase.is_none(),
+            "run 结束后 phase 必须置空"
+        );
+    }
+
+    /// 进程重启收编 running run 时也要清 phase,否则历史里会留下
+    /// 「已中断」却仍显示「扫描目录中」的矛盾记录。
+    #[test]
+    fn test_interrupted_runs_clear_phase() {
+        let (_dir, mgr) = fresh();
+        let s = sub("phase-int");
+        mgr.upsert_subscription(&s).unwrap();
+        mgr.start_run("run-i", &s.id, 1000).unwrap();
+
+        let interrupted = mgr.mark_running_runs_interrupted().unwrap();
+        assert_eq!(interrupted.len(), 1);
+
+        let rec = mgr.get_run("run-i").unwrap().unwrap();
+        assert_eq!(rec.status, "interrupted");
+        assert!(rec.phase.is_none(), "被收编的 run 不应残留 phase");
     }
 
     #[test]
@@ -1171,7 +1272,7 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+                .unwrap();
         }
 
         assert_eq!(mgr.count_run_items("run-page").unwrap(), 125);
@@ -1277,7 +1378,7 @@ mod tests {
             Some("/old.bak"),
             Some("first_reason"),
         )
-        .unwrap();
+            .unwrap();
         // 第二次传 None 给 transfer_task_id / download_task_id / versioned_old_path / reason
         mgr.add_run_item(
             "run-c",
@@ -1290,7 +1391,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+            .unwrap();
         let items = mgr.list_run_items("run-c").unwrap();
         assert_eq!(items.len(), 1);
         // status / action 是 NOT NULL 用 excluded 覆盖
@@ -1369,7 +1470,7 @@ mod tests {
             &DiffSummary::default(),
             None,
         )
-        .unwrap();
+            .unwrap();
 
         let stale = mgr.mark_stale_runs_failed(120).unwrap();
         let ids: Vec<&str> = stale.iter().map(|r| r.run_id.as_str()).collect();
@@ -1403,7 +1504,7 @@ mod tests {
             &DiffSummary::default(),
             None,
         )
-        .unwrap();
+            .unwrap();
 
         let mut got = mgr.mark_running_runs_interrupted().unwrap();
         let mut ids: Vec<String> = got.drain(..).map(|r| r.run_id).collect();
@@ -1466,7 +1567,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+            .unwrap();
         let items = mgr.list_run_items("r1").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, "completed");

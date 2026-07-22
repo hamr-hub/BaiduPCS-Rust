@@ -1175,6 +1175,9 @@ impl TaskEvent {
             }
             TaskEvent::Scan(ScanEvent::Started { .. }) => true,
             TaskEvent::Scan(ScanEvent::Progress { .. }) => true,
+            // 抓取阶段进度：run 正在跑但还没进入执行段，属于活跃事件，必须高频推送，
+            // 否则前端在最长的那段（递归列目录）反而收不到更新。
+            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ScanProgress { .. }) => true,
             TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::DiffDetected { .. }) => true,
             TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemScheduled { .. }) => true,
             TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemProgress { .. }) => true,

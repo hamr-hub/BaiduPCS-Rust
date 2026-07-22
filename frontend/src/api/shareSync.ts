@@ -93,6 +93,15 @@ export interface UpdateShareSubscriptionRequest {
   enabled?: boolean
 }
 
+/**
+ * 运行中 run 的细化阶段（后端 `share_sync_runs.phase`）。
+ * - `scanning`  ：递归列举分享目录（大分享可长达数分钟，是最容易被误认为卡死的一段）
+ * - `diffing`   ：与上次基线快照算差异
+ * - `executing` ：转存 / 下载
+ * 终态 run 为 `null`。
+ */
+export type RunPhase = 'scanning' | 'diffing' | 'executing'
+
 export interface RunRecord {
   id: string
   started_at: number
@@ -107,6 +116,8 @@ export interface RunRecord {
   skipped_count: number
   overwritten_count: number
   error: string | null
+  /** 运行中 run 的当前阶段；老后端不返回该字段时为 undefined */
+  phase?: RunPhase | string | null
 }
 
 export interface RunItemRecord {
@@ -136,6 +147,8 @@ export interface RunDetail {
   skipped_count: number
   overwritten_count: number
   error: string | null
+  /** 运行中 run 的当前阶段（后端 RunDetailDto 用 serde flatten 透传 RunRecord 的字段） */
+  phase?: RunPhase | string | null
   items: RunItemRecord[]
   item_total_count: number
   item_page: number
@@ -207,6 +220,30 @@ export type ShareSyncWsEvent =
     | { type: 'status_changed'; subscription_id: string; enabled: boolean; owner_uid?: number }
     | { type: 'diff_detected'; run_id: string; subscription_id: string; added: number; modified: number; removed: number; owner_uid?: number }
     | { type: 'run_started'; run_id: string; subscription_id: string; owner_uid?: number }
+    | {
+  /**
+   * 抓取（递归列目录）阶段的实时进度。后端节流约 500ms 一帧。
+   *
+   * 注意 `dirs_pending` 会随 BFS 发现新子目录而增长，**不要**用它算百分比，
+   * 否则进度条会倒退；按计数式文案展示。
+   */
+  type: 'scan_progress'
+  run_id: string
+  subscription_id: string
+  /** 已完成列举的目录数 */
+  dirs_done: number
+  /** 待扫描目录数（动态增长） */
+  dirs_pending: number
+  /** 累计发现文件数（不含目录） */
+  files_seen: number
+  /** 当前正在扫描的目录 */
+  current_dir: string
+  /** 第几次整轮抓取尝试；>1 表示网络异常正在重试 */
+  attempt: number
+  /** 命中缓存、本轮无需重新请求的目录数（重试续爬的效果） */
+  cached_hits: number
+  owner_uid?: number
+}
     | { type: 'run_completed'; run_id: string; subscription_id: string; added: number; modified: number; removed: number; failed: number; owner_uid?: number }
     | { type: 'run_failed'; run_id: string; subscription_id: string; error: string; owner_uid?: number }
     | {

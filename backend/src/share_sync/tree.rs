@@ -38,6 +38,11 @@ pub struct TreeNode {
     pub children: Vec<usize>,
     /// 父节点下标;虚拟根为 None
     pub parent: Option<usize>,
+    /// 该目录在抓快照时「有后代被 include/exclude 过滤剔除」(源自
+    /// `ShareSnapshotItem.subtree_pruned`)。为 `true` 时**禁止**把此目录当作单个
+    /// fs_id 整体提交转存 —— 百度服务端会按 fs_id 递归复制整目录,把被过滤的子项也
+    /// 搬过去。转存阶段必须把它展开成子节点逐层提交。
+    pub subtree_pruned: bool,
 }
 
 impl TreeNode {
@@ -123,6 +128,7 @@ pub fn build(items: &[ShareSnapshotItem]) -> Tree {
         name: String::new(),
         children: Vec::new(),
         parent: None,
+        subtree_pruned: false,
     }];
     // path → idx 索引,O(log N) 查找祖先链
     use std::collections::BTreeMap;
@@ -150,6 +156,7 @@ pub fn build(items: &[ShareSnapshotItem]) -> Tree {
             n.is_dir = item.is_dir;
             n.size = item.size;
             n.name = item.name.clone();
+            n.subtree_pruned = item.subtree_pruned;
             // parent / children 不动
             continue;
         }
@@ -162,6 +169,7 @@ pub fn build(items: &[ShareSnapshotItem]) -> Tree {
             name: item.name.clone(),
             children: Vec::new(),
             parent: Some(parent_idx),
+            subtree_pruned: item.subtree_pruned,
         });
         path_to_idx.insert(item.path.clone(), idx);
         nodes[parent_idx].children.push(idx);
@@ -239,6 +247,7 @@ pub fn nodes_to_items(tree: &Tree, indices: &[usize]) -> Vec<ShareSnapshotItem> 
             Some(ShareSnapshotItem {
                 path: n.path.clone(),
                 raw_path: n.path.clone(),
+                subtree_pruned: n.subtree_pruned,
                 fs_id: n.fs_id,
                 size: n.size,
                 name: n.name.clone(),
@@ -286,6 +295,7 @@ fn ensure_path(
         name,
         children: Vec::new(),
         parent: Some(parent_idx),
+        subtree_pruned: false,
     });
     path_to_idx.insert(path.to_string(), idx);
     nodes[parent_idx].children.push(idx);

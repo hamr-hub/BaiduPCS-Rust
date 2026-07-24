@@ -876,7 +876,7 @@ impl NetdiskClient {
     ///
     /// 通过调用网盘用户信息接口来验证 BDUSS
     /// 复用 QRCodeAuth::verify_bduss 相同的 API 逻辑
-    async fn verify_bduss(&self) -> bool {
+    pub async fn verify_bduss(&self) -> bool {
         info!("验证 BDUSS 是否有效...");
 
         let url = format!(
@@ -930,6 +930,18 @@ impl NetdiskClient {
     /// 获取用户UID
     pub fn uid(&self) -> u64 {
         self.user_auth.uid
+    }
+
+    /// 构造 REST/xpan 接口的 Cookie 头：`BDUSS=xxx` 或 `BDUSS=xxx; STOKEN=yyy`。
+    ///
+    /// 部分账号（多为较新注册的）百度要求 BDUSS+STOKEN 双凭证，只带 BDUSS 时
+    /// pan 接口返回 errno=-6（即使 BDUSS 本身通过 passport 校验，见 issue #130）；
+    /// 老账号多带 STOKEN 无副作用，因此有 STOKEN 就一律带上。
+    fn bduss_cookie_header(&self) -> String {
+        match self.user_auth.stoken.as_deref() {
+            Some(st) if !st.is_empty() => format!("BDUSS={}; STOKEN={}", self.bduss(), st),
+            _ => format!("BDUSS={}", self.bduss()),
+        }
     }
 
     /// 获取用户认证信息（用于重建客户端）
@@ -1005,7 +1017,7 @@ impl NetdiskClient {
                 ("dir", dir),
                 ("t", &chrono::Utc::now().timestamp_millis().to_string()),
             ])
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.mobile_user_agent)
             .send()
             .await;
@@ -1070,7 +1082,7 @@ impl NetdiskClient {
                 ("recursion", &recursion.to_string()),
                 ("key", key),
             ])
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
             .send()
             .await;
@@ -1236,7 +1248,7 @@ impl NetdiskClient {
         let response = match self
             .client
             .post(&url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.mobile_user_agent)
             .send()
             .await
@@ -1433,7 +1445,7 @@ impl NetdiskClient {
             .client
             .post(url)
             // .query(&[("method", "create")])
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.mobile_user_agent)
             .form(&[
                 ("path", remote_path),
@@ -1521,7 +1533,7 @@ impl NetdiskClient {
         let response = self
             .client
             .get(&url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.mobile_user_agent)
             .send()
             .await;
@@ -1600,7 +1612,7 @@ impl NetdiskClient {
             .client
             .post(url)
             // .query(&[("method", "precreate")])
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.mobile_user_agent)
             .form(&[
                 ("path", remote_path),
@@ -1709,7 +1721,7 @@ impl NetdiskClient {
         let response = self
             .client
             .post(&url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.mobile_user_agent)
             .multipart(form)
             .send()
@@ -1809,7 +1821,7 @@ impl NetdiskClient {
     //         .client
     //         .post(url)
     //         .query(&[("method", "create")])
-    //         .header("Cookie", format!("BDUSS={}", self.bduss()))
+    //         .header("Cookie", self.bduss_cookie_header())
     //         .header("User-Agent", &self.mobile_user_agent)
     //         .form(&[
     //             ("path", remote_path),
@@ -3275,7 +3287,7 @@ impl NetdiskClient {
         let response = self
             .client
             .post(url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
             .form(&[
                 ("method", "query_magnetinfo"),
@@ -3377,7 +3389,7 @@ impl NetdiskClient {
         let response = self
             .client
             .post(&url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
             .send()
             .await
@@ -3452,7 +3464,7 @@ impl NetdiskClient {
         let response = self
             .client
             .post(&url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
             .send()
             .await
@@ -3532,7 +3544,7 @@ impl NetdiskClient {
         let response = self
             .client
             .get(&url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
             .send()
             .await
@@ -3604,7 +3616,7 @@ impl NetdiskClient {
         let response = self
             .client
             .post(&url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
             .send()
             .await
@@ -3656,7 +3668,7 @@ impl NetdiskClient {
         let response = self
             .client
             .post(&url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
             .send()
             .await
@@ -3699,7 +3711,7 @@ impl NetdiskClient {
         let response = self
             .client
             .post(url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
             .send()
             .await
@@ -3769,7 +3781,7 @@ impl NetdiskClient {
         let response = self
             .client
             .post(url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
             .header("Referer", "https://pan.baidu.com/disk/home")
             .form(&[
@@ -3835,7 +3847,7 @@ impl NetdiskClient {
         let response = self
             .client
             .post(url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
             .header("Referer", "https://pan.baidu.com/disk/home")
             .form(&[("shareid_list", shareid_list.as_str())])
@@ -3887,7 +3899,7 @@ impl NetdiskClient {
                 ("desc", "1"),
                 ("order", "time"),
             ])
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
             .header("Referer", "https://pan.baidu.com/disk/home")
             .send()
@@ -3948,7 +3960,7 @@ impl NetdiskClient {
                 ("shareid", share_id.to_string().as_str()),
                 ("sign", sign.as_str()),
             ])
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
             .header("Referer", "https://pan.baidu.com/disk/home")
             .send()

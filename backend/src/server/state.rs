@@ -489,7 +489,7 @@ impl AppState {
                 }
             }
 
-            // 预热过期时间（2小时 = 7200秒）
+            // 预热过期时间（24小时 = 86400秒）
             const WARMUP_EXPIRE_SECS: i64 = 86400;
 
             // 检查是否需要预热：
@@ -1681,34 +1681,45 @@ impl AppState {
             }
         };
 
-        // 2) 取活跃账号客户端（按 active_uid 路由，唯一真源）
+        // 2/3) client / UserAuth 缺失时保持宽松语义（Ok(false) 而非 Err）
+        if self.client_pool.read().await.get_client(uid).is_none() {
+            warn!("trigger_warmup: client_pool uid={} 缺失客户端", uid.raw());
+            return Ok(false);
+        }
+        if self.account_manager.lock().await.get_user(uid).is_none() {
+            warn!("trigger_warmup: AccountManager 中未找到 uid={}", uid.raw());
+            return Ok(false);
+        }
+
+        self.warmup_uid(uid).await?;
+        Ok(true)
+    }
+
+    /// 为指定 uid 执行一次 Web 会话预热并持久化到 accounts.json。
+    ///
+    /// `trigger_warmup`（活跃账号）与 `ensure_session_for_switch`（切换目标账号）
+    /// 共用此实现。
+    ///
+    /// # 返回值
+    /// - `Ok(true)` - 预热拿到了 bdstoken，Web 会话可用
+    /// - `Ok(false)` - 预热被跳过或未拿到 bdstoken（如缺 PTOKEN 走 PANPSC 快捷路径失败），
+    ///   Web 写接口（删除/建目录等）大概率仍会失败
+    /// - `Err(e)` - 预热执行失败（网络错误 / BDUSS 失效等）
+    pub async fn warmup_uid(&self, uid: crate::auth::Uid) -> anyhow::Result<bool> {
         let client = match self.client_pool.read().await.get_client(uid) {
             Some(c) => (*c).clone(),
-            None => {
-                warn!(
-                    "trigger_warmup: client_pool uid={} 缺失客户端",
-                    uid.raw()
-                );
-                return Ok(false);
-            }
+            None => anyhow::bail!("client_pool uid={} 缺失客户端", uid.raw()),
         };
 
-        // 3) 取活跃账号 UserAuth 副本（从 AccountManager，单一持久化真源）
         let mut user_auth = {
             let am = self.account_manager.lock().await;
             match am.get_user(uid) {
                 Some(u) => u.clone(),
-                None => {
-                    warn!(
-                        "trigger_warmup: AccountManager 中未找到 uid={}",
-                        uid.raw()
-                    );
-                    return Ok(false);
-                }
+                None => anyhow::bail!("AccountManager 中未找到 uid={}", uid.raw()),
             }
         };
 
-        info!("手动触发预热 uid={}...", uid.raw());
+        info!("触发预热 uid={}...", uid.raw());
 
         // 清除旧的预热数据
         user_auth.panpsc = None;
@@ -1718,7 +1729,12 @@ impl AppState {
         // 执行预热
         match client.warmup_and_get_cookies().await {
             Ok((panpsc, csrf_token, bdstoken, stoken)) => {
-                info!("手动预热成功 uid={}，更新 accounts.json", uid.raw());
+                let got_bdstoken = bdstoken.is_some();
+                info!(
+                    "预热完成 uid={}（bdstoken={}），更新 accounts.json",
+                    uid.raw(),
+                    if got_bdstoken { "已获取" } else { "未获取" }
+                );
                 if panpsc.is_some() {
                     user_auth.panpsc = panpsc;
                 }
@@ -1738,7 +1754,7 @@ impl AppState {
                     let mut am = self.account_manager.lock().await;
                     if let Err(e) = am.add_user(user_auth.clone()).await {
                         error!(
-                            "trigger_warmup uid={}: 保存预热 cookie 到 accounts.json 失败: {}",
+                            "warmup_uid uid={}: 保存预热 cookie 到 accounts.json 失败: {}",
                             uid.raw(),
                             e
                         );
@@ -1750,12 +1766,80 @@ impl AppState {
                     *self.current_user.write().await = Some(user_auth);
                 }
 
-                Ok(true)
+                Ok(got_bdstoken)
             }
             Err(e) => {
-                error!("手动预热失败 uid={}: {}", uid.raw(), e);
+                error!("预热失败 uid={}: {}", uid.raw(), e);
                 Err(anyhow::anyhow!("预热失败: {}", e))
             }
+        }
+    }
+
+    /// 🔥 切换账号前的会话体检（`switch_account` 专用）。
+    ///
+    /// 预热数据齐全且未过期（24 小时内预热过）→ 直接放行；
+    /// 否则先校验 BDUSS，再重新预热：
+    /// - BDUSS 确定失效 → `Err`（提示重新登录；`verify_bduss` 网络错误时宽松放行）
+    /// - 预热失败 / 未拿到 bdstoken → `Err`（Web 会话无法自动恢复）
+    ///
+    /// 背景：非活跃账号只在启动时构造 client、从不预热（见 `preheat_inactive_clients`），
+    /// 陈旧会话切换上岗后 Web 接口会撞百度 errno=-6（issue #130）。在切换入口拦截并
+    /// 给出可操作的提示，而不是让用户在删除/列表时撞晦涩的 -6。
+    pub async fn ensure_session_for_switch(&self, uid: crate::auth::Uid) -> anyhow::Result<()> {
+        /// 预热数据有效期：24 小时（与启动期 `load_initial_session` 的判断一致）
+        const WARMUP_EXPIRE_SECS: i64 = 86400;
+
+        let user_auth = {
+            let am = self.account_manager.lock().await;
+            match am.get_user(uid) {
+                Some(u) => u.clone(),
+                None => anyhow::bail!("AccountManager 中未找到 uid={}", uid.raw()),
+            }
+        };
+
+        // 不把 csrfToken 作为硬条件：缺 PTOKEN 的账号走 PANPSC 快捷路径预热，
+        // 永远拿不到 csrfToken，若要求它会导致每次切换都重复体检；
+        // 而 -6 相关链路只依赖 bdstoken + 会话 cookie。
+        let fresh = user_auth.panpsc.is_some()
+            && user_auth.bdstoken.is_some()
+            && user_auth
+            .last_warmup_at
+            .map(|t| chrono::Utc::now().timestamp() - t <= WARMUP_EXPIRE_SECS)
+            .unwrap_or(false);
+        if fresh {
+            return Ok(());
+        }
+
+        info!(
+            "切换前会话体检 uid={}: 预热数据缺失或过期，校验 BDUSS 并重新预热",
+            uid.raw()
+        );
+
+        let client = match self.client_pool.read().await.get_client(uid) {
+            Some(c) => (*c).clone(),
+            None => anyhow::bail!("client_pool uid={} 缺失客户端", uid.raw()),
+        };
+
+        // verify_bduss 只在明确拿到"用户信息无效"时返回 false（网络错误宽松放行），
+        // 因此 false 可以放心断言为登录失效。
+        //
+        // 提示文案需写明恢复路径不依赖切换：重新添加账号按 uid upsert 覆盖旧凭证，
+        // 删除账号走 DELETE /accounts/:uid，两者都无需先切换到该账号。
+        if !client.verify_bduss().await {
+            anyhow::bail!(
+                "该账号登录已失效（BDUSS 无效）。无需切换，直接通过“添加账号”重新扫码/导入 Cookie 即可覆盖登录，或在账号管理中删除该账号"
+            );
+        }
+
+        match self.warmup_uid(uid).await {
+            Ok(true) => Ok(()),
+            Ok(false) => anyhow::bail!(
+                "该账号 Web 会话已过期且无法自动预热（可能缺少 PTOKEN）。无需切换，直接通过“添加账号”重新扫码/导入完整 Cookie 即可覆盖登录"
+            ),
+            Err(e) => anyhow::bail!(
+                "该账号会话预热失败（{}）。请检查网络后重试；若持续失败，无需切换，直接通过“添加账号”重新登录即可覆盖该账号",
+                e
+            ),
         }
     }
 

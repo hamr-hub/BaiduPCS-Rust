@@ -64,6 +64,22 @@ pub struct AppConfig {
     /// 多账号 VIP 推荐配置表
     #[serde(default)]
     pub multi_account_vip_recommended: MultiAccountVipRecommendedConfig,
+    /// 分享同步配置
+    #[serde(default)]
+    pub share_sync: ShareSyncConfig,
+}
+
+// ============================================================================
+// 分享同步配置
+// ============================================================================
+
+/// 分享同步相关配置
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShareSyncConfig {
+    /// 排除规则「常用词表」：创建/编辑订阅时可点选快速添加，免去重复手输。
+    /// 在系统设置页维护（增删）；默认为空，完全由用户自行配置，不做任何预置。
+    #[serde(default)]
+    pub exclude_preset_rules: Vec<String>,
 }
 
 // ============================================================================
@@ -1269,6 +1285,7 @@ impl Default for AppConfig {
             conflict_strategy: ConflictStrategyConfig::default(),
             multi_account_budget: MultiAccountBudgetConfig::default(),
             multi_account_vip_recommended: MultiAccountVipRecommendedConfig::default(),
+            share_sync: ShareSyncConfig::default(),
         }
     }
 }
@@ -1465,6 +1482,23 @@ mod tests {
             loaded.download.max_global_threads,
             config.download.max_global_threads
         );
+    }
+
+    /// 分享同步词表：默认为空（不做预置，完全由用户配置）；已保存的词表可正常读回。
+    #[test]
+    fn test_share_sync_config_defaults_and_roundtrip() {
+        // 默认 / 老配置文件缺失该段 → 空词表
+        assert!(AppConfig::default()
+            .share_sync
+            .exclude_preset_rules
+            .is_empty());
+        let legacy: ShareSyncConfig = toml::from_str("").unwrap();
+        assert!(legacy.exclude_preset_rules.is_empty());
+
+        // 用户配置的词表反序列化读回
+        let saved: ShareSyncConfig =
+            toml::from_str(r#"exclude_preset_rules = ["*样片*", "*.nfo"]"#).unwrap();
+        assert_eq!(saved.exclude_preset_rules, ["*样片*", "*.nfo"]);
     }
 
     #[test]

@@ -33,6 +33,14 @@ pub struct FileListQuery {
     pub desc: bool,
 }
 
+/// errno=-6（身份校验失败）在预热重试后仍未恢复时，给用户的可操作提示。
+///
+/// 多为账号缺少 STOKEN（部分账号百度强制 BDUSS+STOKEN 双凭证）、且无 PTOKEN
+/// 无法自动预热出 STOKEN 的场景（见 issue #130）；纯 BDUSS 导入的账号必须重新
+/// 导入含 STOKEN 的完整 Cookie 才能恢复。
+const ERRNO_MINUS6_HINT: &str =
+    "账号登录已过期或凭证不完整（errno=-6）。请通过“添加账号”重新扫码登录，或重新导入包含 STOKEN 的完整 Cookie 后重试";
+
 fn default_dir() -> String {
     "/".to_string()
 }
@@ -103,7 +111,7 @@ pub async fn get_file_list(
     };
 
     // 获取文件列表（透传百度支持的排序参数）
-    match client
+    let mut result = client
         .get_file_list_ordered(
             &params.dir,
             params.page,
@@ -111,8 +119,33 @@ pub async fn get_file_list(
             &params.order,
             params.desc,
         )
-        .await
-    {
+        .await;
+
+    // errno=-6（身份校验失败）自愈：预热刷新会话后重试一次
+    if let Err(e) = &result {
+        if e.to_string().contains("API error -6") {
+            warn!("获取文件列表遇到 errno=-6，触发预热重试...");
+            match state.trigger_warmup().await {
+                Ok(true) => {
+                    if let Some(c) = state.active_client().await {
+                        result = c
+                            .get_file_list_ordered(
+                                &params.dir,
+                                params.page,
+                                params.page_size,
+                                &params.order,
+                                params.desc,
+                            )
+                            .await;
+                    }
+                }
+                Ok(false) => warn!("预热跳过（用户未登录）"),
+                Err(warmup_err) => error!("预热失败: {}", warmup_err),
+            }
+        }
+    }
+
+    match result {
         Ok(file_list) => {
             let total = file_list.list.len();
             let has_more = total >= params.page_size as usize;
@@ -195,6 +228,10 @@ pub async fn get_file_list(
         }
         Err(e) => {
             error!("获取文件列表失败: {}", e);
+            // -6 预热重试后仍失败：给出明确的重登引导，而非晦涩的 errno
+            if e.to_string().contains("API error -6") {
+                return Ok(Json(ApiResponse::error(500, ERRNO_MINUS6_HINT.to_string())));
+            }
             Ok(Json(ApiResponse::error(
                 500,
                 format!("获取文件列表失败: {}", e),
@@ -491,61 +528,58 @@ pub async fn delete_files(
         }
     };
 
-    match client.delete_files_chunked(&request.paths).await {
-        Ok(response) => {
-            if response.success {
-                // 百度异步删除，等待1秒让服务端完成处理，避免前端刷新时文件仍在
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                info!("成功删除 {} 个文件", response.deleted_count);
-                Ok(Json(ApiResponse::success(DeleteFilesData {
-                    deleted_count: response.deleted_count,
-                    failed_paths: response.failed_paths,
-                })))
-            } else {
-                let msg = response.error.unwrap_or_else(|| "删除失败".to_string());
-                // errno=132 透传为 code,让前端弹出明确的安全验证引导
-                let code = if response.errno == Some(132) { 132 } else { 500 };
-                Ok(Json(ApiResponse::error(code, msg)))
-            }
-        }
+    let mut response = match client.delete_files_chunked(&request.paths).await {
+        Ok(r) => r,
         Err(e) => {
-            let error_msg = e.to_string();
-            if error_msg.contains("errno=-6") {
-                warn!("删除文件遇到 errno=-6，触发预热重试...");
-                match state.trigger_warmup().await {
-                    Ok(true) => {
-                        if let Some(c) = state.active_client().await {
-                            match c.delete_files_chunked(&request.paths).await {
-                                Ok(response) if response.success => {
-                                    // 百度异步删除，等待1秒让服务端完成处理
-                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                    return Ok(Json(ApiResponse::success(DeleteFilesData {
-                                        deleted_count: response.deleted_count,
-                                        failed_paths: response.failed_paths,
-                                    })));
-                                }
-                                Ok(response) => {
-                                    let msg = response.error.unwrap_or_else(|| "删除失败".to_string());
-                                    let code = if response.errno == Some(132) { 132 } else { 500 };
-                                    return Ok(Json(ApiResponse::error(code, msg)));
-                                }
-                                Err(retry_err) => {
-                                    error!("预热重试后仍失败: {}", retry_err);
-                                    return Ok(Json(ApiResponse::error(
-                                        500,
-                                        format!("删除文件失败（已重试）: {}", retry_err),
-                                    )));
-                                }
-                            }
+            error!("删除文件失败: {}", e);
+            return Ok(Json(ApiResponse::error(
+                500,
+                format!("删除文件失败: {}", e),
+            )));
+        }
+    };
+
+    // errno=-6（身份校验失败）自愈：预热刷新会话后重试一次。
+    // 注意：API 层错误（含 -6）由 delete_files 以 Ok(failure_with_errno) 返回，
+    // 因此必须在这里判断 response.errno，而不是上面的 Err 分支。
+    if !response.success && response.errno == Some(-6) {
+        warn!("删除文件遇到 errno=-6，触发预热重试...");
+        match state.trigger_warmup().await {
+            Ok(true) => {
+                if let Some(c) = state.active_client().await {
+                    match c.delete_files_chunked(&request.paths).await {
+                        Ok(r) => response = r,
+                        Err(retry_err) => {
+                            error!("预热重试后仍失败: {}", retry_err);
+                            return Ok(Json(ApiResponse::error(
+                                500,
+                                format!("删除文件失败（已重试）: {}", retry_err),
+                            )));
                         }
                     }
-                    Ok(false) => warn!("预热跳过（用户未登录）"),
-                    Err(warmup_err) => error!("预热失败: {}", warmup_err),
                 }
             }
-            error!("删除文件失败: {}", e);
-            Ok(Json(ApiResponse::error(500, format!("删除文件失败: {}", e))))
+            Ok(false) => warn!("预热跳过（用户未登录）"),
+            Err(warmup_err) => error!("预热失败: {}", warmup_err),
         }
+    }
+
+    if response.success {
+        // 百度异步删除，等待1秒让服务端完成处理，避免前端刷新时文件仍在
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        info!("成功删除 {} 个文件", response.deleted_count);
+        Ok(Json(ApiResponse::success(DeleteFilesData {
+            deleted_count: response.deleted_count,
+            failed_paths: response.failed_paths,
+        })))
+    } else if response.errno == Some(-6) {
+        // -6 预热重试后仍失败：给出明确的重登引导，而非晦涩的 errno
+        Ok(Json(ApiResponse::error(500, ERRNO_MINUS6_HINT.to_string())))
+    } else {
+        let msg = response.error.unwrap_or_else(|| "删除失败".to_string());
+        // errno=132 透传为 code,让前端弹出明确的安全验证引导
+        let code = if response.errno == Some(132) { 132 } else { 500 };
+        Ok(Json(ApiResponse::error(code, msg)))
     }
 }
 

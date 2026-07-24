@@ -192,6 +192,12 @@ export interface ConflictStrategyConfig {
   default_download_strategy: 'overwrite' | 'skip' | 'auto_rename'
 }
 
+/// 分享同步配置
+export interface ShareSyncConfig {
+  /** 排除规则常用词表：创建/编辑订阅时点选快速添加；在系统设置页维护 */
+  exclude_preset_rules: string[]
+}
+
 /// 应用配置
 export interface AppConfig {
   server: ServerConfig
@@ -208,6 +214,7 @@ export interface AppConfig {
   conflict_strategy?: ConflictStrategyConfig
   multi_account_budget?: MultiAccountBudgetConfig
   multi_account_vip_recommended?: MultiAccountVipRecommendedConfig
+  share_sync?: ShareSyncConfig
 }
 
 /// VIP 推荐配置

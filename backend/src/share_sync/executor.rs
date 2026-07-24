@@ -2856,7 +2856,88 @@ mod tests {
         assert!(submitted.contains(&20), "clean dir /root/02 未被转存: {:?}", submitted);
     }
 
-    /// pruned 目录若其后代也被逐层剔除、最终无存活子节点，则整目录被跳过（不提交）。
+    /// 复现 issue #128 追加反馈的「多层级」场景：pruned 链贯穿 4 层
+    /// (/大主宰3D → /S02 连载中 → /S02 4K NoSub → /字幕文件)，
+    /// 其中最深层 字幕文件 的全部子项被排除（空壳）、同层混有存活文件与干净子目录。
+    /// 期望：整条 pruned 链上任何一层目录的 fs_id 都不得被整目录直传；
+    /// 空壳目录被跳过；存活文件与干净子目录正常提交。
+    #[test]
+    fn test_multilevel_pruned_chain_never_submits_ancestor_dirs() {
+        let dir = tempdir().unwrap();
+        let s = {
+            let mut s = sub();
+            s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/apps".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            })];
+            s
+        };
+        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+
+        // 快照阶段的产物：被排除项（*Soft* mp4 / *.zip*）已不在快照中，
+        // 其祖先链全部被标记 subtree_pruned。
+        let mk_dir = |path: &str, fs_id: u64, pruned: bool| {
+            let name = path.rsplit('/').next().unwrap().to_string();
+            let mut d = ShareSnapshotItem::new(path, name, fs_id, 0, true);
+            d.subtree_pruned = pruned;
+            d
+        };
+        let items = vec![
+            mk_dir("/大主宰3D", 1, true),
+            mk_dir("/大主宰3D/S02 连载中", 2, true),
+            mk_dir("/大主宰3D/S02 连载中/S02 4K NoSub", 3, true),
+            // 全部子项被 *.zip* 排除 → 空壳 + pruned
+            mk_dir("/大主宰3D/S02 连载中/S02 4K NoSub/字幕文件", 4, true),
+            // 干净子目录（无被排除后代）→ 应保持整目录提交
+            mk_dir("/大主宰3D/S02 连载中/S02 4K NoSub/花絮", 5, false),
+            item("/大主宰3D/S02 连载中/S02 4K NoSub/花絮/mv.mp4", 51, 10),
+            // 存活文件（HEVC 版本未被排除）
+            item("/大主宰3D/S02 连载中/S02 4K NoSub/E01.4K.HEVC-GM.mp4", 31, 100),
+            item("/大主宰3D/S02 连载中/S02 4K NoSub/E02.4K.HEVC-GM.mp4", 32, 100),
+        ];
+        let curr = ShareSnapshot::with_items(&s.id, items);
+
+        let diff = diff_snapshots(None, &curr);
+        let hooks = MockHooks::default();
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+        let outcome = futures::executor::block_on(ex.apply_with_run_id_tree(
+            "run-deep".into(),
+            &captured(),
+            &diff,
+        ));
+        assert_eq!(outcome.status, RunStatus::Completed);
+
+        let submitted: Vec<u64> = hooks
+            .batch_transfers
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(_, ids, _)| ids.clone())
+            .collect();
+        // pruned 链上的每一层目录都不得被整目录直传
+        for (fs_id, label) in [
+            (1u64, "/大主宰3D"),
+            (2, "/S02 连载中"),
+            (3, "/S02 4K NoSub"),
+            (4, "/字幕文件(空壳)"),
+        ] {
+            assert!(
+                !submitted.contains(&fs_id),
+                "pruned 目录 {} (fs_id={}) 被整目录直传了: {:?}",
+                label,
+                fs_id,
+                submitted
+            );
+        }
+        // 存活文件与干净子目录必须被提交
+        assert!(submitted.contains(&31), "存活文件 E01 未被转存: {:?}", submitted);
+        assert!(submitted.contains(&32), "存活文件 E02 未被转存: {:?}", submitted);
+        assert!(submitted.contains(&5), "干净子目录 /花絮 未被整目录转存: {:?}", submitted);
+    }
+
+    /// pruned 目录若其后代也被逐层剔除，最终无存活子节点，则整目录被跳过（不提交）。
     #[test]
     fn test_fully_excluded_pruned_dir_submits_nothing() {
         let dir = tempdir().unwrap();

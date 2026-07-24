@@ -579,40 +579,13 @@ impl<'a> SnapshotCollector<'a> {
             });
         }
 
-        // Step 3: 过滤
-        //
-        // 同时记录「被 include/exclude 剔除项」的所有祖先目录路径。转存阶段若把某个
-        // 目录当作单个 fs_id 整体直传，百度服务端会按 fs_id **递归复制整目录**，连带
-        // 把这里被过滤掉的子项也搬过去 —— 过滤形同虚设。因此需要标记「有后代被剔除」
-        // 的存活目录（`subtree_pruned=true`），让转存阶段拒绝整目录直传、改为展开到
-        // 子节点逐层提交，从而真正跳过被过滤的分支。
-        let mut pruned_ancestors: BTreeSet<String> = BTreeSet::new();
-        let filtered: Vec<ShareSnapshotItem> = all_items
-            .into_iter()
-            .filter(|it| {
-                if self.item_allowed(it) {
-                    true
-                } else {
-                    for anc in ancestor_dirs(&it.path) {
-                        pruned_ancestors.insert(anc);
-                    }
-                    false
-                }
-            })
-            .collect();
-
-        // 给存活下来的、且有后代被剔除的目录条目打标。
-        let mut filtered = filtered;
-        if !pruned_ancestors.is_empty() {
-            for it in filtered.iter_mut() {
-                if it.is_dir && pruned_ancestors.contains(&it.path) {
-                    it.subtree_pruned = true;
-                }
-            }
-        }
-
-        // 排序（path 字典序）
-        filtered.sort_by(|a, b| a.path.cmp(&b.path));
+        // Step 3: 过滤 + 标记（抽成自由函数，见 `filter_and_mark_pruned` 注释）
+        let filtered = filter_and_mark_pruned(
+            all_items,
+            &self.include_paths,
+            &self.include_index,
+            self.exclude_set.as_ref(),
+        );
 
         let captured = CapturedShare {
             short_key: self.short_key.clone(),
@@ -703,32 +676,18 @@ impl<'a> SnapshotCollector<'a> {
             return true;
         }
         // 命中预计算索引 → dir 是某个 include_path 自身或它的祖先
-        self.include_index.contains(dir)
-    }
-
-    fn item_allowed(&self, item: &ShareSnapshotItem) -> bool {
-        // 1) include 过滤：item.path 是某个 include_path 自身或后代
-        if !self.include_paths.is_empty() && !self.include_index.contains(&item.path) {
-            // 二级检查：item.path 是否是某个 include_path 的后代（include 选了目录，
-            // 它下面的所有文件/子目录都应被收录）
-            let mut allowed = false;
-            for inc in &self.include_paths {
-                if is_path_ancestor_or_self(&item.path, inc) {
-                    allowed = true;
-                    break;
-                }
-            }
-            if !allowed {
-                return false;
-            }
+        if self.include_index.contains(dir) {
+            return true;
         }
-        // 2) exclude 过滤：任意 exclude glob 命中则排除
-        if let Some(ref set) = self.exclude_set {
-            if set.is_match(&item.path) {
-                return false;
-            }
-        }
-        true
+        // dir 是某个 include **目录**的后代 → 用户圈选的是整棵子树，必须继续深入。
+        // 漏掉这一支时（issue #128 追加反馈的「多层级过滤失效」根因），BFS 在
+        // include 目录下一层就截断：深层内容从未被扫描，exclude 过滤与
+        // subtree_pruned 标记都无从发生，后续整目录 fs_id 直传会让百度服务端
+        // 把被排除的深层内容原样递归复制回来。
+        // `item_allowed` / `dir_needs_more_pages` 均有同款后代判断，三者语义须一致。
+        self.include_paths
+            .iter()
+            .any(|inc| is_path_ancestor_or_self(dir, inc))
     }
 
     fn dir_needs_more_pages(&self, dir: &str, found_included_files: &BTreeSet<String>) -> bool {
@@ -1028,7 +987,92 @@ fn dir_allowed_with(
     if include_paths.is_empty() {
         return true;
     }
-    include_index.contains(dir)
+    if include_index.contains(dir) {
+        return true;
+    }
+    // dir 是某个 include 目录的后代 → 整棵子树都要深入（与 `dir_allowed` 一致，
+    // 详见其注释；漏掉此支 = issue #128 的多层级过滤失效）。
+    include_paths
+        .iter()
+        .any(|inc| is_path_ancestor_or_self(dir, inc))
+}
+
+/// 单条目 include/exclude 准入判断（原 `SnapshotCollector::item_allowed`）。
+/// 做成自由函数是为了让 `filter_and_mark_pruned` 可以脱离 collector（不依赖
+/// 网络客户端）被单元测试直接驱动。
+fn item_allowed_with(
+    include_paths: &BTreeSet<String>,
+    include_index: &BTreeSet<String>,
+    exclude_set: Option<&RegexSet>,
+    item: &ShareSnapshotItem,
+) -> bool {
+    // 1) include 过滤：item.path 是某个 include_path 自身/祖先（索引命中）或后代
+    if !include_paths.is_empty() && !include_index.contains(&item.path) {
+        // 二级检查：item.path 是否是某个 include_path 的后代（include 选了目录，
+        // 它下面的所有文件/子目录都应被收录）
+        let mut allowed = false;
+        for inc in include_paths {
+            if is_path_ancestor_or_self(&item.path, inc) {
+                allowed = true;
+                break;
+            }
+        }
+        if !allowed {
+            return false;
+        }
+    }
+    // 2) exclude 过滤：任意 exclude glob 命中则排除
+    if let Some(set) = exclude_set {
+        if set.is_match(&item.path) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 抓取 Step 3：应用 include/exclude 过滤，并给「有后代被剔除」的存活目录打
+/// `subtree_pruned` 标记，返回按 path 字典序排好的最终快照条目。
+///
+/// 为什么要标记：转存阶段若把某个目录当作单个 fs_id 整体直传，百度服务端会按
+/// fs_id **递归复制整目录**，连带把这里被过滤掉的子项也搬过去 —— 过滤形同虚设。
+/// 标记后转存阶段会拒绝对这类目录整目录直传、展开到子节点逐层提交（executor 的
+/// `transfer_node_set` 入口），从而真正跳过被过滤的分支。
+///
+/// 抽成自由函数：`collect()` 依赖真实网络客户端无法单测，而这段过滤/标记逻辑
+/// 恰是 issue #128（多层级过滤失效）的回归高发区，必须可以被直接测试。
+fn filter_and_mark_pruned(
+    all_items: Vec<ShareSnapshotItem>,
+    include_paths: &BTreeSet<String>,
+    include_index: &BTreeSet<String>,
+    exclude_set: Option<&RegexSet>,
+) -> Vec<ShareSnapshotItem> {
+    let mut pruned_ancestors: BTreeSet<String> = BTreeSet::new();
+    let mut filtered: Vec<ShareSnapshotItem> = all_items
+        .into_iter()
+        .filter(|it| {
+            if item_allowed_with(include_paths, include_index, exclude_set, it) {
+                true
+            } else {
+                for anc in ancestor_dirs(&it.path) {
+                    pruned_ancestors.insert(anc);
+                }
+                false
+            }
+        })
+        .collect();
+
+    // 给存活下来的、且有后代被剔除的目录条目打标。
+    if !pruned_ancestors.is_empty() {
+        for it in filtered.iter_mut() {
+            if it.is_dir && pruned_ancestors.contains(&it.path) {
+                it.subtree_pruned = true;
+            }
+        }
+    }
+
+    // 排序（path 字典序）
+    filtered.sort_by(|a, b| a.path.cmp(&b.path));
+    filtered
 }
 
 /// 把一批 list 结果并入抓取状态：去重推入快照、记录命中的 include 文件、
@@ -1180,13 +1224,146 @@ mod tests {
         let empty = BTreeSet::new();
         assert!(dir_allowed_with(&empty, &empty, "/anything"));
 
-        // 有 include → 只放行 include 自身及其祖先（即预计算索引里的项）
+        // include 是具体文件 → 放行其祖先（用于走到该文件），不放行无关目录
         let mut includes = BTreeSet::new();
         includes.insert("/a/b/c.mp4".to_string());
         let index = build_include_index(&includes);
         assert!(dir_allowed_with(&includes, &index, "/a"));
         assert!(dir_allowed_with(&includes, &index, "/a/b"));
         assert!(!dir_allowed_with(&includes, &index, "/other"));
+        // 文件 include 没有"后代目录"概念：同层其它目录不放行（避免全树扫描）
+        assert!(!dir_allowed_with(&includes, &index, "/a/b/other_dir"));
+
+        // include 是目录 → **后代目录必须放行**（issue #128 多层级过滤失效的根因：
+        // 只查索引会在 include 目录下一层截断 BFS，深层内容从未被扫描，
+        // exclude / subtree_pruned 全部失效）
+        let mut dir_includes = BTreeSet::new();
+        dir_includes.insert("/大主宰3D".to_string());
+        let dir_index = build_include_index(&dir_includes);
+        assert!(dir_allowed_with(&dir_includes, &dir_index, "/大主宰3D"));
+        assert!(
+            dir_allowed_with(&dir_includes, &dir_index, "/大主宰3D/S02 连载中"),
+            "include 目录的一级子目录必须放行"
+        );
+        assert!(
+            dir_allowed_with(
+                &dir_includes,
+                &dir_index,
+                "/大主宰3D/S02 连载中/S02 4K NoSub/字幕文件"
+            ),
+            "include 目录的任意深度后代都必须放行"
+        );
+        assert!(!dir_allowed_with(&dir_includes, &dir_index, "/其他目录"));
+        // 前缀相似但非路径后代：/大主宰3Dxx 不是 /大主宰3D 的后代
+        assert!(!dir_allowed_with(&dir_includes, &dir_index, "/大主宰3Dxx"));
+    }
+
+    /// 端到端复现 issue #128 追加反馈：include 圈定目录 + exclude 排除深层内容。
+    /// 模拟修复后 BFS 应扫出的完整条目集，走真实的 `filter_and_mark_pruned`：
+    /// 深层被排除项必须剔除，且其祖先链每一层都被标 `subtree_pruned`（否则转存
+    /// 阶段整目录直传会把它们带回来）。
+    #[test]
+    fn test_issue128_deep_exclude_marks_whole_ancestor_chain() {
+        let mut includes = BTreeSet::new();
+        includes.insert("/大主宰3D".to_string());
+        let index = build_include_index(&includes);
+        let excludes =
+            compile_exclude_patterns(&["*S01*".into(), "*Soft*".into(), "*.zip*".into()])
+                .unwrap();
+
+        let mk_dir = |path: &str, fs_id: u64| {
+            let name = path.rsplit('/').next().unwrap().to_string();
+            ShareSnapshotItem::new(path, name, fs_id, 0, true)
+        };
+        // BFS(修复后)扫出的全量条目：含深层 zip / Soft / S01
+        let all_items = vec![
+            mk_dir("/大主宰3D", 1),
+            mk_dir("/大主宰3D/S01", 6), // 一级排除
+            mk_dir("/大主宰3D/S02 连载中", 2),
+            mk_dir("/大主宰3D/S02 连载中/S02 4K NoSub", 3),
+            mk_dir("/大主宰3D/S02 连载中/S02 4K NoSub/字幕文件", 4),
+            item("/大主宰3D/S02 连载中/S02 4K NoSub/字幕文件/56.zip", 41, 1),
+            item(
+                "/大主宰3D/S02 连载中/S02 4K NoSub/E01.4K.Soft-GM.mp4",
+                31,
+                100,
+            ),
+            item(
+                "/大主宰3D/S02 连载中/S02 4K NoSub/E01.4K.HEVC-GM.mp4",
+                32,
+                100,
+            ),
+        ];
+
+        let out = filter_and_mark_pruned(all_items, &includes, &index, Some(&excludes));
+        let by_path: BTreeMap<&str, &ShareSnapshotItem> =
+            out.iter().map(|i| (i.path.as_str(), i)).collect();
+
+        // 被排除项（无论层级）不得存活
+        for gone in [
+            "/大主宰3D/S01",
+            "/大主宰3D/S02 连载中/S02 4K NoSub/字幕文件/56.zip",
+            "/大主宰3D/S02 连载中/S02 4K NoSub/E01.4K.Soft-GM.mp4",
+        ] {
+            assert!(!by_path.contains_key(gone), "{gone} 应被排除");
+        }
+        // 存活文件仍在
+        assert!(by_path.contains_key("/大主宰3D/S02 连载中/S02 4K NoSub/E01.4K.HEVC-GM.mp4"));
+        // 关键：祖先链每一层都必须被标 pruned，禁止整目录直传
+        for (dir, why) in [
+            ("/大主宰3D", "含被排除的 S01 与深层内容"),
+            ("/大主宰3D/S02 连载中", "含深层被排除内容"),
+            ("/大主宰3D/S02 连载中/S02 4K NoSub", "直接含被排除的 Soft/zip"),
+            ("/大主宰3D/S02 连载中/S02 4K NoSub/字幕文件", "全部子项被排除"),
+        ] {
+            let d = by_path
+                .get(dir)
+                .unwrap_or_else(|| panic!("{dir} 应存活于快照"));
+            assert!(d.subtree_pruned, "{dir} 应被标 subtree_pruned（{why}）");
+        }
+    }
+
+    /// absorb_entries 的目录入队必须放行 include 目录的后代（与 dir_allowed 同款
+    /// 修复）：否则 BFS 在 include 目录下一层截断，深层内容永远扫不到。
+    #[test]
+    fn test_absorb_entries_enqueues_descendants_of_included_dir() {
+        let mut includes = BTreeSet::new();
+        includes.insert("/大主宰3D".to_string());
+        let index = build_include_index(&includes);
+        let mut all_items = Vec::new();
+        let mut seen = HashSet::new();
+        let mut queued_dirs = HashSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        let mut found = BTreeSet::new();
+        let mut files_seen = 0usize;
+
+        // 列 /大主宰3D 得到的一级条目：子目录 + 无关目录（不在 include 下）
+        let batch = vec![
+            shared_file("/大主宰3D/S02 连载中", "S02 连载中", 2, true),
+            shared_file("/其他目录", "其他目录", 9, true),
+        ];
+        absorb_entries(
+            batch,
+            "",
+            &includes,
+            &index,
+            &mut all_items,
+            &mut seen,
+            &mut queued_dirs,
+            &mut queue,
+            &mut found,
+            &mut files_seen,
+        );
+        assert!(
+            queued_dirs.contains("/大主宰3D/S02 连载中"),
+            "include 目录的子目录必须入队继续深入: {:?}",
+            queued_dirs
+        );
+        assert!(
+            !queued_dirs.contains("/其他目录"),
+            "include 范围外的目录不应入队: {:?}",
+            queued_dirs
+        );
     }
 
     fn shared_file(path: &str, name: &str, fs_id: u64, is_dir: bool) -> SharedFileInfo {

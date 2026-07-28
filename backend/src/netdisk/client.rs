@@ -1891,14 +1891,24 @@ impl NetdiskClient {
             "https://pcs.baidu.com/",
         ];
 
-        let mut result = vec![];
+        // 按 cookie name 去重（保留首次出现），避免多域同名 cookie 同时进入
+        // Cookie 头。尤其 STOKEN：passport(.baidu.com) 与 pan(pan.baidu.com) 可能
+        // 是两个不同值，全部发出会让百度 filemanager 命中错误的那个 → errno=-6
+        // （issue #130，QR 登录的多域账号；BaiduPCS-Go 只发单个 stoken 故正常）。
+        let mut names: Vec<String> = Vec::new();
+        let mut result: Vec<String> = Vec::new();
 
         for d in domains {
             let url = d.parse::<reqwest::Url>()?;
             if let Some(header) = self.cookie_jar.cookies(&url) {
                 if let Ok(s) = header.to_str() {
                     for kv in s.split("; ") {
-                        if !result.contains(&kv.to_string()) {
+                        let name = kv.split('=').next().unwrap_or("").to_string();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        if !names.contains(&name) {
+                            names.push(name);
                             result.push(kv.to_string());
                         }
                     }
@@ -1906,16 +1916,33 @@ impl NetdiskClient {
             }
         }
 
-        // 强制保证 BDUSS + PANPSC 必定存在
-        if !result.iter().any(|x| x.starts_with("BDUSS=")) {
-            let bd = format!("BDUSS={}", self.user_auth.bduss);
-            result.push(bd);
+        // 强制保证 BDUSS 存在
+        if !names.iter().any(|n| n == "BDUSS") {
+            result.push(format!("BDUSS={}", self.user_auth.bduss));
         }
 
+        // PANPSC 用最新预热值覆盖（jar 里可能同样存在多域旧值）
         let panpsc_val = self.panpsc_cookie.lock().await.clone();
-        if !result.iter().any(|x| x.starts_with("PANPSC=")) {
-            if let Some(v) = panpsc_val {
-                result.push(format!("PANPSC={}", v));
+        if let Some(v) = panpsc_val {
+            result.retain(|x| !x.starts_with("PANPSC="));
+            result.push(format!("PANPSC={}", v));
+        }
+
+        // 强制 STOKEN 唯一：以登录时保存、已验证可用（可在 BaiduPCS-Go 删除）的
+        // user_auth.stoken 为准，清除 jar 里可能混入的另一域 STOKEN（issue #130）。
+        if let Some(ref st) = self.user_auth.stoken {
+            if !st.is_empty() {
+                // 可观测：jar 里出现多个 STOKEN 正是 issue #130 的触发条件，
+                // 打印命中日志，便于上线后从用户日志确认修复路径生效。
+                let stoken_count = result.iter().filter(|x| x.starts_with("STOKEN=")).count();
+                if stoken_count > 1 {
+                    warn!(
+                        "collect_all_baidu_cookies: 检测到 {} 个 STOKEN（多域混入），已统一为登录保存的 user_auth.stoken（issue #130）",
+                        stoken_count
+                    );
+                }
+                result.retain(|x| !x.starts_with("STOKEN="));
+                result.push(format!("STOKEN={}", st));
             }
         }
 

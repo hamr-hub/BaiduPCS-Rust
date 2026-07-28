@@ -17,12 +17,29 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-/// 槽位过期警告阈值（2分钟未更新）
-pub const STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(120);
-/// 槽位过期释放阈值（5分钟未更新）
-pub const STALE_RELEASE_THRESHOLD: Duration = Duration::from_secs(300);
+/// 槽位过期警告阈值（默认值；实际取「有效释放阈值」的一半，随配置缩放）
+pub const STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(900);
+/// 槽位过期释放阈值（默认 30 分钟未更新）。
+///
+/// 槽位的「最后更新时间」只在下载**收到字节**时刷新(见 engine 的 slot_touch)。
+/// 因此这个阈值的真实含义是「连续多久零字节进展就判定卡死、回收槽位」。
+/// 原值 5 分钟对弱网/被限速的下载太短 —— 限速时出现几分钟 0 字节空档很常见，
+/// 会把其实还在(缓慢)下载的任务误判为卡死并判失败。放宽到 30 分钟:只有真正
+/// 长时间彻底不动才回收，慢速下载只要还有一点点字节进来就会持续刷新、不受影响。
+/// 可用 `BAIDUPCS_SLOT_STALE_RELEASE_MINS` 覆盖(取值 >0)。
+pub const STALE_RELEASE_THRESHOLD: Duration = Duration::from_secs(1800);
 /// 清理任务执行间隔（30秒）
 pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 读取「有效的槽位过期释放阈值」：env 覆盖 + 默认 `STALE_RELEASE_THRESHOLD`。
+fn effective_stale_release_threshold() -> Duration {
+    std::env::var("BAIDUPCS_SLOT_STALE_RELEASE_MINS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(|mins| Duration::from_secs(mins * 60))
+        .unwrap_or(STALE_RELEASE_THRESHOLD)
+}
 
 /// 任务位类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -702,13 +719,16 @@ impl TaskSlotPool {
 
     /// 清理过期槽位
     ///
-    /// 检测超过 5 分钟未更新的槽位，自动释放并记录日志。
-    /// 超过 2 分钟但未达到 5 分钟的槽位会记录警告。
+    /// 检测「连续超过释放阈值(默认 30 分钟、可配置)零进展」的槽位，自动释放并记录日志。
+    /// 超过阈值一半但未达到释放线的槽位会记录警告。
     ///
     /// # Returns
     /// 被释放的任务ID列表
     pub async fn cleanup_stale_slots(&self) -> Vec<String> {
         let now = Instant::now();
+        // 有效释放阈值(env 可覆盖)；警告线取其一半，随之缩放，避免慢下载一直刷警告。
+        let release_threshold = effective_stale_release_threshold();
+        let warning_threshold = release_threshold / 2;
         let mut released_tasks = Vec::new();
         let mut warned_tasks = Vec::new();
         let max_slots = self.max_slots.load(Ordering::SeqCst);
@@ -723,8 +743,8 @@ impl TaskSlotPool {
             if let Some(last_updated) = slot.last_updated_at {
                 let elapsed = now.duration_since(last_updated);
 
-                if elapsed >= STALE_RELEASE_THRESHOLD {
-                    // 超过5分钟，自动释放
+                if elapsed >= release_threshold {
+                    // 超过释放阈值(默认 30 分钟)零进展，自动释放
                     let task_id = slot.task_id.clone().unwrap_or_default();
                     let allocated_at = slot.allocated_at;
 
@@ -737,8 +757,8 @@ impl TaskSlotPool {
 
                     released_tasks.push(task_id);
                     slot.release();
-                } else if elapsed >= STALE_WARNING_THRESHOLD {
-                    // 超过2分钟，记录警告
+                } else if elapsed >= warning_threshold {
+                    // 超过警告线(释放阈值的一半)，记录警告
                     let task_id = slot.task_id.as_deref().unwrap_or("unknown");
                     warned_tasks.push((slot.id, task_id.to_string(), elapsed));
                 }
@@ -987,6 +1007,32 @@ mod tests {
         assert_eq!(pool.max_slots(), 5);
         assert_eq!(pool.available_borrow_slots().await, 5);
         assert_eq!(pool.used_slots().await, 0);
+    }
+
+    /// 停滞回收:默认阈值 30 分钟。只有「最后更新」早于阈值的槽位才被释放；
+    /// 阈值之内(哪怕已很久)的不动。回归 issue #136:原 5 分钟阈值把限速慢下载
+    /// 误判卡死，放宽到 30 分钟后 20 分钟无进展的任务不再被误杀。
+    #[tokio::test]
+    async fn test_cleanup_stale_slots_uses_30min_threshold() {
+        let pool = TaskSlotPool::new(3);
+        pool.allocate_fixed_slot("fresh", false).await.unwrap();
+        pool.allocate_fixed_slot("stale", false).await.unwrap();
+
+        // fresh: 20 分钟前更新(< 30min 阈值)→ 不该被回收(旧的 5min 阈值下会被误杀)
+        pool.set_slot_last_updated(
+            "fresh",
+            Instant::now() - Duration::from_secs(20 * 60),
+        )
+            .await;
+        // stale: 31 分钟前更新(> 30min 阈值)→ 应被回收
+        pool.set_slot_last_updated(
+            "stale",
+            Instant::now() - Duration::from_secs(31 * 60),
+        )
+            .await;
+
+        let released = pool.cleanup_stale_slots().await;
+        assert_eq!(released, vec!["stale".to_string()], "只应回收真正停滞的槽位");
     }
 
     #[tokio::test]

@@ -2791,6 +2791,10 @@ impl DownloadManager {
         let tasks = self.tasks.clone();
         let ws_manager = self.ws_manager.clone();
         let chunk_scheduler = self.chunk_scheduler.clone();
+        // 🔥 槽位超时释放时要真正把下载 worker 停掉：仅标记失败而不取消，worker 会
+        //    继续跑(刷新链接、探测),在临时目录被清理后对着不存在的路径狂刷
+        //    「31066 file does not exist」。取消令牌 + 调度器一起停。
+        let cancellation_tokens = self.cancellation_tokens.clone();
         // 🔥 备份任务终态失败需要走 BackupTransferNotification::Failed，
         //    与 publish_event() 的"备份任务跳过普通下载事件"约定保持一致。
         let backup_notification_tx_arc = self.backup_notification_tx.clone();
@@ -2818,6 +2822,14 @@ impl DownloadManager {
                         t.slot_id = None;
                         (t.group_id.clone(), t.total_size, t.is_backup, t.owner_uid.raw())
                     };
+
+                    // 🔥 真正停掉下载 worker：先触发取消令牌终止当前分片循环，再让调度器
+                    //    清理该任务，避免 worker 在任务已判失败后继续刷新链接 / 探测，
+                    //    在临时目录被上层清理后疯狂报 31066 file does not exist。
+                    if let Some(token) = cancellation_tokens.read().await.get(&task_id) {
+                        token.cancel();
+                    }
+                    chunk_scheduler.cancel_task(&task_id).await;
 
                     // 发送终态失败通知：备份任务走 BackupTransferNotification::Failed，
                     // 普通下载任务保持原有的 WebSocket 路径。

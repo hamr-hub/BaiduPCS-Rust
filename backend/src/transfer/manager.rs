@@ -1907,10 +1907,10 @@ impl TransferManager {
         let start_task_concurrency_limit = std::env::var(
             "BAIDUPCS_AUTO_DOWNLOAD_START_CONCURRENCY",
         )
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(128);
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(128);
         for (fs_id, remote_path, filename, size, local_dir) in download_files {
             // 确保本地下载目录存在（分批模式下可能是按原始结构还原出的父目录）
             if ensured_local_dirs.insert(local_dir.clone()) && !local_dir.exists() {
@@ -2179,10 +2179,15 @@ impl TransferManager {
             // 🔥 从共享引用快照当前客户端（代理热更新后自动生效）
             let client = Arc::new(client.read().unwrap().clone());
             const CHECK_INTERVAL: Duration = Duration::from_secs(2);
-            const DOWNLOAD_TIMEOUT_HOURS: i64 = 24;
+            // 下载「停滞超时」：连续这么久零字节进展才判失败(取代旧的绝对 24h 超时)。
+            let stall_timeout_secs = Self::download_stall_timeout_secs();
             let share_sync_download_failure_retry_max =
                 Self::share_sync_download_failure_retry_max();
             let mut share_sync_download_failure_retry_attempts = 0u32;
+            // 停滞检测的滚动状态:上次观察到的已下载字节总量 + 上次「有进展」的时刻。
+            // 字节一旦增长就把时刻刷新为当前(等价于把超时计时器归零/顺延)。
+            let mut stall_last_bytes: u64 = 0;
+            let mut stall_last_progress_at: Option<i64> = None;
 
             loop {
                 tokio::time::sleep(CHECK_INTERVAL).await;
@@ -2226,73 +2231,143 @@ impl TransferManager {
                 };
                 let is_share_sync_internal_download = is_internal
                     && backup_config_id
-                        .as_deref()
-                        .map(|id| id.starts_with("share-sync:"))
-                        .unwrap_or(false);
+                    .as_deref()
+                    .map(|id| id.starts_with("share-sync:"))
+                    .unwrap_or(false);
 
                 // 非下载中状态，停止监听
                 if status != TransferStatus::Downloading {
                     break;
                 }
 
-                // 超时检查
-                if let Some(started_at) = download_started_at {
+                // 停滞超时检查
+                //
+                // 旧逻辑是「从下载开始算满 24h 就判失败」，会把慢但仍在下载的任务
+                // (低带宽/被限速)误杀，还连带清临时目录导致其余在下文件报 31066。
+                // 新逻辑:只要已下载字节仍在增长就把计时器归零；只有连续
+                // `stall_timeout_secs` 零进展才判「停滞」。
+                if download_started_at.is_some() {
                     let now = chrono::Utc::now().timestamp();
-                    let elapsed_hours = (now - started_at) / 3600;
-                    if elapsed_hours > DOWNLOAD_TIMEOUT_HOURS {
-                        warn!(
-                            "下载超时: task_id={}, 已超过 {} 小时",
-                            task_id, elapsed_hours
-                        );
-
-                        // 获取分享直下相关信息
-                        let (is_share_direct_download, temp_dir) = {
-                            let t = task.read().await;
-                            (t.is_share_direct_download, t.temp_dir.clone())
-                        };
-
-                        {
-                            let mut t = task.write().await;
-                            t.status = TransferStatus::DownloadFailed;
-                            t.error = Some(format!("下载超时（超过{}小时）", DOWNLOAD_TIMEOUT_HOURS));
-                            t.touch();
+                    let (cur_bytes, any_active) = Self::aggregate_download_progress(
+                        &download_manager,
+                        &folder_download_manager,
+                        &download_task_ids,
+                    )
+                        .await;
+                    match stall_last_progress_at {
+                        None => {
+                            // 首次进入下载：初始化基准，不判超时
+                            stall_last_bytes = cur_bytes;
+                            stall_last_progress_at = Some(now);
                         }
+                        Some(last_at) => {
+                            // 判进展的两个信号：
+                            // ① 没有活跃下载(全部暂停/无在下任务)—— 停滞时钟应暂停，
+                            //    否则用户主动暂停的任务会被误判停滞；
+                            // ② 字节总和「与上次不同」—— 用变动而非「超过历史峰值」，
+                            //    因为已完成任务归档后被移出内存会让总和**下降**，重试
+                            //    重置也会变动，这些都是任务仍在推进的表现。
+                            // 只有「有活跃下载 且 字节持续完全不变」(真·0 KB/s 卡死)才判停滞。
+                            if !any_active || cur_bytes != stall_last_bytes {
+                                stall_last_bytes = cur_bytes;
+                                stall_last_progress_at = Some(now);
+                            } else if now - last_at > stall_timeout_secs {
+                                let stalled_mins = (now - last_at) / 60;
+                                warn!(
+                                    "下载停滞超时: task_id={}, 连续 {} 分钟无字节进展(已下载 {} 字节)",
+                                    task_id, stalled_mins, cur_bytes
+                                );
 
-                        // 分享直下任务：下载超时也需要清理临时目录
-                        if is_share_direct_download {
-                            let (cleanup_on_failure, configured_root) = {
-                                let cfg = app_config.read().await;
-                                (cfg.share_direct_download.cleanup_on_failure, cfg.share_direct_download.temp_dir.clone())
-                            };
+                                // 获取分享直下相关信息
+                                let (is_share_direct_download, temp_dir) = {
+                                    let t = task.read().await;
+                                    (t.is_share_direct_download, t.temp_dir.clone())
+                                };
 
-                            if cleanup_on_failure {
-                                if let Some(ref temp_dir) = temp_dir {
-                                    info!("下载超时，触发临时目录清理: task_id={}, temp_dir={}", task_id, temp_dir);
-                                    let cleanup = Self::cleanup_temp_dir_internal(&client, temp_dir, &configured_root).await;
-                                    info!("下载超时清理结果: task_id={}, status={:?}", task_id, cleanup.status);
-                                    if let Some(ref pm_arc) = persistence_manager {
-                                        if let Err(e) = pm_arc.lock().await.update_cleanup_status(&task_id, cleanup.status) {
-                                            warn!("持久化清理状态失败: task_id={}, error={}", task_id, e);
+                                // 先取消底层下载 worker，避免它们继续对(即将被清理的)
+                                // 临时目录刷 Locate、刷出满屏 31066。
+                                Self::cancel_associated_downloads(
+                                    &download_manager,
+                                    &folder_download_manager,
+                                    &download_task_ids,
+                                )
+                                    .await;
+
+                                let old_status;
+                                {
+                                    let mut t = task.write().await;
+                                    old_status = format!("{:?}", t.status).to_lowercase();
+                                    t.status = TransferStatus::DownloadFailed;
+                                    // 中性文案：只陈述现象 + 下一步，不猜测原因(会员/带宽等)
+                                    t.error = Some(
+                                        "下载长时间无进展，已判定为停滞并停止；可稍后重试".to_string(),
+                                    );
+                                    t.touch();
+                                }
+
+                                // 持久化失败状态
+                                if let Some(ref pm_arc) = persistence_manager {
+                                    if let Err(e) = pm_arc
+                                        .lock()
+                                        .await
+                                        .update_transfer_status(&task_id, "download_failed")
+                                    {
+                                        warn!("持久化停滞失败状态失败: task_id={}, error={}", task_id, e);
+                                    }
+                                }
+
+                                // 广播状态变更
+                                if let Some(ref ws) = ws_manager {
+                                    ws.send_if_subscribed(
+                                        TaskEvent::Transfer(TransferEvent::StatusChanged {
+                                            task_id: task_id.to_string(),
+                                            old_status,
+                                            new_status: "download_failed".to_string(),
+                                            owner_uid: Some(owner_uid_raw),
+                                        }),
+                                        None,
+                                    );
+                                }
+
+                                // 分享直下任务：清理临时目录(worker 已先行取消)
+                                if is_share_direct_download {
+                                    let (cleanup_on_failure, configured_root) = {
+                                        let cfg = app_config.read().await;
+                                        (
+                                            cfg.share_direct_download.cleanup_on_failure,
+                                            cfg.share_direct_download.temp_dir.clone(),
+                                        )
+                                    };
+                                    if cleanup_on_failure {
+                                        if let Some(ref temp_dir) = temp_dir {
+                                            info!("下载停滞，触发临时目录清理: task_id={}, temp_dir={}", task_id, temp_dir);
+                                            let cleanup = Self::cleanup_temp_dir_internal(&client, temp_dir, &configured_root).await;
+                                            info!("下载停滞清理结果: task_id={}, status={:?}", task_id, cleanup.status);
+                                            if let Some(ref pm_arc) = persistence_manager {
+                                                if let Err(e) = pm_arc.lock().await.update_cleanup_status(&task_id, cleanup.status) {
+                                                    warn!("持久化清理状态失败: task_id={}, error={}", task_id, e);
+                                                }
+                                            }
                                         }
                                     }
                                 }
+
+                                break;
                             }
                         }
-
-                        break;
                     }
                 }
 
                 if is_share_sync_internal_download
                     && share_sync_download_failure_retry_attempts
-                        < share_sync_download_failure_retry_max
+                    < share_sync_download_failure_retry_max
                 {
                     let restarted = Self::restart_failed_downloads_once(
                         &download_manager,
                         &folder_download_manager,
                         &download_task_ids,
                     )
-                    .await;
+                        .await;
                     if restarted > 0 {
                         share_sync_download_failure_retry_attempts += 1;
                         warn!(
@@ -2567,6 +2642,95 @@ impl TransferManager {
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(20)
+    }
+
+    /// 下载「停滞超时」阈值（秒）。
+    ///
+    /// 取代原先「从下载开始算满 24h 就一刀切判失败」的绝对超时 —— 那种做法会把
+    /// 「慢但仍在下载」的任务(低带宽/被限速)误杀。改为:只有在**连续这么久没有
+    /// 任何字节进展**时才判定停滞。正常下载即使很慢也会持续有字节增长，永远不会
+    /// 触发；只有真正卡死(0 字节/长时间)才会被清掉，防卡死能力不丢。
+    ///
+    /// 默认 30 分钟。可用 `BAIDUPCS_DOWNLOAD_STALL_TIMEOUT_MINS` 覆盖(取值 >0)。
+    fn download_stall_timeout_secs() -> i64 {
+        let mins = std::env::var("BAIDUPCS_DOWNLOAD_STALL_TIMEOUT_MINS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(30);
+        mins * 60
+    }
+
+    /// 汇总关联下载任务的进度信号，用于停滞检测。
+    ///
+    /// 返回 `(已下载字节总和, 是否有子任务正在下载中)`：
+    /// - 字节总和:普通任务查 DownloadManager 内存态 `downloaded_size`，文件夹任务查
+    ///   FolderDownloadManager `downloaded_size`；查不到的按 0 计。
+    /// - 是否有活跃下载:任一子任务处于「下载中」(Downloading/Pending/Decrypting，
+    ///   文件夹为 Downloading/Scanning)时为 `true`。**用户暂停**的子任务不算活跃 ——
+    ///   停滞计时只应在真正尝试下载时累积，否则会把用户主动暂停的任务误判为停滞。
+    async fn aggregate_download_progress(
+        download_manager: &Arc<RwLock<Option<Arc<DownloadManager>>>>,
+        folder_download_manager: &Arc<RwLock<Option<Arc<FolderDownloadManager>>>>,
+        download_task_ids: &[String],
+    ) -> (u64, bool) {
+        use crate::downloader::task::TaskStatus;
+        let dm_lock = download_manager.read().await;
+        let fdm_lock = folder_download_manager.read().await;
+        let mut total: u64 = 0;
+        let mut any_active = false;
+        for task_id in download_task_ids {
+            if let Some(folder_id) = task_id.strip_prefix("folder:") {
+                if let Some(ref fdm) = *fdm_lock {
+                    if let Some(folder) = fdm.get_folder(folder_id).await {
+                        total = total.saturating_add(folder.downloaded_size);
+                        if matches!(
+                            folder.status,
+                            FolderStatus::Downloading | FolderStatus::Scanning
+                        ) {
+                            any_active = true;
+                        }
+                    }
+                }
+            } else if let Some(ref dm) = *dm_lock {
+                if let Some(t) = dm.get_task(task_id).await {
+                    total = total.saturating_add(t.downloaded_size);
+                    if matches!(
+                        t.status,
+                        TaskStatus::Downloading | TaskStatus::Pending | TaskStatus::Decrypting
+                    ) {
+                        any_active = true;
+                    }
+                }
+            }
+        }
+        (total, any_active)
+    }
+
+    /// 停滞/超时判定成立时，取消所有关联下载 worker。
+    ///
+    /// 关键:仅标记转存任务失败、却不取消底层下载 worker 的话，worker 会继续对着
+    /// (即将被清理的)临时目录刷 Locate、刷出满屏 `31066 file does not exist`。
+    /// 这里在清理临时目录**之前**先把 worker 停掉。用 `without_delete` 变体保留
+    /// 任务记录，便于前端/历史查看终态。
+    async fn cancel_associated_downloads(
+        download_manager: &Arc<RwLock<Option<Arc<DownloadManager>>>>,
+        folder_download_manager: &Arc<RwLock<Option<Arc<FolderDownloadManager>>>>,
+        download_task_ids: &[String],
+    ) {
+        let dm_lock = download_manager.read().await;
+        let fdm_lock = folder_download_manager.read().await;
+        for task_id in download_task_ids {
+            if let Some(folder_id) = task_id.strip_prefix("folder:") {
+                if let Some(ref fdm) = *fdm_lock {
+                    if let Err(e) = fdm.cancel_folder(folder_id, false).await {
+                        warn!("停滞超时取消文件夹下载失败: folder_id={}, err={}", folder_id, e);
+                    }
+                }
+            } else if let Some(ref dm) = *dm_lock {
+                dm.cancel_task_without_delete(task_id).await;
+            }
+        }
     }
 
     async fn restart_failed_downloads_once(

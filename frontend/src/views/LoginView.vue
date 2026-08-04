@@ -240,7 +240,7 @@
       <!-- 底部信息 -->
       <div class="footer">
         <p>基于 Rust + Axum + Vue 3 构建</p>
-        <p class="version">{{ APP_VERSION_LABEL }}</p>
+        <p class="version">v2.1.1</p>
       </div>
     </div>
   </div>
@@ -252,7 +252,6 @@ import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import { useIsMobile } from '@/utils/responsive'
-import { APP_VERSION_LABEL } from '@/utils/version'
 import {
   FolderOpened,
   Loading,

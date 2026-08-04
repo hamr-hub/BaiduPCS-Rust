@@ -38,11 +38,6 @@ pub struct TreeNode {
     pub children: Vec<usize>,
     /// 父节点下标;虚拟根为 None
     pub parent: Option<usize>,
-    /// 该目录在抓快照时「有后代被 include/exclude 过滤剔除」(源自
-    /// `ShareSnapshotItem.subtree_pruned`)。为 `true` 时**禁止**把此目录当作单个
-    /// fs_id 整体提交转存 —— 百度服务端会按 fs_id 递归复制整目录,把被过滤的子项也
-    /// 搬过去。转存阶段必须把它展开成子节点逐层提交。
-    pub subtree_pruned: bool,
 }
 
 impl TreeNode {
@@ -128,7 +123,6 @@ pub fn build(items: &[ShareSnapshotItem]) -> Tree {
         name: String::new(),
         children: Vec::new(),
         parent: None,
-        subtree_pruned: false,
     }];
     // path → idx 索引,O(log N) 查找祖先链
     use std::collections::BTreeMap;
@@ -156,7 +150,6 @@ pub fn build(items: &[ShareSnapshotItem]) -> Tree {
             n.is_dir = item.is_dir;
             n.size = item.size;
             n.name = item.name.clone();
-            n.subtree_pruned = item.subtree_pruned;
             // parent / children 不动
             continue;
         }
@@ -169,7 +162,6 @@ pub fn build(items: &[ShareSnapshotItem]) -> Tree {
             name: item.name.clone(),
             children: Vec::new(),
             parent: Some(parent_idx),
-            subtree_pruned: item.subtree_pruned,
         });
         path_to_idx.insert(item.path.clone(), idx);
         nodes[parent_idx].children.push(idx);
@@ -207,10 +199,8 @@ pub fn split_indices_two(tree: &Tree, indices: &[usize]) -> Vec<Vec<usize>> {
     if indices.len() == 1 {
         return vec![vec![indices[0]]];
     }
-    let mut weighted: Vec<(usize, u64)> = indices
-        .iter()
-        .map(|&c| (c, tree.subtree_size(c)))
-        .collect();
+    let mut weighted: Vec<(usize, u64)> =
+        indices.iter().map(|&c| (c, tree.subtree_size(c))).collect();
     weighted.sort_by(|a, b| b.1.cmp(&a.1));
 
     let mut group_a: Vec<usize> = Vec::new();
@@ -247,7 +237,6 @@ pub fn nodes_to_items(tree: &Tree, indices: &[usize]) -> Vec<ShareSnapshotItem> 
             Some(ShareSnapshotItem {
                 path: n.path.clone(),
                 raw_path: n.path.clone(),
-                subtree_pruned: n.subtree_pruned,
                 fs_id: n.fs_id,
                 size: n.size,
                 name: n.name.clone(),
@@ -281,11 +270,7 @@ fn ensure_path(
     // 递归补父
     let parent_path = parent_of(path);
     let parent_idx = ensure_path(nodes, path_to_idx, &parent_path);
-    let name = path
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let name = path.rsplit('/').next().unwrap_or("").to_string();
     let idx = nodes.len();
     nodes.push(TreeNode {
         path: path.to_string(),
@@ -295,7 +280,6 @@ fn ensure_path(
         name,
         children: Vec::new(),
         parent: Some(parent_idx),
-        subtree_pruned: false,
     });
     path_to_idx.insert(path.to_string(), idx);
     nodes[parent_idx].children.push(idx);
@@ -480,7 +464,11 @@ mod tests {
         ];
         let t = build(&items);
         let curated_idx = t.nodes.iter().position(|n| n.path == "/curated").unwrap();
-        let fina_idx = t.nodes.iter().position(|n| n.path == "/curated/fina").unwrap();
+        let fina_idx = t
+            .nodes
+            .iter()
+            .position(|n| n.path == "/curated/fina")
+            .unwrap();
         // 喂 placeholder + 真实 → placeholder 被丢
         let out = nodes_to_items(&t, &[curated_idx, fina_idx]);
         assert_eq!(out.len(), 1);
@@ -490,10 +478,7 @@ mod tests {
 
     #[test]
     fn test_nodes_to_items_preserves_is_dir() {
-        let items = vec![
-            dir("/c", 10),
-            file("/c/a.txt", 1, 100),
-        ];
+        let items = vec![dir("/c", 10), file("/c/a.txt", 1, 100)];
         let t = build(&items);
         let c_idx = t.nodes.iter().position(|n| n.path == "/c").unwrap();
         let out = nodes_to_items(&t, &[c_idx]);
@@ -516,11 +501,19 @@ mod tests {
     fn test_build_large_fan_out_smoke() {
         let mut items = vec![dir("/curated", 100), dir("/curated/fina", 101)];
         for i in 0..200_u64 {
-            items.push(file(&format!("/curated/fina/600{:03}.SH.csv", i), 1000 + i, 1024 * i));
+            items.push(file(
+                &format!("/curated/fina/600{:03}.SH.csv", i),
+                1000 + i,
+                1024 * i,
+            ));
         }
         let t = build(&items);
         assert_eq!(t.len(), 1 + 2 + 200);
-        let fina_idx = t.nodes.iter().position(|n| n.path == "/curated/fina").unwrap();
+        let fina_idx = t
+            .nodes
+            .iter()
+            .position(|n| n.path == "/curated/fina")
+            .unwrap();
         let leaves = t.descendants_leaves(fina_idx);
         assert_eq!(leaves.len(), 200);
         let groups = split_two(&t, fina_idx);

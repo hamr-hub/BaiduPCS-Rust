@@ -62,12 +62,10 @@
           style="width: 100%"
           @row-click="handleRowClick"
           @selection-change="handleSelectionChange"
-          @sort-change="handleSortChange"
-          :default-sort="{ prop: 'name', order: 'ascending' }"
           :row-class-name="getRowClassName"
       >
         <el-table-column type="selection" width="55" />
-        <el-table-column label="文件名" min-width="400" prop="name" sortable="custom">
+        <el-table-column label="文件名" min-width="400">
           <template #default="{ row }">
             <div class="file-name">
               <el-icon :size="20" class="file-icon">
@@ -79,14 +77,14 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="大小" width="120" prop="size" sortable="custom">
+        <el-table-column label="大小" width="120">
           <template #default="{ row }">
             <span v-if="row.entryType === 'file'">{{ formatFileSize(row.size) }}</span>
             <span v-else>-</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="修改时间" width="180" prop="updatedAt" sortable="custom">
+        <el-table-column label="修改时间" width="180">
           <template #default="{ row }">
             {{ formatTime(row.updatedAt) }}
           </template>
@@ -138,7 +136,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { listLocalFiles, deleteLocalFiles, type FileEntry, type SortField, type SortOrder } from '@/api/localFiles'
+import { listLocalFiles, deleteLocalFiles, type FileEntry } from '@/api/localFiles'
 import { formatFileSize, formatTime } from '@/api/filesystem'
 import { useIsMobile } from '@/utils/responsive'
 
@@ -151,9 +149,6 @@ const currentPath = ref('')
 const rootPath = ref('')
 const currentPage = ref(0)
 const hasMore = ref(true)
-// 排序状态（服务端排序：name/size/updated_at + 升降序）
-const sortField = ref<SortField>('name')
-const sortOrder = ref<SortOrder>('asc')
 const fileListRef = ref<HTMLElement | null>(null)
 const selectedFiles = ref<FileEntry[]>([])
 const batchDeleting = ref(false)
@@ -182,7 +177,7 @@ async function loadFiles(path: string, append: boolean = false) {
 
   try {
     const page = append ? currentPage.value : 0
-    const data = await listLocalFiles(path, page, 100, sortField.value, sortOrder.value)
+    const data = await listLocalFiles(path, page, 100)
 
     if (append) {
       fileList.value = [...fileList.value, ...data.entries]
@@ -202,19 +197,6 @@ async function loadFiles(path: string, append: boolean = false) {
     loading.value = false
     loadingMore.value = false
   }
-}
-
-// 表头排序变化（服务端排序，重新从第一页加载）
-const LOCAL_SORT_PROP_MAP: Record<string, SortField> = {
-  name: 'name',
-  size: 'size',
-  updatedAt: 'updated_at',
-}
-function handleSortChange({ prop, order }: { prop: string; order: 'ascending' | 'descending' | null }) {
-  // order 为 null（取消排序）时回退到默认：文件名升序
-  sortField.value = order ? (LOCAL_SORT_PROP_MAP[prop] ?? 'name') : 'name'
-  sortOrder.value = order === 'descending' ? 'desc' : 'asc'
-  loadFiles(currentPath.value)
 }
 
 async function loadNextPage() {

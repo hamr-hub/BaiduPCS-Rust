@@ -108,26 +108,6 @@ impl Chunk {
             .unwrap_or("unnamed")
             .to_string();
 
-        // 🔥 续传安全校验：若已记录下载进度，但目标文件缺失或长度不足，
-        // 说明此前的局部数据已随文件被竞态清理而失效（大批量文件夹下载中
-        // 失败清理/重试可能删掉半成品文件）。此时若直接 create(true)+seek 续传，
-        // 会在 0..effective_start 写出稀疏空洞（全 0），而文件逻辑大小仍等于完整大小，
-        // 使仅按大小判定的完成校验把损坏文件误标为完成。故重置进度，从头重下本分片。
-        if self.bytes_downloaded > 0 {
-            let resume_start = self.range.start + self.bytes_downloaded;
-            let resume_invalid = match tokio::fs::metadata(output_path).await {
-                Ok(meta) => !meta.is_file() || meta.len() < resume_start,
-                Err(_) => true,
-            };
-            if resume_invalid {
-                warn!(
-                    "[分片线程{}] 分片 #{} 续传校验失败：目标文件缺失或长度不足（期望 ≥ {} bytes），重置进度从头重下",
-                    chunk_thread_id, self.index, resume_start
-                );
-                self.bytes_downloaded = 0;
-            }
-        }
-
         // 🔥 分片内断点续传：从已下载偏移开始
         let effective_start = self.range.start + self.bytes_downloaded;
         let remaining = self.remaining();
@@ -194,8 +174,7 @@ impl Chunk {
         // 🔥 校验 Content-Range 头（防止 CDN 返回错误的字节范围）
         if let Some(content_range) = resp.headers().get("content-range") {
             if let Ok(cr_str) = content_range.to_str() {
-                let expected_prefix =
-                    format!("bytes {}-{}", effective_start, self.range.end - 1);
+                let expected_prefix = format!("bytes {}-{}", effective_start, self.range.end - 1);
                 if !cr_str.starts_with(&expected_prefix) {
                     anyhow::bail!(
                         "Content-Range 不匹配: 期望以 '{}' 开头，实际 '{}'",
@@ -236,10 +215,10 @@ impl Chunk {
         let mut total_bytes_downloaded = 0u64;
         let mut pending_progress = 0u64; // 累积的待更新字节数
         const PROGRESS_UPDATE_THRESHOLD: u64 = 256 * 1024; // 每256KB更新一次进度（减少锁竞争）
-        // 🔥 读取超时：防止CDN连接挂起导致分片线程永久卡死
-        // 当服务端返回headers后数据流停止时，reqwest的全局timeout不会生效，
-        // 需要对每次stream.next()单独设置超时
-        // 使用动态值（由 engine 根据链接速度计算），慢链接获得更长超时
+                                                           // 🔥 读取超时：防止CDN连接挂起导致分片线程永久卡死
+                                                           // 当服务端返回headers后数据流停止时，reqwest的全局timeout不会生效，
+                                                           // 需要对每次stream.next()单独设置超时
+                                                           // 使用动态值（由 engine 根据链接速度计算），慢链接获得更长超时
 
         let read_timeout_dur = std::time::Duration::from_secs(read_timeout_secs);
 
@@ -308,7 +287,9 @@ impl Chunk {
                     chunk_thread_id, self.index, total_bytes_downloaded, chunk_len, remaining, safe_len
                 );
                 if safe_len > 0 {
-                    file.write_all(&chunk_data[..safe_len]).await.context("写入文件失败")?;
+                    file.write_all(&chunk_data[..safe_len])
+                        .await
+                        .context("写入文件失败")?;
                     total_bytes_downloaded += safe_len as u64;
                     pending_progress += safe_len as u64;
                 }
@@ -322,8 +303,7 @@ impl Chunk {
             pending_progress += chunk_len;
 
             // 🔥 批量更新进度：累积到阈值或下载完成时才回调（大幅减少锁竞争）
-            if pending_progress >= PROGRESS_UPDATE_THRESHOLD
-                || total_bytes_downloaded >= remaining
+            if pending_progress >= PROGRESS_UPDATE_THRESHOLD || total_bytes_downloaded >= remaining
             {
                 progress_callback(pending_progress);
                 pending_progress = 0;
@@ -340,7 +320,9 @@ impl Chunk {
             self.bytes_downloaded += total_bytes_downloaded;
             anyhow::bail!(
                 "分片 #{} 数据不完整: 期望 {} bytes，实际收到 {} bytes (差 {} bytes)",
-                self.index, remaining, total_bytes_downloaded,
+                self.index,
+                remaining,
+                total_bytes_downloaded,
                 remaining - total_bytes_downloaded
             );
         }
@@ -619,7 +601,10 @@ impl ChunkManager {
 
     /// 获取分片的已下载字节数（分片内断点续传持久化）
     pub fn get_bytes_downloaded(&self, index: usize) -> u64 {
-        self.chunks.get(index).map(|c| c.bytes_downloaded).unwrap_or(0)
+        self.chunks
+            .get(index)
+            .map(|c| c.bytes_downloaded)
+            .unwrap_or(0)
     }
 
     /// 重置所有分片状态

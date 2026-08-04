@@ -33,6 +33,8 @@ jobs:
           push: false
           tags: baidupcs-rust:${{ github.ref_name }}-arm64
           platforms: linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           outputs: type=docker,dest=/tmp/BaiduPCS-Rust-${{ github.ref_name }}-arm64.tar
 
       - name: Compress Docker image (arm64)

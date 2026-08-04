@@ -1,23 +1,19 @@
 // 应用状态
 
-use anyhow::Context;
 use crate::auth::{AccountManager, QRCodeAuth, SessionManager, Uid, UserAuth};
-use crate::common::ProxyType;
-use crate::common::{ProxyConfig, ProxyFallbackManager, ProxyHotUpdater};
-use crate::encryption::SnapshotManager;
 use crate::autobackup::record::BackupRecordManager;
 use crate::autobackup::AutoBackupManager;
+use crate::common::ProxyType;
 use crate::common::{MemoryMonitor, MemoryMonitorConfig};
+use crate::common::{ProxyConfig, ProxyFallbackManager, ProxyHotUpdater};
 use crate::config::AppConfig;
 use crate::downloader::budget_scheduler::{
     BudgetScheduler, BudgetSchedulerConfig, RequestedSource, VipRecommendedTable, VipType,
     WeightTable,
 };
 use crate::downloader::{ChunkScheduler, DownloadManager, FolderDownloadManager};
-use tokio::sync::Semaphore;
+use crate::encryption::SnapshotManager;
 use crate::netdisk::{ClientPool, CloudDlMonitor, NetdiskClient};
-use crate::share_sync::resolver::ShareSyncAccountResolver;
-use crate::share_sync::ShareSyncManager;
 use crate::persistence::{
     cleanup_completed_tasks, cleanup_invalid_tasks, create_pre_migration_backup,
     is_transient_sqlite_error, needs_pre_migration_backup, run_migration_matrix,
@@ -25,12 +21,16 @@ use crate::persistence::{
     TransferRecoveryInfo, UploadRecoveryInfo,
 };
 use crate::server::websocket::WebSocketManager;
+use crate::share_sync::resolver::ShareSyncAccountResolver;
+use crate::share_sync::ShareSyncManager;
 use crate::transfer::TransferManager;
 use crate::uploader::{ScanManager, UploadManager};
+use anyhow::Context;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
@@ -63,7 +63,10 @@ struct AppStateShareSyncResolver {
 #[async_trait::async_trait]
 impl ShareSyncAccountResolver for AppStateShareSyncResolver {
     async fn netdisk_client(&self, owner_uid: u64) -> Option<Arc<NetdiskClient>> {
-        self.client_pool.read().await.get_client(Uid::new(owner_uid))
+        self.client_pool
+            .read()
+            .await
+            .get_client(Uid::new(owner_uid))
     }
 
     async fn transfer_manager(&self, owner_uid: u64) -> Option<Arc<TransferManager>> {
@@ -115,8 +118,7 @@ pub struct AppState {
     /// 实现跨账号共享同一份加密密钥（机器级单例语义，避免多账号下不同 uid 看不到
     /// 同一份 encryption.json）。值为 `None` 表示 autobackup 尚未初始化或环境不支持
     /// 加密下载。
-    pub encryption_config_store:
-        Arc<RwLock<Option<Arc<crate::encryption::EncryptionConfigStore>>>>,
+    pub encryption_config_store: Arc<RwLock<Option<Arc<crate::encryption::EncryptionConfigStore>>>>,
     /// 🔥 内存监控器
     pub memory_monitor: Arc<MemoryMonitor>,
     /// per-uid 离线下载监听服务池
@@ -333,7 +335,7 @@ impl AppState {
                 initial_active_uid,
                 account_count,
             )
-                .await
+            .await
             {
                 Ok(summary) => break Ok(summary),
                 Err(e) if attempt < MAX_MIGRATION_ATTEMPTS && is_transient_sqlite_error(&e) => {
@@ -390,7 +392,10 @@ impl AppState {
         seed_budget_scheduler(&budget_scheduler, &account_manager).await;
         info!(
             "BudgetScheduler 已启动: M_download={}, M_upload={}",
-            config.multi_account_budget.download_machine_budget.resolve(),
+            config
+                .multi_account_budget
+                .download_machine_budget
+                .resolve(),
             config.multi_account_budget.upload_machine_budget.resolve()
         );
 
@@ -458,7 +463,8 @@ impl AppState {
 
             // 初始化网盘客户端
             let config_guard = self.config.read().await;
-            let proxy_config_for_client = if config_guard.network.proxy.proxy_type != ProxyType::None
+            let proxy_config_for_client = if config_guard.network.proxy.proxy_type
+                != ProxyType::None
                 && !self.fallback_mgr.is_fallen_back()
             {
                 Some(config_guard.network.proxy.clone())
@@ -489,7 +495,7 @@ impl AppState {
                 }
             }
 
-            // 预热过期时间（24小时 = 86400秒）
+            // 预热过期时间（2小时 = 7200秒）
             const WARMUP_EXPIRE_SECS: i64 = 86400;
 
             // 检查是否需要预热：
@@ -506,20 +512,14 @@ impl AppState {
                 let now = chrono::Utc::now().timestamp();
                 let elapsed = now - last_warmup;
                 if elapsed > WARMUP_EXPIRE_SECS {
-                    info!(
-                        "防止预热数据过期({}秒前),清除旧数据并重新预热...",
-                        elapsed
-                    );
+                    info!("防止预热数据过期({}秒前),清除旧数据并重新预热...", elapsed);
                     // 清除过期的预热数据
                     user_auth.panpsc = None;
                     user_auth.csrf_token = None;
                     user_auth.bdstoken = None;
                     true
                 } else {
-                    info!(
-                        "检测到已有预热 Cookie({}秒前预热),跳过预热",
-                        elapsed
-                    );
+                    info!("检测到已有预热 Cookie({}秒前预热),跳过预热", elapsed);
                     false
                 }
             } else {
@@ -642,7 +642,9 @@ impl AppState {
 
             // 🔥 设置文件夹下载管理器的 WAL 目录（用于文件夹持久化）
             let wal_dir = pm_arc.lock().await.wal_dir().clone();
-            self.folder_download_manager.set_wal_dir(wal_dir.clone()).await;
+            self.folder_download_manager
+                .set_wal_dir(wal_dir.clone())
+                .await;
 
             // 注入 ClientPool，支持按 folder.owner_uid 路由
             self.folder_download_manager
@@ -739,8 +741,11 @@ impl AppState {
             info!("扫描管理器初始化完成");
 
             // 初始化转存管理器
-            let mut transfer_manager =
-                TransferManager::new(Arc::new(std::sync::RwLock::new(client)), transfer_config, Arc::clone(&self.config));
+            let mut transfer_manager = TransferManager::new(
+                Arc::new(std::sync::RwLock::new(client)),
+                transfer_config,
+                Arc::clone(&self.config),
+            );
             // 注入 owner_uid，使后续所有 TransferTask::new(...)
             // 链调 .with_owner_uid(self.owner_uid) 能写入正确归属（之前默认 0）
             transfer_manager.set_owner_uid(crate::auth::Uid::new(user_auth.uid));
@@ -837,10 +842,12 @@ impl AppState {
                 &transfer_manager_arc,
                 &pm_arc,
             )
-                .await;
+            .await;
 
             // 🔥 启动时清理孤立临时目录（如果配置启用）
-            transfer_manager_arc.cleanup_orphaned_on_startup_if_enabled().await;
+            transfer_manager_arc
+                .cleanup_orphaned_on_startup_if_enabled()
+                .await;
         }
 
         // 🔥 启动 WebSocket 批量发送器
@@ -863,11 +870,7 @@ impl AppState {
         // 借调/回收依赖 download_manager.folder_manager == None 时降级、加密下载
         // 缺 snapshot/key store。这里收口为对所有已注册账号统一调用 helper，
         // 实现"启动 / 登录 / 切换"三条路径同源。
-        let registered_uids: Vec<Uid> = self
-            .download_managers
-            .iter()
-            .map(|e| *e.key())
-            .collect();
+        let registered_uids: Vec<Uid> = self.download_managers.iter().map(|e| *e.key()).collect();
         for uid in registered_uids {
             if let Err(e) = self.wire_manager_runtime_deps_for_uid(uid).await {
                 warn!(
@@ -933,12 +936,8 @@ impl AppState {
                     .iter()
                     .map(|u| u.uid)
                     .collect();
-                let active_uid_raw: Option<u64> = self
-                    .active_uid
-                    .read()
-                    .await
-                    .as_ref()
-                    .map(|u| u.raw());
+                let active_uid_raw: Option<u64> =
+                    self.active_uid.read().await.as_ref().map(|u| u.raw());
 
                 // 闭包：对一个 task 列表按分支过滤；wal_dir 借用用于 LegacyFillActive 写回 .meta
                 let wal_dir_for_filter = wal_dir.clone();
@@ -1027,11 +1026,18 @@ impl AppState {
                 }
 
                 // 🔥 先恢复文件夹任务（必须在恢复子任务之前）
-                let (restored_folders, skipped_folders) = self.folder_download_manager.restore_folders().await;
-                info!("文件夹任务恢复完成: 恢复 {} 个, 跳过 {} 个", restored_folders, skipped_folders);
+                let (restored_folders, skipped_folders) =
+                    self.folder_download_manager.restore_folders().await;
+                info!(
+                    "文件夹任务恢复完成: 恢复 {} 个, 跳过 {} 个",
+                    restored_folders, skipped_folders
+                );
 
                 // 🔥 加载历史归档的已完成文件夹到内存（用于前端显示历史记录）
-                let history_folders = self.folder_download_manager.load_history_folders_to_memory().await;
+                let history_folders = self
+                    .folder_download_manager
+                    .load_history_folders_to_memory()
+                    .await;
                 if history_folders > 0 {
                     info!("历史文件夹加载完成: {} 个", history_folders);
                 }
@@ -1055,10 +1061,9 @@ impl AppState {
                     let mut without_uid: Vec<DownloadRecoveryInfo> = Vec::new();
                     for info in recovery_infos {
                         match info.owner_uid {
-                            Some(raw) if raw != 0 => by_uid
-                                .entry(Uid::new(raw))
-                                .or_default()
-                                .push(info),
+                            Some(raw) if raw != 0 => {
+                                by_uid.entry(Uid::new(raw)).or_default().push(info)
+                            }
                             _ => without_uid.push(info),
                         }
                     }
@@ -1071,12 +1076,7 @@ impl AppState {
                             let (s, f) = dm.restore_tasks(infos).await;
                             total_success += s;
                             total_failed += f;
-                            info!(
-                                "下载任务恢复: uid={} {} 成功, {} 失败",
-                                uid.raw(),
-                                s,
-                                f
-                            );
+                            info!("下载任务恢复: uid={} {} 成功, {} 失败", uid.raw(), s, f);
                         } else {
                             skipped += infos.len();
                             warn!(
@@ -1098,7 +1098,9 @@ impl AppState {
                     );
 
                     // 🔥 同步恢复的子任务进度到文件夹
-                    self.folder_download_manager.sync_restored_tasks_progress().await;
+                    self.folder_download_manager
+                        .sync_restored_tasks_progress()
+                        .await;
                 }
 
                 // 🔥 恢复模式补任务：从 pending_files 创建暂停状态的任务
@@ -1122,10 +1124,9 @@ impl AppState {
                     let mut without_uid: Vec<UploadRecoveryInfo> = Vec::new();
                     for info in recovery_infos {
                         match info.owner_uid {
-                            Some(raw) if raw != 0 => by_uid
-                                .entry(Uid::new(raw))
-                                .or_default()
-                                .push(info),
+                            Some(raw) if raw != 0 => {
+                                by_uid.entry(Uid::new(raw)).or_default().push(info)
+                            }
                             _ => without_uid.push(info),
                         }
                     }
@@ -1172,10 +1173,9 @@ impl AppState {
                     let mut without_uid: Vec<TransferRecoveryInfo> = Vec::new();
                     for info in recovery_infos {
                         match info.owner_uid {
-                            Some(raw) if raw != 0 => by_uid
-                                .entry(Uid::new(raw))
-                                .or_default()
-                                .push(info),
+                            Some(raw) if raw != 0 => {
+                                by_uid.entry(Uid::new(raw)).or_default().push(info)
+                            }
                             _ => without_uid.push(info),
                         }
                     }
@@ -1286,7 +1286,9 @@ impl AppState {
             temp_dir,
             Arc::clone(&self.backup_record_manager),
             Arc::clone(&self.snapshot_manager),
-        ).await {
+        )
+        .await
+        {
             Ok(manager) => {
                 // 设置 WebSocket 管理器
                 manager.set_ws_manager(Arc::clone(&self.ws_manager));
@@ -1315,7 +1317,8 @@ impl AppState {
                 // 设置代理配置（使备份任务的 NetdiskClient 走代理）
                 {
                     let config_guard = self.config.read().await;
-                    let proxy = if config_guard.network.proxy.proxy_type != crate::common::ProxyType::None
+                    let proxy = if config_guard.network.proxy.proxy_type
+                        != crate::common::ProxyType::None
                         && !self.fallback_mgr.is_fallen_back()
                     {
                         Some(config_guard.network.proxy.clone())
@@ -1336,21 +1339,29 @@ impl AppState {
 
                 // 注入到下载管理器（用于解密时查询原始文件名和 key_version）
                 if let Some(download_mgr) = self.download_manager_for_active().await {
-                    download_mgr.set_snapshot_manager(Arc::clone(&self.snapshot_manager)).await;
-                    download_mgr.set_encryption_config_store(Arc::clone(&encryption_config_store)).await;
+                    download_mgr
+                        .set_snapshot_manager(Arc::clone(&self.snapshot_manager))
+                        .await;
+                    download_mgr
+                        .set_encryption_config_store(Arc::clone(&encryption_config_store))
+                        .await;
                     info!("已将 snapshot_manager 和 encryption_config_store 注入到下载管理器");
                 }
 
                 // 注入到上传管理器（用于上传完成后保存加密映射）
                 if let Some(upload_mgr) = self.upload_manager_for_active().await {
-                    upload_mgr.set_snapshot_manager(Arc::clone(&self.snapshot_manager)).await;
+                    upload_mgr
+                        .set_snapshot_manager(Arc::clone(&self.snapshot_manager))
+                        .await;
                     info!("已将 snapshot_manager 注入到上传管理器");
                 }
 
                 let manager_arc = Arc::new(manager);
 
                 // 🔥 初始化全局轮询（使用配置文件中的触发配置）
-                manager_arc.update_trigger_config(upload_trigger, download_trigger).await;
+                manager_arc
+                    .update_trigger_config(upload_trigger, download_trigger)
+                    .await;
 
                 // 启动事件消费循环（监听文件变更和定时轮询事件）
                 manager_arc.start_event_consumer().await;
@@ -1402,10 +1413,7 @@ impl AppState {
         let _init_guard = init_lock.lock().await;
 
         if self.cloud_dl_monitors.contains_key(&uid) {
-            info!(
-                "CloudDlMonitor uid={} 已存在，跳过重复初始化",
-                uid.raw()
-            );
+            info!("CloudDlMonitor uid={} 已存在，跳过重复初始化", uid.raw());
             return;
         }
 
@@ -1441,7 +1449,11 @@ impl AppState {
 
         // 下载管理器严格按 uid 取，不回退到 active
         // （否则 uid=B 的 monitor 内部把任务推到 uid=A 的 download manager 还是会串号）。
-        if let Some(dm) = self.download_managers.get(&uid).map(|r| Arc::clone(r.value())) {
+        if let Some(dm) = self
+            .download_managers
+            .get(&uid)
+            .map(|r| Arc::clone(r.value()))
+        {
             monitor.set_download_manager(dm).await;
         } else {
             warn!(
@@ -1451,7 +1463,9 @@ impl AppState {
         }
 
         // 🔥 设置文件夹下载管理器（FolderDownloadManager 全局共享）
-        monitor.set_folder_download_manager(Arc::clone(&self.folder_download_manager)).await;
+        monitor
+            .set_folder_download_manager(Arc::clone(&self.folder_download_manager))
+            .await;
 
         // 从数据库加载未触发的自动下载配置
         let loaded = monitor.load_auto_download_configs_from_db().await;
@@ -1477,9 +1491,9 @@ impl AppState {
 
     /// 🔥 初始化分享同步管理器
     pub async fn init_share_sync_manager(&self) {
+        use crate::server::events::TaskEvent;
         use crate::share_sync::events::{ShareSyncEvent, ShareSyncEventPublisher};
         use crate::share_sync::manager::ManagerConfig;
-        use crate::server::events::TaskEvent;
         use std::sync::Arc;
 
         let config = self.config.read().await;
@@ -1554,12 +1568,16 @@ impl AppState {
     /// 获取活跃账号的 `CloudDlMonitor`（返回 `None` 表示未初始化）
     pub async fn cloud_dl_monitor_for_active(&self) -> Option<Arc<CloudDlMonitor>> {
         let uid = (*self.active_uid.read().await)?;
-        self.cloud_dl_monitors.get(&uid).map(|r| Arc::clone(r.value()))
+        self.cloud_dl_monitors
+            .get(&uid)
+            .map(|r| Arc::clone(r.value()))
     }
 
     /// 按 UID 查找 `CloudDlMonitor`
     pub fn cloud_dl_monitor_for(&self, uid: Uid) -> Option<Arc<CloudDlMonitor>> {
-        self.cloud_dl_monitors.get(&uid).map(|r| Arc::clone(r.value()))
+        self.cloud_dl_monitors
+            .get(&uid)
+            .map(|r| Arc::clone(r.value()))
     }
 
     /// 遍历所有已存在的 `CloudDlMonitor`（代理热更 / 接受 shutdown 使用）
@@ -1590,11 +1608,9 @@ impl AppState {
 
         // 补扫 topic 订阅了 cloud_dl 但映射缺失的连接
         if new_uid.is_some() {
-            let topic_subs = self
-                .ws_manager
-                .connections_matching_subscription(|s| {
-                    s == "cloud_dl" || s.starts_with("cloud_dl:")
-                });
+            let topic_subs = self.ws_manager.connections_matching_subscription(|s| {
+                s == "cloud_dl" || s.starts_with("cloud_dl:")
+            });
             for conn_id in topic_subs {
                 if !self.cloud_dl_ws_subscribers.contains_key(&conn_id) {
                     entries.push((conn_id, None));
@@ -1681,45 +1697,28 @@ impl AppState {
             }
         };
 
-        // 2/3) client / UserAuth 缺失时保持宽松语义（Ok(false) 而非 Err）
-        if self.client_pool.read().await.get_client(uid).is_none() {
-            warn!("trigger_warmup: client_pool uid={} 缺失客户端", uid.raw());
-            return Ok(false);
-        }
-        if self.account_manager.lock().await.get_user(uid).is_none() {
-            warn!("trigger_warmup: AccountManager 中未找到 uid={}", uid.raw());
-            return Ok(false);
-        }
-
-        self.warmup_uid(uid).await?;
-        Ok(true)
-    }
-
-    /// 为指定 uid 执行一次 Web 会话预热并持久化到 accounts.json。
-    ///
-    /// `trigger_warmup`（活跃账号）与 `ensure_session_for_switch`（切换目标账号）
-    /// 共用此实现。
-    ///
-    /// # 返回值
-    /// - `Ok(true)` - 预热拿到了 bdstoken，Web 会话可用
-    /// - `Ok(false)` - 预热被跳过或未拿到 bdstoken（如缺 PTOKEN 走 PANPSC 快捷路径失败），
-    ///   Web 写接口（删除/建目录等）大概率仍会失败
-    /// - `Err(e)` - 预热执行失败（网络错误 / BDUSS 失效等）
-    pub async fn warmup_uid(&self, uid: crate::auth::Uid) -> anyhow::Result<bool> {
+        // 2) 取活跃账号客户端（按 active_uid 路由，唯一真源）
         let client = match self.client_pool.read().await.get_client(uid) {
             Some(c) => (*c).clone(),
-            None => anyhow::bail!("client_pool uid={} 缺失客户端", uid.raw()),
+            None => {
+                warn!("trigger_warmup: client_pool uid={} 缺失客户端", uid.raw());
+                return Ok(false);
+            }
         };
 
+        // 3) 取活跃账号 UserAuth 副本（从 AccountManager，单一持久化真源）
         let mut user_auth = {
             let am = self.account_manager.lock().await;
             match am.get_user(uid) {
                 Some(u) => u.clone(),
-                None => anyhow::bail!("AccountManager 中未找到 uid={}", uid.raw()),
+                None => {
+                    warn!("trigger_warmup: AccountManager 中未找到 uid={}", uid.raw());
+                    return Ok(false);
+                }
             }
         };
 
-        info!("触发预热 uid={}...", uid.raw());
+        info!("手动触发预热 uid={}...", uid.raw());
 
         // 清除旧的预热数据
         user_auth.panpsc = None;
@@ -1729,12 +1728,7 @@ impl AppState {
         // 执行预热
         match client.warmup_and_get_cookies().await {
             Ok((panpsc, csrf_token, bdstoken, stoken)) => {
-                let got_bdstoken = bdstoken.is_some();
-                info!(
-                    "预热完成 uid={}（bdstoken={}），更新 accounts.json",
-                    uid.raw(),
-                    if got_bdstoken { "已获取" } else { "未获取" }
-                );
+                info!("手动预热成功 uid={}，更新 accounts.json", uid.raw());
                 if panpsc.is_some() {
                     user_auth.panpsc = panpsc;
                 }
@@ -1754,7 +1748,7 @@ impl AppState {
                     let mut am = self.account_manager.lock().await;
                     if let Err(e) = am.add_user(user_auth.clone()).await {
                         error!(
-                            "warmup_uid uid={}: 保存预热 cookie 到 accounts.json 失败: {}",
+                            "trigger_warmup uid={}: 保存预热 cookie 到 accounts.json 失败: {}",
                             uid.raw(),
                             e
                         );
@@ -1766,80 +1760,12 @@ impl AppState {
                     *self.current_user.write().await = Some(user_auth);
                 }
 
-                Ok(got_bdstoken)
+                Ok(true)
             }
             Err(e) => {
-                error!("预热失败 uid={}: {}", uid.raw(), e);
+                error!("手动预热失败 uid={}: {}", uid.raw(), e);
                 Err(anyhow::anyhow!("预热失败: {}", e))
             }
-        }
-    }
-
-    /// 🔥 切换账号前的会话体检（`switch_account` 专用）。
-    ///
-    /// 预热数据齐全且未过期（24 小时内预热过）→ 直接放行；
-    /// 否则先校验 BDUSS，再重新预热：
-    /// - BDUSS 确定失效 → `Err`（提示重新登录；`verify_bduss` 网络错误时宽松放行）
-    /// - 预热失败 / 未拿到 bdstoken → `Err`（Web 会话无法自动恢复）
-    ///
-    /// 背景：非活跃账号只在启动时构造 client、从不预热（见 `preheat_inactive_clients`），
-    /// 陈旧会话切换上岗后 Web 接口会撞百度 errno=-6（issue #130）。在切换入口拦截并
-    /// 给出可操作的提示，而不是让用户在删除/列表时撞晦涩的 -6。
-    pub async fn ensure_session_for_switch(&self, uid: crate::auth::Uid) -> anyhow::Result<()> {
-        /// 预热数据有效期：24 小时（与启动期 `load_initial_session` 的判断一致）
-        const WARMUP_EXPIRE_SECS: i64 = 86400;
-
-        let user_auth = {
-            let am = self.account_manager.lock().await;
-            match am.get_user(uid) {
-                Some(u) => u.clone(),
-                None => anyhow::bail!("AccountManager 中未找到 uid={}", uid.raw()),
-            }
-        };
-
-        // 不把 csrfToken 作为硬条件：缺 PTOKEN 的账号走 PANPSC 快捷路径预热，
-        // 永远拿不到 csrfToken，若要求它会导致每次切换都重复体检；
-        // 而 -6 相关链路只依赖 bdstoken + 会话 cookie。
-        let fresh = user_auth.panpsc.is_some()
-            && user_auth.bdstoken.is_some()
-            && user_auth
-            .last_warmup_at
-            .map(|t| chrono::Utc::now().timestamp() - t <= WARMUP_EXPIRE_SECS)
-            .unwrap_or(false);
-        if fresh {
-            return Ok(());
-        }
-
-        info!(
-            "切换前会话体检 uid={}: 预热数据缺失或过期，校验 BDUSS 并重新预热",
-            uid.raw()
-        );
-
-        let client = match self.client_pool.read().await.get_client(uid) {
-            Some(c) => (*c).clone(),
-            None => anyhow::bail!("client_pool uid={} 缺失客户端", uid.raw()),
-        };
-
-        // verify_bduss 只在明确拿到"用户信息无效"时返回 false（网络错误宽松放行），
-        // 因此 false 可以放心断言为登录失效。
-        //
-        // 提示文案需写明恢复路径不依赖切换：重新添加账号按 uid upsert 覆盖旧凭证，
-        // 删除账号走 DELETE /accounts/:uid，两者都无需先切换到该账号。
-        if !client.verify_bduss().await {
-            anyhow::bail!(
-                "该账号登录已失效（BDUSS 无效）。无需切换，直接通过“添加账号”重新扫码/导入 Cookie 即可覆盖登录，或在账号管理中删除该账号"
-            );
-        }
-
-        match self.warmup_uid(uid).await {
-            Ok(true) => Ok(()),
-            Ok(false) => anyhow::bail!(
-                "该账号 Web 会话已过期且无法自动预热（可能缺少 PTOKEN）。无需切换，直接通过“添加账号”重新扫码/导入完整 Cookie 即可覆盖登录"
-            ),
-            Err(e) => anyhow::bail!(
-                "该账号会话预热失败（{}）。请检查网络后重试；若持续失败，无需切换，直接通过“添加账号”重新登录即可覆盖该账号",
-                e
-            ),
         }
     }
 
@@ -1887,7 +1813,9 @@ impl AppState {
     /// 注：FolderDownloadManager / ScanManager / AutoBackupManager 仍是进程级共享/单例
     /// 组件（按 owner_uid 路由内部状态）；本方法只描述 per-uid manager 池语义。
     pub fn download_manager_for(&self, uid: Uid) -> Option<Arc<DownloadManager>> {
-        self.download_managers.get(&uid).map(|e| Arc::clone(e.value()))
+        self.download_managers
+            .get(&uid)
+            .map(|e| Arc::clone(e.value()))
     }
 
     /// 取**当前活跃账号**的 `DownloadManager`（无活跃账号时返回 `None`）。
@@ -1898,7 +1826,9 @@ impl AppState {
 
     /// 取指定账号 uid 的 `UploadManager`（语义同 `download_manager_for`）
     pub fn upload_manager_for(&self, uid: Uid) -> Option<Arc<UploadManager>> {
-        self.upload_managers.get(&uid).map(|e| Arc::clone(e.value()))
+        self.upload_managers
+            .get(&uid)
+            .map(|e| Arc::clone(e.value()))
     }
 
     /// 取活跃账号的 `UploadManager`
@@ -1909,7 +1839,9 @@ impl AppState {
 
     /// 取指定账号 uid 的 `TransferManager`（语义同 `download_manager_for`）
     pub fn transfer_manager_for(&self, uid: Uid) -> Option<Arc<TransferManager>> {
-        self.transfer_managers.get(&uid).map(|e| Arc::clone(e.value()))
+        self.transfer_managers
+            .get(&uid)
+            .map(|e| Arc::clone(e.value()))
     }
 
     /// 取活跃账号的 `TransferManager`
@@ -2215,8 +2147,14 @@ impl AppState {
         };
 
         // 3) 取该账号 effective 配置 + 全局 download_dir + transfer_config
-        let (download_dir, eff_dl_threads, eff_dl_concurrent, eff_dl_retries,
-            upload_config, transfer_config) = {
+        let (
+            download_dir,
+            eff_dl_threads,
+            eff_dl_concurrent,
+            eff_dl_retries,
+            upload_config,
+            transfer_config,
+        ) = {
             let cfg = self.config.read().await;
             let (dl_t, dl_c, dl_r, up_t, up_c, up_r) =
                 resolve_effective_account_config(&user_auth, &cfg);
@@ -2348,12 +2286,18 @@ impl AppState {
     /// 幂等：所有 `set_*` 调用都是覆盖式写入，重复调用无副作用。
     pub async fn wire_manager_runtime_deps_for_uid(&self, uid: Uid) -> anyhow::Result<()> {
         // 1) 取该 uid 的三类 manager（要求已构造好；调用方应保证）
-        let dm = self
-            .download_manager_for(uid)
-            .ok_or_else(|| anyhow::anyhow!("wire_manager_runtime_deps_for_uid: uid={} 缺 DownloadManager", uid.raw()))?;
-        let um = self
-            .upload_manager_for(uid)
-            .ok_or_else(|| anyhow::anyhow!("wire_manager_runtime_deps_for_uid: uid={} 缺 UploadManager", uid.raw()))?;
+        let dm = self.download_manager_for(uid).ok_or_else(|| {
+            anyhow::anyhow!(
+                "wire_manager_runtime_deps_for_uid: uid={} 缺 DownloadManager",
+                uid.raw()
+            )
+        })?;
+        let um = self.upload_manager_for(uid).ok_or_else(|| {
+            anyhow::anyhow!(
+                "wire_manager_runtime_deps_for_uid: uid={} 缺 UploadManager",
+                uid.raw()
+            )
+        })?;
 
         // 2) 给 DownloadManager 注入 folder_manager / snapshot / encryption_config_store
         dm.set_folder_manager(Arc::clone(&self.folder_download_manager))
@@ -2469,7 +2413,9 @@ impl AppState {
             let (mem, hist) = dm.delete_tasks_for_owner(uid, false).await;
             info!(
                 "force_delete_account uid={} download.delete_tasks_for_owner: 内存={}, 历史={}",
-                uid.raw(), mem, hist
+                uid.raw(),
+                mem,
+                hist
             );
         }
         // 文件夹下载（共享 FolderDownloadManager，按 owner 清扫描+槽位+持久化）
@@ -2479,20 +2425,25 @@ impl AppState {
             .await;
         info!(
             "force_delete_account uid={} folder_download.delete_folders_for_owner: 处理={}",
-            uid.raw(), folder_processed
+            uid.raw(),
+            folder_processed
         );
         if let Some(um) = self.upload_managers.get(&uid).map(|e| e.value().clone()) {
             let (mem, hist) = um.delete_tasks_for_owner(uid).await;
             info!(
                 "force_delete_account uid={} upload.delete_tasks_for_owner: 内存={}, 历史={}",
-                uid.raw(), mem, hist
+                uid.raw(),
+                mem,
+                hist
             );
         }
         if let Some(tm) = self.transfer_managers.get(&uid).map(|e| e.value().clone()) {
             let (mem, hist) = tm.delete_tasks_for_owner(uid).await;
             info!(
                 "force_delete_account uid={} transfer.delete_tasks_for_owner: 内存={}, 历史={}",
-                uid.raw(), mem, hist
+                uid.raw(),
+                mem,
+                hist
             );
         }
 
@@ -2550,8 +2501,7 @@ impl AppState {
         // 修复：捕获被删 uid 下的 autobackup Arc（如有），在剩余账号中挑一个（优先
         // `account_manager.active_uid()` 更新后的值；否则取第一个剩余 uid）做 rebind
         // 注册；如已没有任何剩余账号，则 drop 单例（最后一个账号删除流程）。
-        let removed_autobackup_arc =
-            self.autobackup_managers.remove(&uid).map(|(_, arc)| arc);
+        let removed_autobackup_arc = self.autobackup_managers.remove(&uid).map(|(_, arc)| arc);
         if let Some(autobackup_arc) = removed_autobackup_arc {
             // 找一个剩余账号承接单例
             let remaining_uid: Option<Uid> = {
@@ -2862,7 +2812,13 @@ impl AppState {
         // 4) 构造 client + 注入池
         let username = user.username.clone();
         let client = NetdiskClient::new_with_proxy(user, proxy_config.as_ref(), fallback)
-            .with_context(|| format!("懒加载 NetdiskClient 失败：uid={} ({})", uid.raw(), username))?;
+            .with_context(|| {
+                format!(
+                    "懒加载 NetdiskClient 失败：uid={} ({})",
+                    uid.raw(),
+                    username
+                )
+            })?;
         {
             let mut pool = self.client_pool.write().await;
             pool.add_client(uid, Arc::new(client));
@@ -2939,11 +2895,8 @@ impl ProxyHotUpdater for AppState {
         // 按 active_uid → AccountManager 取，不用 current_user
         let user_auth = self.active_user_auth().await;
         if let Some(user) = user_auth {
-            let new_client = NetdiskClient::new_with_proxy(
-                user,
-                proxy,
-                Some(Arc::clone(&self.fallback_mgr)),
-            )?;
+            let new_client =
+                NetdiskClient::new_with_proxy(user, proxy, Some(Arc::clone(&self.fallback_mgr)))?;
             *self.netdisk_client.write().await = Some(new_client);
         }
         Ok(())
@@ -3021,17 +2974,10 @@ impl ProxyHotUpdater for AppState {
                 continue;
             };
 
-            match NetdiskClient::new_with_proxy(
-                user,
-                proxy,
-                Some(Arc::clone(&self.fallback_mgr)),
-            ) {
+            match NetdiskClient::new_with_proxy(user, proxy, Some(Arc::clone(&self.fallback_mgr))) {
                 Ok(new_client) => {
                     monitor.update_client(new_client);
-                    tracing::info!(
-                        "CloudDlMonitor uid={} NetdiskClient 已热更新",
-                        uid.raw()
-                    );
+                    tracing::info!("CloudDlMonitor uid={} NetdiskClient 已热更新", uid.raw());
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -3048,11 +2994,7 @@ impl ProxyHotUpdater for AppState {
         // 按 active_uid → AccountManager 取，不用 current_user
         let user_auth = self.active_user_auth().await;
         if let Some(user) = user_auth {
-            match NetdiskClient::new_with_proxy(
-                user,
-                proxy,
-                Some(Arc::clone(&self.fallback_mgr)),
-            ) {
+            match NetdiskClient::new_with_proxy(user, proxy, Some(Arc::clone(&self.fallback_mgr))) {
                 Ok(new_client) => {
                     self.folder_download_manager
                         .set_netdisk_client(Arc::new(new_client))
@@ -3163,15 +3105,24 @@ pub(crate) fn resolve_effective_account_config(
     let (recommended_threads, recommended_max_concurrent) = match vip {
         crate::downloader::budget_scheduler::VipType::Normal => (
             config.multi_account_vip_recommended.normal.threads,
-            config.multi_account_vip_recommended.normal.max_concurrent_tasks,
+            config
+                .multi_account_vip_recommended
+                .normal
+                .max_concurrent_tasks,
         ),
         crate::downloader::budget_scheduler::VipType::Vip => (
             config.multi_account_vip_recommended.vip.threads,
-            config.multi_account_vip_recommended.vip.max_concurrent_tasks,
+            config
+                .multi_account_vip_recommended
+                .vip
+                .max_concurrent_tasks,
         ),
         crate::downloader::budget_scheduler::VipType::Svip => (
             config.multi_account_vip_recommended.svip.threads,
-            config.multi_account_vip_recommended.svip.max_concurrent_tasks,
+            config
+                .multi_account_vip_recommended
+                .svip
+                .max_concurrent_tasks,
         ),
     };
 

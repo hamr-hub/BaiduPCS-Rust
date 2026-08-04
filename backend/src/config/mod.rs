@@ -64,22 +64,6 @@ pub struct AppConfig {
     /// 多账号 VIP 推荐配置表
     #[serde(default)]
     pub multi_account_vip_recommended: MultiAccountVipRecommendedConfig,
-    /// 分享同步配置
-    #[serde(default)]
-    pub share_sync: ShareSyncConfig,
-}
-
-// ============================================================================
-// 分享同步配置
-// ============================================================================
-
-/// 分享同步相关配置
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ShareSyncConfig {
-    /// 排除规则「常用词表」：创建/编辑订阅时可点选快速添加，免去重复手输。
-    /// 在系统设置页维护（增删）；默认为空，完全由用户自行配置，不做任何预置。
-    #[serde(default)]
-    pub exclude_preset_rules: Vec<String>,
 }
 
 // ============================================================================
@@ -259,19 +243,17 @@ impl Default for ConflictStrategyConfig {
         Self {
             default_upload_strategy: crate::uploader::conflict::UploadConflictStrategy::SmartDedup,
             default_download_strategy:
-            crate::uploader::conflict::DownloadConflictStrategy::Overwrite,
+                crate::uploader::conflict::DownloadConflictStrategy::Overwrite,
         }
     }
 }
 
 /// 网络配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub proxy: ProxyConfig,
 }
-
 
 /// 自动备份配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -818,8 +800,7 @@ impl Default for TransferConfig {
 }
 
 /// 文件系统配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FilesystemConfig {
     /// 允许访问的路径白名单（空表示允许所有）
     #[serde(default)]
@@ -841,7 +822,6 @@ pub struct FilesystemConfig {
     pub enforce_allowlist_on_followed_symlinks: bool,
 }
 
-
 impl FilesystemConfig {
     /// 校验文件系统配置的结构合法性
     ///
@@ -860,19 +840,18 @@ impl FilesystemConfig {
             if !path.is_absolute() {
                 anyhow::bail!(
                     "filesystem.allowed_paths[{}] 必须是绝对路径，当前值: {:?}",
-                    i, path_str
+                    i,
+                    path_str
                 );
             }
             if !path.exists() {
                 tracing::warn!(
                     "filesystem.allowed_paths[{}] 路径不存在（运行时将跳过该条目）: {:?}",
-                    i, path_str
+                    i,
+                    path_str
                 );
             } else if !path.is_dir() {
-                anyhow::bail!(
-                    "filesystem.allowed_paths[{}] 不是目录: {:?}",
-                    i, path_str
-                );
+                anyhow::bail!("filesystem.allowed_paths[{}] 不是目录: {:?}", i, path_str);
             }
         }
 
@@ -894,10 +873,7 @@ impl FilesystemConfig {
                 return Ok(());
             }
             if !path.is_dir() {
-                anyhow::bail!(
-                    "filesystem.default_path 不是目录: {:?}",
-                    default_path
-                );
+                anyhow::bail!("filesystem.default_path 不是目录: {:?}", default_path);
             }
             // default_path 必须位于 allowed_paths 内（如果白名单非空）
             if !self.allowed_paths.is_empty() {
@@ -1285,7 +1261,6 @@ impl Default for AppConfig {
             conflict_strategy: ConflictStrategyConfig::default(),
             multi_account_budget: MultiAccountBudgetConfig::default(),
             multi_account_vip_recommended: MultiAccountVipRecommendedConfig::default(),
-            share_sync: ShareSyncConfig::default(),
         }
     }
 }
@@ -1482,23 +1457,6 @@ mod tests {
             loaded.download.max_global_threads,
             config.download.max_global_threads
         );
-    }
-
-    /// 分享同步词表：默认为空（不做预置，完全由用户配置）；已保存的词表可正常读回。
-    #[test]
-    fn test_share_sync_config_defaults_and_roundtrip() {
-        // 默认 / 老配置文件缺失该段 → 空词表
-        assert!(AppConfig::default()
-            .share_sync
-            .exclude_preset_rules
-            .is_empty());
-        let legacy: ShareSyncConfig = toml::from_str("").unwrap();
-        assert!(legacy.exclude_preset_rules.is_empty());
-
-        // 用户配置的词表反序列化读回
-        let saved: ShareSyncConfig =
-            toml::from_str(r#"exclude_preset_rules = ["*样片*", "*.nfo"]"#).unwrap();
-        assert_eq!(saved.exclude_preset_rules, ["*样片*", "*.nfo"]);
     }
 
     #[test]

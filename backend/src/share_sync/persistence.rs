@@ -170,9 +170,6 @@ impl ShareSyncPersistence {
                 skipped_count INTEGER NOT NULL DEFAULT 0,
                 overwritten_count INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
-                -- run 当前阶段（scanning / diffing / executing）；结束时置 NULL。
-                -- 供 REST 轮询在 WS 断线/页面刷新后仍能显示细化状态。
-                phase TEXT,
                 FOREIGN KEY (subscription_id) REFERENCES share_subscriptions(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_share_runs_sub_time
@@ -225,11 +222,6 @@ impl ShareSyncPersistence {
             "ALTER TABLE share_sync_runs ADD COLUMN unchanged_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE share_sync_runs ADD COLUMN skipped_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE share_sync_runs ADD COLUMN overwritten_count INTEGER NOT NULL DEFAULT 0",
-            // run 的当前阶段（scanning / diffing / executing）。
-            // ScanProgress 是瞬时 WS 事件，刷新页面或 WS 断线重连后就没了；把阶段
-            // 落库，REST 轮询才能兜底告诉用户「在扫描目录」而不是裸的「运行中」。
-            // run 结束时置回 NULL。
-            "ALTER TABLE share_sync_runs ADD COLUMN phase TEXT",
             // 多账号隔离：老库（含早期把 share_subscriptions 建在独立库的版本）补 owner_uid 列
             "ALTER TABLE share_subscriptions ADD COLUMN owner_uid INTEGER NOT NULL DEFAULT 0",
         ] {
@@ -438,9 +430,6 @@ impl ShareSyncPersistence {
                     size: size as u64,
                     is_dir: is_dir != 0,
                     name,
-                    // 派生字段，不持久化：基线快照仅用于 diff，转存决策用当前抓取的
-                    // 快照条目（其 subtree_pruned 每次重新计算）。
-                    subtree_pruned: false,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -467,28 +456,14 @@ impl ShareSyncPersistence {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO share_sync_runs
-             (id, subscription_id, started_at, status, phase)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (id, subscription_id, started_at, status)
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 run_id,
                 subscription_id,
                 started_at,
-                RunStatus::Running.as_str(),
-                // run 一开始就进入抓取阶段；前端立刻能显示「扫描目录中」而非「运行中」
-                RUN_PHASE_SCANNING,
+                RunStatus::Running.as_str()
             ],
-        )?;
-        Ok(())
-    }
-
-    /// 更新 run 的当前阶段（`scanning` / `diffing` / `executing`）。
-    ///
-    /// 阶段只是给用户看的展示信息，写失败不应中断同步 —— 调用方忽略返回值即可。
-    pub fn update_run_phase(&self, run_id: &str, phase: &str) -> Result<(), ShareSyncError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE share_sync_runs SET phase = ?1 WHERE id = ?2",
-            params![phase, run_id],
         )?;
         Ok(())
     }
@@ -511,9 +486,7 @@ impl ShareSyncPersistence {
                  removed_count = ?6, unchanged_count = ?7,
                  failed_count = ?8, skipped_count = ?9,
                  overwritten_count = ?10,
-                 error = ?11,
-                 -- run 已结束，阶段信息失去意义，置空避免前端把终态 run 显示成「扫描中」
-                 phase = NULL
+                 error = ?11
             WHERE id = ?12",
             params![
                 finished_at,
@@ -580,8 +553,7 @@ impl ShareSyncPersistence {
             "UPDATE share_sync_runs
              SET status = ?1,
                  finished_at = ?2,
-                 error = ?3,
-                 phase = NULL
+                 error = ?3
              WHERE status = ?4 AND started_at < ?5",
             params![
                 RunStatus::Failed.as_str(),
@@ -638,8 +610,7 @@ impl ShareSyncPersistence {
             "UPDATE share_sync_runs
              SET status = ?1,
                  finished_at = ?2,
-                 error = ?3,
-                 phase = NULL
+                 error = ?3
              WHERE status = ?4",
             params![
                 RunStatus::Interrupted.as_str(),
@@ -784,8 +755,7 @@ impl ShareSyncPersistence {
         let mut stmt = conn.prepare(
             "SELECT id, started_at, finished_at, status,
                     total_count, added_count, modified_count, removed_count,
-                    unchanged_count, failed_count, skipped_count, overwritten_count, error,
-                    phase
+                    unchanged_count, failed_count, skipped_count, overwritten_count, error
              FROM share_sync_runs
              WHERE subscription_id = ?1
              ORDER BY started_at DESC
@@ -806,7 +776,6 @@ impl ShareSyncPersistence {
                 skipped_count: row.get::<_, i64>(10)? as usize,
                 overwritten_count: row.get::<_, i64>(11)? as usize,
                 error: row.get(12)?,
-                phase: row.get(13)?,
             })
         })?;
         let mut out = Vec::new();
@@ -823,8 +792,7 @@ impl ShareSyncPersistence {
             .query_row(
                 "SELECT id, started_at, finished_at, status,
                         total_count, added_count, modified_count, removed_count,
-                        unchanged_count, failed_count, skipped_count, overwritten_count, error,
-                        phase
+                        unchanged_count, failed_count, skipped_count, overwritten_count, error
                  FROM share_sync_runs WHERE id = ?1",
                 params![run_id],
                 |row| {
@@ -842,7 +810,6 @@ impl ShareSyncPersistence {
                         skipped_count: row.get::<_, i64>(10)? as usize,
                         overwritten_count: row.get::<_, i64>(11)? as usize,
                         error: row.get(12)?,
-                        phase: row.get(13)?,
                     })
                 },
             )
@@ -921,6 +888,150 @@ impl ShareSyncPersistence {
         let total = self.count_run_items(run_id)?;
         self.list_run_items_page(run_id, 1, total.max(1))
     }
+
+    /// 删除某订阅下早于 cutoff_ts 的运行历史，并同步删除 run_items。
+    ///
+    /// 表结构声明了 ON DELETE CASCADE，但老库可能未完全开启外键或曾从旧版本迁移；
+    /// 这里显式先删 run_items 再删 runs，保证一键清理不会留下孤儿明细。
+    pub fn delete_runs_before(
+        &self,
+        subscription_id: &str,
+        cutoff_ts: i64,
+    ) -> Result<usize, ShareSyncError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let run_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM share_sync_runs
+                 WHERE subscription_id = ?1 AND started_at < ?2",
+            )?;
+            let rows = stmt.query_map(params![subscription_id, cutoff_ts], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut ids = Vec::new();
+            for r in rows {
+                ids.push(r?);
+            }
+            ids
+        };
+        for run_id in &run_ids {
+            tx.execute(
+                "DELETE FROM share_sync_run_items WHERE run_id = ?1",
+                params![run_id],
+            )?;
+        }
+        let deleted = tx.execute(
+            "DELETE FROM share_sync_runs
+             WHERE subscription_id = ?1 AND started_at < ?2",
+            params![subscription_id, cutoff_ts],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// 新一轮开启前,清掉该订阅的"上一轮仍在跑的同步"以及其衍生的任务下载情况。
+    ///
+    /// 行为:
+    /// - 删 `share_sync_runs` 中该订阅 **status='running'** 的行(FK CASCADE 同步
+    ///   带走 `share_sync_run_items`)。这对应的是"上一次的同步"——还没正常收尾的
+    ///   孤儿 run(进程重启、卡死、被新一轮强制接管),不计入历史。其它已完成/
+    ///   失败/中断的 run 视为 **执行历史记录**,**保留**,不在此处清理。
+    /// - 删 `task_history` 里被该订阅驱动的行(任务下载情况):以订阅的 `share_url`
+    ///   为前缀匹配 `share_link`(share_link 形如 `https://.../1y7C...?pwd=i96y`,
+    ///   `share_url` 是其去掉 `?pwd=...` 的前缀),覆盖顶层分享直下 + 同前缀下
+    ///   的全部子任务(transfer_task_id 形成父子链,顶层删完子层无主)。新一轮开
+    ///   始时让 task_history 从零开始,避免叠加上一轮的进行中/失败下载记录。
+    ///
+    /// 调用方必须保证"无并发 run"——share_sync::manager 已经在 `trigger_one` 与
+    /// scheduler 入口处用 in-memory `running` 去重,这里只清理 DB 残留(进程
+    /// 重启后留下的孤儿 `running` 行)。`CleanupStats::runs_deleted` 现在统计
+    /// 的是被终止+删除的 running run 数,与历史已完成 run 数无关。
+    pub fn cleanup_previous_runs_for_subscription(
+        &self,
+        subscription_id: &str,
+    ) -> Result<CleanupStats, ShareSyncError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // 1) 读出订阅的 share_url,用于归属 task_history。
+        let share_url: Option<String> = tx
+            .query_row(
+                "SELECT share_url FROM share_subscriptions WHERE id = ?1",
+                params![subscription_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        // 2) 先收 share_sync 驱动的 task_history 行(顶层 share_link 前缀匹配 +
+        //    子层 transfer_task_id 反向)。分两步走,避免在 IN 子查询里再读同一张表。
+        let mut n_task_history = 0usize;
+        if let Some(url) = share_url {
+            let like_pat = format!("{}%", url);
+            let parent_ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT task_id FROM task_history WHERE share_link LIKE ?1",
+                )?;
+                let rows = stmt.query_map(params![like_pat], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r?);
+                }
+                out
+            };
+            if !parent_ids.is_empty() {
+                let placeholders =
+                    std::iter::repeat("?").take(parent_ids.len()).collect::<Vec<_>>().join(",");
+                // 同时匹配:task_id 是某个 share-driven 顶层 / transfer_task_id 指向
+                // 某个 share-driven 顶层(子层用)。两段用同一组占位符重复传参。
+                let sql = format!(
+                    "DELETE FROM task_history \
+                     WHERE task_id IN ({ph}) \
+                        OR transfer_task_id IN ({ph})",
+                    ph = placeholders,
+                );
+                let mut binds: Vec<&dyn rusqlite::ToSql> =
+                    Vec::with_capacity(parent_ids.len() * 2);
+                for t in &parent_ids {
+                    binds.push(t);
+                }
+                for t in &parent_ids {
+                    binds.push(t);
+                }
+                n_task_history = tx.execute(&sql, binds.as_slice())?;
+            }
+        }
+
+        // 3) 只删 status='running' 的孤儿 run,作为"终止并删除上一次未完成的同步";
+        //    已 Completed/Failed/CompletedWithErrors/Interrupted 的 run 是执行历史,
+        //    保留不动,前端 / 历史接口仍可拉取。
+        let n_runs = tx.execute(
+            "DELETE FROM share_sync_runs \
+             WHERE subscription_id = ?1 AND status = ?2",
+            params![subscription_id, RunStatus::Running.as_str()],
+        )?;
+
+        tx.commit()?;
+
+        if n_runs > 0 || n_task_history > 0 {
+            info!(
+                "share_sync 新一轮清理: subscription={} running_runs_deleted={} task_history_deleted={}",
+                subscription_id, n_runs, n_task_history,
+            );
+        }
+        Ok(CleanupStats {
+            runs_deleted: n_runs,
+            task_history_deleted: n_task_history,
+        })
+    }
+}
+
+/// 一轮清理的统计
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct CleanupStats {
+    pub runs_deleted: usize,
+    pub task_history_deleted: usize,
 }
 
 /// 一次运行的摘要
@@ -939,19 +1050,7 @@ pub struct RunRecord {
     pub skipped_count: usize,
     pub overwritten_count: usize,
     pub error: Option<String>,
-    /// 运行中 run 的当前阶段：`scanning`（递归列目录）/ `diffing`（算差异）/
-    /// `executing`（转存下载）。终态 run 为 `None`。
-    ///
-    /// 存在的意义是给 REST 轮询兜底：`ScanProgress` 是瞬时 WS 事件，页面刷新或
-    /// WS 断线重连后就没了，只靠它的话用户又会退回到裸的「运行中」。
-    #[serde(default)]
-    pub phase: Option<String>,
 }
-
-/// run 阶段常量。字符串直接进 DB 与 API，改动需同步前端 `describeRunStatus`。
-pub const RUN_PHASE_SCANNING: &str = "scanning";
-pub const RUN_PHASE_DIFFING: &str = "diffing";
-pub const RUN_PHASE_EXECUTING: &str = "executing";
 
 /// 启动自愈被收编的 stale running run 的描述,manager 用来广播 RunFailed 事件
 #[derive(Debug, Clone)]
@@ -1146,7 +1245,7 @@ mod tests {
             None,
             None,
         )
-            .unwrap();
+        .unwrap();
 
         mgr.delete_subscription(&s.id).unwrap();
         assert!(mgr.latest_snapshot(&s.id).unwrap().is_none());
@@ -1170,7 +1269,7 @@ mod tests {
             None,
             None,
         )
-            .unwrap();
+        .unwrap();
         mgr.finish_run(
             "run-1",
             1100,
@@ -1184,10 +1283,11 @@ mod tests {
                 failed: 0,
                 overwritten: 0,
                 skipped: 0,
+                transient_retries_exhausted: 0,
             },
             None,
         )
-            .unwrap();
+        .unwrap();
 
         let rec = mgr.get_run("run-1").unwrap().unwrap();
         assert_eq!(rec.status, "completed_with_errors");
@@ -1196,62 +1296,6 @@ mod tests {
         let items = mgr.list_run_items("run-1").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].transfer_task_id.as_deref(), Some("tx-1"));
-    }
-
-    /// run 阶段（phase）:start_run 落 scanning → update_run_phase 推进 →
-    /// finish_run 置空。前端靠它在 WS 断线/页面刷新后仍能显示细化状态,
-    /// 终态 run 必须不带 phase,否则会被渲染成"扫描中"。
-    #[test]
-    fn test_run_phase_transitions_and_cleared_on_finish() {
-        let (_dir, mgr) = fresh();
-        let s = sub("phase");
-        mgr.upsert_subscription(&s).unwrap();
-
-        mgr.start_run("run-p", &s.id, 1000).unwrap();
-        assert_eq!(
-            mgr.get_run("run-p").unwrap().unwrap().phase.as_deref(),
-            Some(RUN_PHASE_SCANNING),
-            "run 一开始就应处于抓取阶段"
-        );
-
-        mgr.update_run_phase("run-p", RUN_PHASE_EXECUTING).unwrap();
-        assert_eq!(
-            mgr.get_run("run-p").unwrap().unwrap().phase.as_deref(),
-            Some(RUN_PHASE_EXECUTING)
-        );
-        // list_runs 与 get_run 必须一致（两处 SELECT 各写一份列，容易漏改）
-        let listed = mgr.list_runs(&s.id, 1, 10).unwrap();
-        assert_eq!(listed[0].phase.as_deref(), Some(RUN_PHASE_EXECUTING));
-
-        mgr.finish_run(
-            "run-p",
-            1100,
-            RunStatus::Completed,
-            &DiffSummary::default(),
-            None,
-        )
-            .unwrap();
-        assert!(
-            mgr.get_run("run-p").unwrap().unwrap().phase.is_none(),
-            "run 结束后 phase 必须置空"
-        );
-    }
-
-    /// 进程重启收编 running run 时也要清 phase,否则历史里会留下
-    /// 「已中断」却仍显示「扫描目录中」的矛盾记录。
-    #[test]
-    fn test_interrupted_runs_clear_phase() {
-        let (_dir, mgr) = fresh();
-        let s = sub("phase-int");
-        mgr.upsert_subscription(&s).unwrap();
-        mgr.start_run("run-i", &s.id, 1000).unwrap();
-
-        let interrupted = mgr.mark_running_runs_interrupted().unwrap();
-        assert_eq!(interrupted.len(), 1);
-
-        let rec = mgr.get_run("run-i").unwrap().unwrap();
-        assert_eq!(rec.status, "interrupted");
-        assert!(rec.phase.is_none(), "被收编的 run 不应残留 phase");
     }
 
     #[test]
@@ -1272,7 +1316,7 @@ mod tests {
                 None,
                 None,
             )
-                .unwrap();
+            .unwrap();
         }
 
         assert_eq!(mgr.count_run_items("run-page").unwrap(), 125);
@@ -1378,7 +1422,7 @@ mod tests {
             Some("/old.bak"),
             Some("first_reason"),
         )
-            .unwrap();
+        .unwrap();
         // 第二次传 None 给 transfer_task_id / download_task_id / versioned_old_path / reason
         mgr.add_run_item(
             "run-c",
@@ -1391,7 +1435,7 @@ mod tests {
             None,
             None,
         )
-            .unwrap();
+        .unwrap();
         let items = mgr.list_run_items("run-c").unwrap();
         assert_eq!(items.len(), 1);
         // status / action 是 NOT NULL 用 excluded 覆盖
@@ -1470,7 +1514,7 @@ mod tests {
             &DiffSummary::default(),
             None,
         )
-            .unwrap();
+        .unwrap();
 
         let stale = mgr.mark_stale_runs_failed(120).unwrap();
         let ids: Vec<&str> = stale.iter().map(|r| r.run_id.as_str()).collect();
@@ -1504,7 +1548,7 @@ mod tests {
             &DiffSummary::default(),
             None,
         )
-            .unwrap();
+        .unwrap();
 
         let mut got = mgr.mark_running_runs_interrupted().unwrap();
         let mut ids: Vec<String> = got.drain(..).map(|r| r.run_id).collect();
@@ -1522,6 +1566,187 @@ mod tests {
             mgr.get_run("run-done").unwrap().unwrap().status,
             "completed"
         );
+    }
+
+    /// 新一轮开启前只清掉该订阅 **仍在跑** 的"上一轮同步"及其衍生的任务下载情况。
+    /// 已完成的 run 视作 **执行历史记录**,保留。
+    ///
+    /// 验证:
+    /// - 仅 status='running' 的 run 被删(orphan),已完成/失败/中断的 run 保留。
+    /// - FK CASCADE 带走被删 run 的 run_items。
+    /// - task_history 中 share_link 前缀归属的行被清,顶层 + 子层都覆盖。
+    /// - 不同订阅之间互不串,无关 task_history 保留。
+    #[test]
+    fn test_cleanup_previous_runs_for_subscription() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("s.db");
+        let mgr = ShareSyncPersistence::new(&p).unwrap();
+
+        // 两订阅:share_url 不同,清理时按 share_url 前缀归属 task_history
+        let s_a = sub("a");
+        let mut s_b = sub("b");
+        s_b.share_url = "https://pan.baidu.com/s/AnotherShareUrlXX".into();
+        mgr.upsert_subscription(&s_a).unwrap();
+        mgr.upsert_subscription(&s_b).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        // 订阅 A:跑 4 条 run(各种 status),并塞 run_items 验 FK cascade
+        // - a-run1: completed —— 执行历史,应保留
+        // - a-run2: failed    —— 执行历史,应保留
+        // - a-run3: interrupted —— 执行历史,应保留
+        // - a-run4: running   —— 上一轮未完成的同步,应被清(终止+删除)
+        mgr.start_run("a-run1", &s_a.id, now - 400).unwrap();
+        mgr.start_run("a-run2", &s_a.id, now - 300).unwrap();
+        mgr.start_run("a-run3", &s_a.id, now - 200).unwrap();
+        mgr.start_run("a-run4", &s_a.id, now - 100).unwrap();
+        mgr.finish_run(
+            "a-run1",
+            now - 390,
+            RunStatus::Completed,
+            &DiffSummary::default(),
+            None,
+        )
+        .unwrap();
+        mgr.finish_run(
+            "a-run2",
+            now - 290,
+            RunStatus::Failed,
+            &DiffSummary::default(),
+            Some("err"),
+        )
+        .unwrap();
+        mgr.finish_run(
+            "a-run3",
+            now - 190,
+            RunStatus::Interrupted,
+            &DiffSummary::default(),
+            None,
+        )
+        .unwrap();
+        // a-run4 保持 running,并塞一条 run_items 验 FK cascade
+        let conn = mgr.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO share_sync_run_items(run_id, path, action, target, status) \
+             VALUES ('a-run4','/x','added','local','pending')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // 订阅 B:1 条 completed run,绝不能被订阅 A 的清理误伤
+        mgr.start_run("b-run1", &s_b.id, now - 150).unwrap();
+        mgr.finish_run(
+            "b-run1",
+            now - 140,
+            RunStatus::Completed,
+            &DiffSummary::default(),
+            None,
+        )
+        .unwrap();
+
+        // 直接打开同一份 DB 文件,在 task_history 里塞 share-driven 行
+        // (单测里 ShareSyncPersistence 只管 share_sync 自己的表;task_history
+        // 在生产环境是 baidu-pcs.db 里的另一组表,所以这里直接走 Connection)
+        let raw = Connection::open(&p).unwrap();
+        raw.execute_batch(
+            "CREATE TABLE task_history (
+                task_id TEXT PRIMARY KEY,
+                task_type TEXT,
+                status TEXT,
+                share_link TEXT,
+                transfer_task_id TEXT,
+                is_share_direct_download INTEGER
+             )",
+        )
+        .unwrap();
+        // A 的顶层:share_link 是 A.share_url + ?pwd=1234 的拼接(真实生产形如)
+        raw.execute(
+            "INSERT INTO task_history VALUES ('a-top1','download','completed',?,'NULL',1)",
+            [format!("{}?pwd=1234", s_a.share_url)],
+        )
+        .unwrap();
+        // A 的子层:transfer_task_id 指向 a-top1
+        raw.execute(
+            "INSERT INTO task_history VALUES ('a-child1','transfer','completed','NULL','a-top1',0)",
+            [],
+        )
+        .unwrap();
+        // B 的顶层(不应被 A 的清理误伤)
+        raw.execute(
+            "INSERT INTO task_history VALUES ('b-top1','download','completed',?,'NULL',1)",
+            [format!("{}?pwd=5678", s_b.share_url)],
+        )
+        .unwrap();
+        // 完全无关的 task_history(share_link 空,不属于任何订阅)
+        raw.execute(
+            "INSERT INTO task_history VALUES ('user-dl','download','completed','NULL','NULL',0)",
+            [],
+        )
+        .unwrap();
+        drop(raw);
+
+        // 触发清理(订阅 A)
+        let stats = mgr.cleanup_previous_runs_for_subscription(&s_a.id).unwrap();
+        assert_eq!(
+            stats.runs_deleted, 1,
+            "仅 status=running 的 a-run4 应被终止+删除,执行历史(completed/failed/interrupted)保留"
+        );
+        assert_eq!(
+            stats.task_history_deleted, 2,
+            "A 的 share-driven 顶层 + 子层应被清"
+        );
+
+        // 复检:A 的执行历史(3 条)完整保留,仅 running 那条被删
+        let a_runs = mgr.list_runs(&s_a.id, 1, 100).unwrap();
+        assert_eq!(
+            a_runs.len(),
+            3,
+            "A 的 3 条历史 run(completed/failed/interrupted)应全部保留"
+        );
+        let a_run_ids: std::collections::BTreeSet<String> =
+            a_runs.iter().map(|r| r.id.clone()).collect();
+        assert!(a_run_ids.contains("a-run1"), "completed 历史保留");
+        assert!(a_run_ids.contains("a-run2"), "failed 历史保留");
+        assert!(a_run_ids.contains("a-run3"), "interrupted 历史保留");
+        assert!(!a_run_ids.contains("a-run4"), "running 孤儿已被删");
+
+        // run_items:被删的 a-run4 的 item 也应被 FK CASCADE 带走
+        let conn = mgr.conn.lock().unwrap();
+        let leftover_items: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_sync_run_items WHERE run_id = 'a-run4'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover_items, 0, "a-run4 的 run_items 应被 CASCADE 删光");
+        drop(conn);
+
+        // B 的 run 完好
+        let b_runs = mgr.list_runs(&s_b.id, 1, 100).unwrap();
+        assert_eq!(b_runs.len(), 1);
+        assert_eq!(b_runs[0].id, "b-run1");
+
+        let raw = Connection::open(&p).unwrap();
+        let remaining: Vec<String> = raw
+            .prepare("SELECT task_id FROM task_history ORDER BY task_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        // 剩: B 的顶层 + 无关 user-dl
+        assert_eq!(
+            remaining,
+            vec!["b-top1".to_string(), "user-dl".to_string()],
+            "A 的 task_history 行应全部清掉,B 和无关行不动"
+        );
+        drop(raw);
+
+        // 二次清理:已无残留,应得 0
+        let stats2 = mgr.cleanup_previous_runs_for_subscription(&s_a.id).unwrap();
+        assert_eq!(stats2.runs_deleted, 0);
+        assert_eq!(stats2.task_history_deleted, 0);
     }
 
     /// v2: 老库已有 (run_id, path) 重复行时, init_tables 走 ensure_run_items_unique_index
@@ -1567,7 +1792,7 @@ mod tests {
             None,
             None,
         )
-            .unwrap();
+        .unwrap();
         let items = mgr.list_run_items("r1").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, "completed");

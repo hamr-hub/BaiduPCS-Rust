@@ -217,6 +217,23 @@ pub struct DiffSummary {
     /// 前端展示建议：红色 = failed（需关注），黄色 = skipped（信息性）。
     #[serde(default)]
     pub skipped: usize,
+    /// 因 **临时性网络/服务端错误**（`ErrorCategory::Transient`，例如
+    /// `解析文件列表响应失败` / 5xx / 连接重置）在 `transient_max_retries` 全部
+    /// 退避重试后仍未恢复的子项数（v2 新增）。
+    ///
+    /// 与 `failed` 的区别:这些项**不是真正的业务失败**——它们失败是因为百度服务端
+    /// 临时抖动,等下次轮询网络恢复后即可成功。如果按 `failed` 计入,会让 run 被
+    /// 标记为 `CompletedWithErrors` 并阻止快照基线推进,下一次同步又会重复包含这
+    /// 些项,从而陷入「持续触发同样重试 → 持续失败 → 持续阻塞基线」的恶性循环。
+    ///
+    /// 这里把它们单独计数 + 标 `RunItemStatus::Skipped`(reason =
+    /// `"transient_exhausted"`),让 run 状态保持 `Completed`(业务上成功;只是这
+    /// 批项要等下次),并通过 `ApplyOutcome::transient_skipped` 通知 manager 不要
+    /// 推进快照基线——确保下次同步仍会重新尝试这些项。
+    ///
+    /// 前端展示建议:与 `skipped` 同色系(黄色/信息性),不要标红。
+    #[serde(default)]
+    pub transient_retries_exhausted: usize,
 }
 
 #[cfg(test)]

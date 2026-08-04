@@ -3,7 +3,7 @@
 # 本地部署脚本（不使用 Docker）
 # 直接在本机构建并启动后端（rust 二进制）+ 前端（vite）
 # 前端端口：4923（vite preview，绑定 0.0.0.0）
-# 后端端口：取自 config/app.toml（默认 18888）
+# 后端端口：取自 config/app.toml（默认 4924）
 #
 # 关键设计：
 #   - 后端：cargo build 后直接 exec 出 target/<profile> 二进制，PID 即为服务进程，避免 cargo wrapper 残留
@@ -48,7 +48,7 @@ SKIP_BACKEND_BUILD=false
 FRONTEND_PORT=4923
 FRONTEND_HOST="0.0.0.0"
 BACKEND_HOST="127.0.0.1"
-BACKEND_PORT=18888
+BACKEND_PORT=4924
 MODE="prod"   # prod | dev
 
 # systemd

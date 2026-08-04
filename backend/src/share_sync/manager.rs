@@ -25,13 +25,11 @@ use crate::share_sync::events::{
 use crate::share_sync::executor::{
     ApplyOutcome, ExecutorHooks, NetdiskTargetEntry, ShareSyncExecutor,
 };
-use crate::share_sync::persistence::{
-    ShareSyncPersistence, RUN_PHASE_DIFFING, RUN_PHASE_EXECUTING, RUN_PHASE_SCANNING,
-};
+use crate::share_sync::persistence::ShareSyncPersistence;
 use crate::share_sync::resolver::ShareSyncAccountResolver;
 use crate::share_sync::scheduler::SubscriptionScheduler;
 use crate::share_sync::snapshot::{
-    CapturedShare, ScanCache, ScanProgressSink, ShareSnapshot, ShareSnapshotItem, SnapshotCollector,
+    CapturedShare, ShareSnapshot, ShareSnapshotItem, SnapshotCollector,
 };
 use crate::share_sync::types::{ConflictStrategy, RunStatus};
 use crate::transfer::{TransferManager, TransferStatus};
@@ -39,7 +37,6 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -611,6 +608,72 @@ impl ShareSyncManager {
         Ok(())
     }
 
+    /// 清理某订阅的运行历史 + 同步连带清理**内存**中的转存 / 下载 / 文件夹子任务。
+    ///
+    /// 调用时机：用户在前端点了「清理 N 天前的运行记录」。原来只调
+    /// `persistence.delete_runs_before`，仅清掉 `share_sync_runs` / `share_sync_run_items`
+    /// 行；但 `TransferManager` 与 `FolderDownloadManager` 仍持有
+    /// `backup_config_id = share-sync:{id}` 的内部子任务，`subtasks()` 接口会一直把它们
+    /// 当作「进行中」返回给前端 → **「任务下载情况」出现孤儿**。
+    ///
+    /// 这里复用 `delete_subscription` 已用的 `delete_tasks_for_backup_config` 路径
+    /// （取消文件夹 + 清转存内存 + 清历史），保证清完 DB 后内存里也同步归零。
+    ///
+    /// 返回 (DB 行数, 转存内存数, 转存历史数, 文件夹数)，给前端 toast 显示。
+    pub async fn clear_runs_and_orphans(
+        self: &Arc<Self>,
+        subscription_id: &str,
+        days: u32,
+    ) -> Result<ClearRunsAndOrphansResult, ShareSyncError> {
+        let sub = self
+            .get_subscription(subscription_id)
+            .ok_or_else(|| ShareSyncError::SubscriptionNotFound(subscription_id.into()))?;
+        let cutoff = chrono::Utc::now().timestamp() - i64::from(days) * 24 * 60 * 60;
+
+        // 1) DB: 清 share_sync_runs + share_sync_run_items
+        let db_deleted = self
+            .persistence
+            .delete_runs_before(subscription_id, cutoff)?;
+
+        // 2) 内存: 清 share-sync:{id} 名下的内部转存 / 下载 / 文件夹任务
+        //    - 即使当前没有 in-flight run,旧的孤儿(folder 99% 卡住、transfer completed
+        //      但被持久保留等)也一起带走
+        //    - 注意:这是「清理」按钮的语义,即使有正在跑的 sync 也按用户意图清掉,
+        //      与 delete_subscription 同口径
+        let cfg_id = share_sync_backup_config_id(subscription_id);
+        let mut transfer_mem = 0usize;
+        let mut transfer_hist = 0usize;
+        let mut folder_count = 0usize;
+        if let Some(transfer) = self.resolver.transfer_manager(sub.owner_uid).await {
+            // 先统计文件夹数(`delete_folders_for_backup_config` 内部会 cancel 并
+            // `folders.remove`, 之后查就 0 了,所以必须先 count)
+            if let Some(fdm) = transfer.folder_download_manager_handle().await {
+                folder_count = fdm
+                    .get_folders_by_backup_config(&cfg_id)
+                    .await
+                    .len();
+            }
+            let (mem, hist) = transfer.delete_tasks_for_backup_config(&cfg_id).await;
+            transfer_mem = mem;
+            transfer_hist = hist;
+        }
+
+        if db_deleted > 0 || transfer_mem > 0 || transfer_hist > 0 || folder_count > 0 {
+            info!(
+                "share-sync: 清理订阅 {} 历史(days={}) — db_runs={} transfer_mem={} transfer_hist={} folders={}",
+                subscription_id, days, db_deleted, transfer_mem, transfer_hist, folder_count
+            );
+        }
+
+        Ok(ClearRunsAndOrphansResult {
+            db_deleted,
+            transfer_mem,
+            transfer_hist,
+            folder_count,
+            days,
+        })
+    }
+
     // ===================================================
     // 触发 / 执行
     // ===================================================
@@ -670,6 +733,14 @@ impl ShareSyncManager {
         // status=running、WS 端能监听到 RunStarted"的真实 run_id。
         // 前端可以直接跳到 run 详情页拿进度 / 子任务列表，不用再做"我刚点的触发是不是真的
         // 排队成功了"的二次轮询判断。
+        // 新一轮开启前先清掉该订阅的所有"上一轮"记录 + 衍生 task_history 子任务;
+        // 用户偏好:发现上次未完成时直接清理,只处理最新一轮,不复活、不补跑。
+        if let Err(e) = self.persistence.cleanup_previous_runs_for_subscription(id) {
+            warn!(
+                "share-sync: 手动触发入口清理订阅 {} 上一轮失败(继续执行本轮): {}",
+                id, e
+            );
+        }
         let run_id = Uuid::new_v4().to_string();
         let started_at = chrono::Utc::now().timestamp();
         if let Err(e) = self.persistence.start_run(&run_id, id, started_at) {
@@ -707,6 +778,14 @@ impl ShareSyncManager {
     /// 内部委托给 [`execute_one_with_run_id`] 并自动 mint 新 run_id；scheduler tick
     /// 路径与外部调用继续走这里即可，无需自己管 run_id 生成。
     pub async fn execute_one(&self, id: &str) -> Result<ApplyOutcome, ShareSyncError> {
+        // 新一轮开启前清掉该订阅的所有"上一轮"记录 + 衍生 task_history 子任务;
+        // 用户偏好:发现上次未完成时直接清理,只处理最新一轮,不复活、不补跑。
+        if let Err(e) = self.persistence.cleanup_previous_runs_for_subscription(id) {
+            warn!(
+                "share-sync: scheduler 入口清理订阅 {} 上一轮失败(继续执行本轮): {}",
+                id, e
+            );
+        }
         self.execute_one_with_run_id(id, None).await
     }
 
@@ -833,59 +912,7 @@ impl ShareSyncManager {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1000);
         let mut snapshot_attempt: u32 = 0;
-
-        // 跨「整轮重试」复用的目录缓存：只在**本次 run** 内有效。
-        // 让重试从「整棵树重爬」退化成「续爬剩余目录」——大分享一轮几百个目录、
-        // 上百秒，重爬既慢又因请求量翻倍更容易再次撞限流。
-        let scan_cache = Arc::new(ScanCache::new());
-
-        // 抓取阶段的进度广播：`RunStarted` 到 `DiffDetected` 之间是最长的一段静默，
-        // 没有它前端只能一直显示「运行中」，用户会以为卡死。
-        //
-        // 节流约 500ms 一帧：几百个目录逐个回调会刷爆 WS。用 Mutex<Instant> 记上次
-        // 发送时间，回调是同步闭包（在抓取的 async 上下文里被调），不能阻塞。
-        let scan_attempt = Arc::new(AtomicU32::new(1));
-        let scan_sink: ScanProgressSink = {
-            let publisher = Arc::clone(&self.publisher);
-            let run_id_for_sink = run_id.clone();
-            let sub_id_for_sink = id.to_string();
-            let attempt_for_sink = Arc::clone(&scan_attempt);
-            let last_emit = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
-            Arc::new(move |p: crate::share_sync::snapshot::ScanProgress| {
-                {
-                    let mut guard = match last_emit.lock() {
-                        Ok(g) => g,
-                        Err(_) => return,
-                    };
-                    let now = std::time::Instant::now();
-                    if let Some(prev) = *guard {
-                        if now.duration_since(prev) < std::time::Duration::from_millis(500) {
-                            return;
-                        }
-                    }
-                    *guard = Some(now);
-                }
-                publisher.publish(ShareSyncEvent::ScanProgress {
-                    run_id: run_id_for_sink.clone(),
-                    subscription_id: sub_id_for_sink.clone(),
-                    dirs_done: p.dirs_done,
-                    dirs_pending: p.dirs_pending,
-                    files_seen: p.files_seen,
-                    current_dir: p.current_dir,
-                    attempt: attempt_for_sink.load(Ordering::Relaxed),
-                    cached_hits: p.cached_hits,
-                    owner_uid,
-                });
-            })
-        };
-
-        // 阶段落库：WS 断线 / 页面刷新后，REST 轮询仍能显示「扫描目录中」。
-        let _ = self
-            .persistence
-            .update_run_phase(&run_id, RUN_PHASE_SCANNING);
-
         let (captured, curr_snapshot) = loop {
-            scan_attempt.store(snapshot_attempt + 1, Ordering::Relaxed);
             let attempt_result = match SnapshotCollector::from_url(
                 netdisk.as_ref(),
                 &sub.share_url,
@@ -895,14 +922,9 @@ impl ShareSyncManager {
                 // 列目录抓快照与转存提交共用同一个全局风控限速器
                 self.rate_limiter.clone(),
             )
-                .await
+            .await
             {
-                Ok(collector) => collector
-                    .with_progress(Arc::clone(&scan_sink))
-                    .with_cache(Arc::clone(&scan_cache))
-                    .collect()
-                    .await
-                    .map_err(|e| ("抓取失败", e)),
+                Ok(collector) => collector.collect().await.map_err(|e| ("抓取失败", e)),
                 Err(e) => Err(("抓取初始化失败", e)),
             };
 
@@ -911,15 +933,13 @@ impl ShareSyncManager {
                 Err((stage, e)) if e.should_retry() && snapshot_attempt < snapshot_max_retries => {
                     let backoff = snapshot_base_delay_ms.saturating_mul(1u64 << snapshot_attempt);
                     warn!(
-                        "share-sync: {} 临时失败，{}ms 后重试 subscription={} run_id={} attempt={}/{} cached_dirs={} err={}",
+                        "share-sync: {} 临时失败，{}ms 后重试 subscription={} run_id={} attempt={}/{} err={}",
                         stage,
                         backoff,
                         id,
                         run_id,
                         snapshot_attempt + 1,
                         snapshot_max_retries,
-                        // 已缓存的目录数 = 下一轮可跳过的请求数，用来观察续爬是否生效
-                        scan_cache.len(),
                         e
                     );
                     if backoff > 0 {
@@ -936,7 +956,6 @@ impl ShareSyncManager {
         };
         // 成功抓取到分享内容 → 链接可用，归零失效计数（如曾标记失效也清除）。
         self.clear_link_failure(id);
-        let _ = self.persistence.update_run_phase(&run_id, RUN_PHASE_DIFFING);
 
         // 2) 绑定 subscription_id 后，先读"上次成功应用的快照"再计算 diff。
         //    当前快照必须等执行成功后才能推进基线；否则下载/转存失败会把
@@ -964,9 +983,6 @@ impl ShareSyncManager {
         });
 
         // 4) 执行
-        let _ = self
-            .persistence
-            .update_run_phase(&run_id, RUN_PHASE_EXECUTING);
         // 启动「子任务进度广播器」：run 期间约 1s 推一次 ItemProgress（走 share_sync 频道，
         // 不与自动备份 / 下载管理混淆）。run 结束后 abort。前端 WS 实时刷，REST 轮询兜底。
         let progress_handle = {
@@ -1027,19 +1043,24 @@ impl ShareSyncManager {
             id.to_string(),
             owner_uid,
         )
-            .await;
+        .await;
 
         // 仅当 run 完成**且**没有任何子项因资源类原因（配额满 / 本地磁盘满）被跳过时，
         // 才推进快照基线。否则被跳过、尚未真正落地的项会被写入新基线，导致下一次
         // diff 不再包含它们 —— 即使后来腾出空间也不会补传。
-        if should_advance_snapshot_baseline(outcome.status) && !outcome.resource_skipped {
+        // v2:同时检查 transient_skipped —— transient 错误在重试耗尽后被跳过,
+        // 也属于"未真正落地,下次同步要重新尝试"。
+        if should_advance_snapshot_baseline(outcome.status)
+            && !outcome.resource_skipped
+            && !outcome.transient_skipped
+        {
             if let Err(e) = self.persistence.save_snapshot(&curr_snapshot) {
                 warn!("save_snapshot 失败，下一次同步会重试本次 diff: {}", e);
             }
         } else {
             warn!(
-                "share-sync: run 未完全成功或有资源类跳过，不推进快照基线，下一次将重试 diff: run_id={}, status={:?}, failed={}, resource_skipped={}",
-                outcome.run_id, outcome.status, outcome.diff_summary.failed, outcome.resource_skipped
+                "share-sync: run 未完全成功或有资源类跳过，不推进快照基线，下一次将重试 diff: run_id={}, status={:?}, failed={}, resource_skipped={}, transient_skipped={}",
+                outcome.run_id, outcome.status, outcome.diff_summary.failed, outcome.resource_skipped, outcome.transient_skipped
             );
         }
 
@@ -2094,8 +2115,8 @@ impl ExecutorHooks for ProductionHooks {
                     .collect();
                 let paused_resume_due = !paused_subtasks.is_empty()
                     && last_paused_resume_at
-                    .map(|last| now.duration_since(last) >= Duration::from_secs(10))
-                    .unwrap_or(true);
+                        .map(|last| now.duration_since(last) >= Duration::from_secs(10))
+                        .unwrap_or(true);
                 if paused_resume_due {
                     last_paused_resume_at = Some(now);
                     let restarted =
@@ -2140,8 +2161,8 @@ impl ExecutorHooks for ProductionHooks {
                     let retry_due = idle_for >= retry_after
                         && stall_retry_attempts < stall_retry_max
                         && last_stall_retry_at
-                        .map(|last| now.duration_since(last) >= retry_after)
-                        .unwrap_or(true);
+                            .map(|last| now.duration_since(last) >= retry_after)
+                            .unwrap_or(true);
                     if retry_due {
                         last_stall_retry_at = Some(now);
                         let restarted = restart_stalled_share_sync_downloads(
@@ -2149,7 +2170,7 @@ impl ExecutorHooks for ProductionHooks {
                             &subtasks,
                             stall_retry_cooldown,
                         )
-                            .await;
+                        .await;
                         if restarted > 0 {
                             stall_retry_attempts += 1;
                             last_activity_at = tokio::time::Instant::now();
@@ -2685,8 +2706,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         assert_eq!(m.list_subscriptions().len(), 0);
     }
 
@@ -2699,8 +2720,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         assert_eq!(m.list_subscriptions().len(), 1);
         assert!(m.get_subscription(&s.id).is_some());
@@ -2722,8 +2743,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let mut a = sub("a");
         a.owner_uid = 1;
@@ -2755,8 +2776,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         let original_created = s.created_at;
 
@@ -2777,8 +2798,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         m.set_enabled(&s.id, false).unwrap();
         assert!(!m.get_subscription(&s.id).unwrap().enabled);
@@ -3141,8 +3162,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let mut bad = sub("a");
         bad.share_url = "https://example.com".into();
         let r = m.create_subscription(bad);
@@ -3164,8 +3185,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let list = m.list_subscriptions();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "preloaded");
@@ -3180,8 +3201,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let s = m.create_subscription(sub("a")).unwrap();
         // netdisk_client 为 None → 应报错
         let r = m.execute_one(&s.id).await;
@@ -3199,8 +3220,8 @@ mod tests {
             resolver: Arc::new(StaticAccountResolver::none()),
             publisher: Some(Arc::new(NoopShareSyncEventPublisher)),
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let mut sub = sub("a");
         sub.owner_uid = 1;
         let s = m.create_subscription(sub).unwrap();
@@ -3209,4 +3230,21 @@ mod tests {
         m.running.remove(&s.id);
         assert!(matches!(r, Err(ShareSyncError::AlreadyRunning(_))));
     }
+}
+
+/// `clear_runs_and_orphans` 返回的清理结果。
+///
+/// 用于前端 toast 显示「已清理 N 条运行记录 / M 个内存子任务」。
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct ClearRunsAndOrphansResult {
+    /// `share_sync_runs` 表中删掉的行数
+    pub db_deleted: usize,
+    /// `TransferManager` 内存里删掉的转存子任务数
+    pub transfer_mem: usize,
+    /// 转存历史表删掉的行数
+    pub transfer_hist: usize,
+    /// `FolderDownloadManager` 取消的文件夹下载任务数
+    pub folder_count: usize,
+    /// 清理阈值（天）
+    pub days: u32,
 }

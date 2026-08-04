@@ -231,6 +231,13 @@ pub struct ApplyOutcome {
     /// 这类项虽然不把 run 标记为业务失败，但**尚未真正落地**，
     /// 因此调用方不应据此推进快照基线，否则被跳过的项会被误标为已同步而永不重试。
     pub resource_skipped: bool,
+    /// 是否有子项因**临时性网络/服务端错误**（`ErrorCategory::Transient`）在
+    /// `transient_max_retries` 全部退避重试后仍未恢复被跳过（v2 新增）。
+    ///
+    /// 与 `resource_skipped` 语义平行:这些项仍未真正落地,需要下次同步重试;
+    /// 调用方据此**不推进**快照基线。区别是这类原因属于网络抖动,而不是用户侧
+    /// 资源不足——前端可分别展示。
+    pub transient_skipped: bool,
 }
 
 /// 同步执行器
@@ -368,6 +375,7 @@ impl<'a> ShareSyncExecutor<'a> {
                 diff_summary: DiffSummary::default(),
                 error: Some(format!("启动 run 失败: {}", e)),
                 resource_skipped: false,
+                transient_skipped: false,
             };
         }
 
@@ -380,6 +388,10 @@ impl<'a> ShareSyncExecutor<'a> {
         // 触发原因记录在最后一个被跳过的 item 的 error 字段里，供前端展示。
         let mut any_quota_skip = false;
         let mut last_quota_skip_msg: Option<String> = None;
+        // 临时性网络/服务端错误在 transient 重试全部耗尽后被跳过，单独标记——
+        // run 状态保持 Completed（业务上成功），但 transient_skipped 仍置 true 让
+        // manager 不推进快照基线，保证下次同步会重新尝试这些项。
+        let mut any_transient_skipped = false;
 
         // 有效转存操作（网盘+本地合并为一条腿，消除重复转存）
         let ops = self.effective_transfer_ops();
@@ -411,6 +423,11 @@ impl<'a> ShareSyncExecutor<'a> {
                         ) {
                             any_quota_skip = true;
                             last_quota_skip_msg = Some(e.user_message());
+                        } else if matches!(e.category(), ErrorCategory::Transient) {
+                            // v2:临时性错误在 transfer_node_set 内部已经重试到上限,
+                            // 这里仅标记 transient_skipped(run 仍标 Completed),实际
+                            // 叶子已经被 transfer_node_set 标 Skipped + transient_retries_exhausted 计入。
+                            any_transient_skipped = true;
                         } else {
                             any_failure = true;
                         }
@@ -445,6 +462,8 @@ impl<'a> ShareSyncExecutor<'a> {
                         ) {
                             any_quota_skip = true;
                             last_quota_skip_msg = Some(e.user_message());
+                        } else if matches!(e.category(), ErrorCategory::Transient) {
+                            any_transient_skipped = true;
                         } else {
                             any_failure = true;
                         }
@@ -492,6 +511,8 @@ impl<'a> ShareSyncExecutor<'a> {
                         ) {
                             any_quota_skip = true;
                             last_quota_skip_msg = Some(e.user_message());
+                        } else if matches!(e.category(), ErrorCategory::Transient) {
+                            any_transient_skipped = true;
                         } else {
                             any_failure = true;
                         }
@@ -501,10 +522,12 @@ impl<'a> ShareSyncExecutor<'a> {
             summary.removed += 1;
         }
 
-        // 决定 run 终态：
+        // 决定 run 终态（v2:加入 transient_skipped 的去失败化）：
         // - 有真实业务失败（any_failure）→ CompletedWithErrors
-        // - 仅 quota / local_disk 跳过（资源类）→ Completed（run 业务上成功；
-        //   summary.skipped 体现被跳过的子项数；error 字段给前端展示原因）
+        // - 仅 quota / local_disk 跳过（资源类）或仅 transient 重试耗尽跳过
+        //   （网络抖动）→ Completed（run 业务上成功；summary.skipped /
+        //   summary.transient_retries_exhausted 体现被跳过的子项数；error 字段给
+        //   前端展示原因）
         // - 全成功 → Completed
         let status = if any_failure {
             RunStatus::CompletedWithErrors
@@ -513,7 +536,8 @@ impl<'a> ShareSyncExecutor<'a> {
         };
         // run.error：仅当**只有 quota 跳过 + 没有任何真实失败**时，把消息写到
         // outcome.error（前端会把它当作"信息性提示"展示，不会把整次 run 标红）。
-        let run_error = if any_quota_skip && !any_failure {
+        // v2:transient 重试耗尽也走相同处理 —— 同样属"业务成功、信息性提示"。
+        let run_error = if any_quota_skip && !any_failure && !any_transient_skipped {
             last_quota_skip_msg
         } else {
             error
@@ -535,6 +559,7 @@ impl<'a> ShareSyncExecutor<'a> {
             diff_summary: summary,
             error: run_error,
             resource_skipped: any_quota_skip,
+            transient_skipped: any_transient_skipped,
         }
     }
 
@@ -579,6 +604,7 @@ impl<'a> ShareSyncExecutor<'a> {
                 diff_summary: DiffSummary::default(),
                 error: Some(format!("启动 run 失败: {}", e)),
                 resource_skipped: false,
+                transient_skipped: false,
             };
         }
 
@@ -586,6 +612,9 @@ impl<'a> ShareSyncExecutor<'a> {
         seed_diff_summary(&mut summary, diff);
         let mut any_failure = false;
         let mut run_failure_reason: Option<&'static str> = None;
+        // v2:transient 重试耗尽标记。run 状态保持 Completed,但 transient_skipped
+        // 仍置 true 让 manager 不推进快照基线,确保下次同步重新尝试这些项。
+        let mut any_transient_skipped = false;
 
         // 1) 把 added + modified.new 合并为"待处理候选"
         let mut candidates: Vec<(SyncAction, ShareSnapshotItem)> =
@@ -629,9 +658,15 @@ impl<'a> ShareSyncExecutor<'a> {
                             )
                             .await
                         {
-                            any_failure = true;
-                            run_failure_reason =
-                                update_run_failure_reason(run_failure_reason, e.category());
+                            // v2:transient 不再算 any_failure(run 仍标 Completed),
+                            // 只置 any_transient_skipped 让 manager 不推进基线。
+                            if matches!(e.category(), ErrorCategory::Transient) {
+                                any_transient_skipped = true;
+                            } else {
+                                any_failure = true;
+                                run_failure_reason =
+                                    update_run_failure_reason(run_failure_reason, e.category());
+                            }
                             warn!("added/modified 处理失败: path={}, err={}", item.path, e);
                         }
                     }
@@ -715,10 +750,19 @@ impl<'a> ShareSyncExecutor<'a> {
                             )
                             .await;
                         if let Err(e) = wait_result {
-                            any_failure = true;
+                            // v2:transient 不再算 any_failure(run 仍标 Completed),
+                            // 只置 any_transient_skipped 让 manager 不推进基线。
+                            // 注意:batch submit 阶段失败的整组会在下面被标 Failed
+                            // (走 group_failed 分支);我们这里只关心"失败类型"。
+                            if matches!(e.category(), ErrorCategory::Transient) {
+                                any_transient_skipped = true;
+                            } else {
+                                any_failure = true;
+                                let category = e.category();
+                                run_failure_reason =
+                                    update_run_failure_reason(run_failure_reason, category);
+                            }
                             let category = e.category();
-                            run_failure_reason =
-                                update_run_failure_reason(run_failure_reason, category);
                             warn!(
                                 "batch submit 失败: root={}, items={}, err={}",
                                 root_path,
@@ -769,11 +813,17 @@ impl<'a> ShareSyncExecutor<'a> {
                                         // 单文件回退又失败的——`process_added_or_modified`
                                         // 内部已经按 quota 标 Skipped / 其它标 Failed，
                                         // 这里只更新 any_failure 与 run_failure_reason。
-                                        any_failure = true;
-                                        run_failure_reason = update_run_failure_reason(
-                                            run_failure_reason,
-                                            e2.category(),
-                                        );
+                                        // v2:transient 不再算 any_failure, 只置
+                                        // any_transient_skipped。
+                                        if matches!(e2.category(), ErrorCategory::Transient) {
+                                            any_transient_skipped = true;
+                                        } else {
+                                            any_failure = true;
+                                            run_failure_reason = update_run_failure_reason(
+                                                run_failure_reason,
+                                                e2.category(),
+                                            );
+                                        }
                                     }
                                 }
                                 // 不再 break 外层 group 循环——继续尝试其它 group（用
@@ -895,19 +945,25 @@ impl<'a> ShareSyncExecutor<'a> {
                     .process_removed(run_id.as_str(), item, target, &mut summary)
                     .await
                 {
-                    any_failure = true;
-                    run_failure_reason =
-                        update_run_failure_reason(run_failure_reason, e.category());
+                    // v2:transient 不再算 any_failure, 只置 any_transient_skipped。
+                    if matches!(e.category(), ErrorCategory::Transient) {
+                        any_transient_skipped = true;
+                    } else {
+                        any_failure = true;
+                        run_failure_reason =
+                            update_run_failure_reason(run_failure_reason, e.category());
+                    }
                     warn!("removed 处理失败: path={}, err={}", item.path, e);
                 }
             }
             summary.removed += 1;
         }
 
-        // 5) 决定 run 终态（v1.1：quota 不再算 Failed）
-        // - 有非资源类失败（any_failure）→ CompletedWithErrors
-        // - 仅 quota / local_disk_full 跳过 → Completed（业务上成功；被跳过的子项
-        //   在 summary.skipped 体现，error 字段给前端展示原因）
+        // 5) 决定 run 终态（v1.1：quota 不再算 Failed; v2:加入 transient 同样去失败化）
+        // - 有非资源类、非临时性失败（any_failure）→ CompletedWithErrors
+        // - 仅 quota / local_disk_full 跳过（资源类）或仅 transient 重试耗尽跳过
+        //   （网络抖动）→ Completed（业务上成功；被跳过的子项在 summary.skipped /
+        //   summary.transient_retries_exhausted 体现）
         // - 全成功 → Completed
         let quota_only = matches!(
             run_failure_reason,
@@ -943,6 +999,8 @@ impl<'a> ShareSyncExecutor<'a> {
             diff_summary: summary,
             error,
             resource_skipped: quota_only,
+            // v2:transient 重试耗尽与 quota 平行 — run 业务上成功但不推进基线。
+            transient_skipped: any_transient_skipped,
         }
     }
 
@@ -978,6 +1036,7 @@ impl<'a> ShareSyncExecutor<'a> {
                 diff_summary: DiffSummary::default(),
                 error: Some(format!("启动 run 失败: {}", e)),
                 resource_skipped: false,
+                transient_skipped: false,
             };
         }
 
@@ -985,6 +1044,8 @@ impl<'a> ShareSyncExecutor<'a> {
         seed_diff_summary(&mut summary, diff);
         let mut any_failure = false;
         let mut run_failure_reason: Option<&'static str> = None;
+        // v2:transient 重试耗尽标记。
+        let mut any_transient_skipped = false;
 
         // 1) 合并 added + modified 项(**保留 is_dir**——让 tree 重建出目录骨架,
         //    然后我们才能用目录 fs_id 整体提交)
@@ -1117,9 +1178,18 @@ impl<'a> ShareSyncExecutor<'a> {
             summary.failed += local.failed;
             summary.skipped += local.skipped;
             summary.overwritten += local.overwritten;
+            // v2:transient 重试耗尽的子项已经由 transfer_node_set 单独计入
+            // local.transient_retries_exhausted,这里累加到顶层 summary。
+            summary.transient_retries_exhausted += local.transient_retries_exhausted;
             if let Err(category) = res {
-                any_failure = true;
-                run_failure_reason = update_run_failure_reason(run_failure_reason, category);
+                // v2:transient 不再算 any_failure(run 仍标 Completed),
+                // 只置 any_transient_skipped。
+                if matches!(category, ErrorCategory::Transient) {
+                    any_transient_skipped = true;
+                } else {
+                    any_failure = true;
+                    run_failure_reason = update_run_failure_reason(run_failure_reason, category);
+                }
             }
         }
 
@@ -1160,16 +1230,25 @@ impl<'a> ShareSyncExecutor<'a> {
                     .process_removed(run_id.as_str(), item, target, &mut summary)
                     .await
                 {
-                    any_failure = true;
-                    run_failure_reason =
-                        update_run_failure_reason(run_failure_reason, e.category());
+                    // v2:transient 不再算 any_failure, 只置 any_transient_skipped。
+                    if matches!(e.category(), ErrorCategory::Transient) {
+                        any_transient_skipped = true;
+                    } else {
+                        any_failure = true;
+                        run_failure_reason =
+                            update_run_failure_reason(run_failure_reason, e.category());
+                    }
                     warn!("removed 处理失败: path={}, err={}", item.path, e);
                 }
             }
             summary.removed += 1;
         }
 
-        // 6) run 终态(沿用 grouped 路径语义:仅 quota 不算 Failed)
+        // 6) run 终态(沿用 grouped 路径语义:仅 quota 不算 Failed;v2 加 transient 同样去失败化)
+        // - 有非资源类、非临时性失败（any_failure）→ CompletedWithErrors
+        // - 仅 quota / local_disk_full 跳过（资源类）或仅 transient 重试耗尽跳过
+        //   （网络抖动）→ Completed（业务上成功）
+        // - 全成功 → Completed
         let quota_only = matches!(
             run_failure_reason,
             Some("quota_full") | Some("local_disk_full")
@@ -1203,6 +1282,8 @@ impl<'a> ShareSyncExecutor<'a> {
             diff_summary: summary,
             error,
             resource_skipped: quota_only,
+            // v2:transient 重试耗尽与 quota 平行 — run 业务上成功但不推进基线。
+            transient_skipped: any_transient_skipped,
         }
     }
 
@@ -1235,7 +1316,7 @@ impl<'a> ShareSyncExecutor<'a> {
             summary,
             0,
         )
-            .await
+        .await
     }
 
     /// 提交一组节点(可能是 1 个目录、N 个散文件、混合)的 transfer
@@ -1268,33 +1349,6 @@ impl<'a> ShareSyncExecutor<'a> {
         if indices.is_empty() {
             return Ok(());
         }
-
-        // 过滤安全：抓快照时被 include/exclude 剔除了后代的目录（`subtree_pruned`）**不能**
-        // 当作单个目录 fs_id 整体提交 —— 百度服务端会按 fs_id 递归复制整目录，把被过滤的
-        // 子项也搬过去（过滤形同虚设）。这里在提交前迭代展开：把每个 pruned 目录替换为它
-        // 存活的子节点（被过滤的子项已不在 tree 中，自然跳过），直到工作集里不再有 pruned
-        // 目录。干净的兄弟子树仍保持"整目录 fs_id 高效转存"，只有含被过滤分支的目录才被
-        // 拆到子节点粒度。用迭代（而非递归）实现，避免消耗二分递归的 depth 预算。
-        let indices: Vec<usize> = {
-            let mut resolved: Vec<usize> = Vec::with_capacity(indices.len());
-            let mut queue: std::collections::VecDeque<usize> = indices.into_iter().collect();
-            while let Some(idx) = queue.pop_front() {
-                let n = tree.get(idx);
-                if n.is_dir && n.subtree_pruned && !n.is_placeholder() {
-                    // 展开到子节点；若该目录被过滤后已无存活子节点，则什么都不加（整目录跳过）。
-                    for &c in &n.children {
-                        queue.push_back(c);
-                    }
-                } else {
-                    resolved.push(idx);
-                }
-            }
-            resolved
-        };
-        if indices.is_empty() {
-            return Ok(());
-        }
-
         let items_to_submit = tree_mod::nodes_to_items(tree, &indices);
         if items_to_submit.is_empty() {
             // 全是 placeholder — 降级按叶子提交
@@ -1321,8 +1375,10 @@ impl<'a> ShareSyncExecutor<'a> {
         }
         let target_kind = record_kind;
         let strategy = target.effective_conflict_strategy(self.subscription.conflict_strategy);
-        let internal_label =
-            format!("share-sync/{}/tree/d{}/{}", self.subscription.id, depth, run_id);
+        let internal_label = format!(
+            "share-sync/{}/tree/d{}/{}",
+            self.subscription.id, depth, run_id
+        );
 
         let first_path = tree.get(indices[0]).path.clone();
         info!(
@@ -1345,8 +1401,7 @@ impl<'a> ShareSyncExecutor<'a> {
                 .ok()
                 .map(|v| v != "0" && v.to_lowercase() != "false")
                 .unwrap_or(true);
-            if bisect_enabled && self.op_transfers_to_netdisk(target) && depth < BISECT_MAX_DEPTH
-            {
+            if bisect_enabled && self.op_transfers_to_netdisk(target) && depth < BISECT_MAX_DEPTH {
                 let leaf_count: usize = indices
                     .iter()
                     .map(|&i| tree.descendants_leaves(i).len())
@@ -1692,6 +1747,17 @@ impl<'a> ShareSyncExecutor<'a> {
                     unresolved_count += 1;
                     (RunItemStatus::Failed, None)
                 }
+                ErrorCategory::Transient => {
+                    // v2:transfer_node_set 内部已经把 transient 重试到上限仍未恢复
+                    // (例如 `解析文件列表响应失败` / 5xx / 连接重置) → 不算业务失败,
+                    // 而是与 quota 平行地标 Skipped + 单独计入
+                    // summary.transient_retries_exhausted。run 状态保持 Completed,
+                    // 但 manager 通过 outcome.transient_skipped 不推进快照基线,
+                    // 保证下次同步会重新尝试这些项。
+                    summary.transient_retries_exhausted += 1;
+                    unresolved_count += 1;
+                    (RunItemStatus::Skipped, Some("transient_exhausted"))
+                }
                 _ => {
                     summary.failed += 1;
                     unresolved_count += 1;
@@ -1831,7 +1897,6 @@ impl<'a> ShareSyncExecutor<'a> {
             Some(c) => Err(c),
         }
     }
-
 
     /// 处理 added/modified 文件
     async fn process_added_or_modified(
@@ -2800,180 +2865,6 @@ mod tests {
         }
     }
 
-    /// 回归：含被 exclude/include 剔除后代的目录（subtree_pruned=true）不得被整目录
-    /// fs_id 直传（否则百度会递归复制整目录、连带把被过滤子项搬过去）；干净的兄弟
-    /// 子目录仍应保持整目录高效转存。
-    #[test]
-    fn test_pruned_dir_not_transferred_wholesale_but_clean_children_are() {
-        let dir = tempdir().unwrap();
-        let s = {
-            let mut s = sub();
-            s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
-                remote_path: "/dest".into(),
-                save_fs_id: 0,
-                conflict_strategy: None,
-            })];
-            s
-        };
-        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
-        pm.upsert_subscription(&s).unwrap();
-
-        // 模拟抓快照后的结果：/root 因其后代 /root/00 被 exclude 剔除而标记 pruned；
-        // 被排除的 /root/00 子树不在快照里；干净子目录 /root/01、/root/02 各含 1 个文件。
-        let mut root = ShareSnapshotItem::new("/root", "root", 1, 0, true);
-        root.subtree_pruned = true;
-        let d01 = ShareSnapshotItem::new("/root/01", "01", 10, 0, true);
-        let f1 = item("/root/01/a.mp4", 11, 100);
-        let d02 = ShareSnapshotItem::new("/root/02", "02", 20, 0, true);
-        let f2 = item("/root/02/b.mp4", 21, 200);
-        let curr = ShareSnapshot::with_items(&s.id, vec![root, d01, f1, d02, f2]);
-
-        let diff = diff_snapshots(None, &curr);
-        let hooks = MockHooks::default();
-        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
-        let outcome = futures::executor::block_on(ex.apply_with_run_id_tree(
-            "run-prune".into(),
-            &captured(),
-            &diff,
-        ));
-        assert_eq!(outcome.status, RunStatus::Completed);
-
-        let submitted: Vec<u64> = hooks
-            .batch_transfers
-            .lock()
-            .unwrap()
-            .iter()
-            .flat_map(|(_, ids, _)| ids.clone())
-            .collect();
-        // 关键：pruned 父目录 /root(fs_id=1) 绝不能被整目录直传
-        assert!(
-            !submitted.contains(&1),
-            "pruned 父目录被整目录直传了: {:?}",
-            submitted
-        );
-        // 干净子目录应各自被整目录提交
-        assert!(submitted.contains(&10), "clean dir /root/01 未被转存: {:?}", submitted);
-        assert!(submitted.contains(&20), "clean dir /root/02 未被转存: {:?}", submitted);
-    }
-
-    /// 复现 issue #128 追加反馈的「多层级」场景：pruned 链贯穿 4 层
-    /// (/大主宰3D → /S02 连载中 → /S02 4K NoSub → /字幕文件)，
-    /// 其中最深层 字幕文件 的全部子项被排除（空壳）、同层混有存活文件与干净子目录。
-    /// 期望：整条 pruned 链上任何一层目录的 fs_id 都不得被整目录直传；
-    /// 空壳目录被跳过；存活文件与干净子目录正常提交。
-    #[test]
-    fn test_multilevel_pruned_chain_never_submits_ancestor_dirs() {
-        let dir = tempdir().unwrap();
-        let s = {
-            let mut s = sub();
-            s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
-                remote_path: "/apps".into(),
-                save_fs_id: 0,
-                conflict_strategy: None,
-            })];
-            s
-        };
-        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
-        pm.upsert_subscription(&s).unwrap();
-
-        // 快照阶段的产物：被排除项（*Soft* mp4 / *.zip*）已不在快照中，
-        // 其祖先链全部被标记 subtree_pruned。
-        let mk_dir = |path: &str, fs_id: u64, pruned: bool| {
-            let name = path.rsplit('/').next().unwrap().to_string();
-            let mut d = ShareSnapshotItem::new(path, name, fs_id, 0, true);
-            d.subtree_pruned = pruned;
-            d
-        };
-        let items = vec![
-            mk_dir("/大主宰3D", 1, true),
-            mk_dir("/大主宰3D/S02 连载中", 2, true),
-            mk_dir("/大主宰3D/S02 连载中/S02 4K NoSub", 3, true),
-            // 全部子项被 *.zip* 排除 → 空壳 + pruned
-            mk_dir("/大主宰3D/S02 连载中/S02 4K NoSub/字幕文件", 4, true),
-            // 干净子目录（无被排除后代）→ 应保持整目录提交
-            mk_dir("/大主宰3D/S02 连载中/S02 4K NoSub/花絮", 5, false),
-            item("/大主宰3D/S02 连载中/S02 4K NoSub/花絮/mv.mp4", 51, 10),
-            // 存活文件（HEVC 版本未被排除）
-            item("/大主宰3D/S02 连载中/S02 4K NoSub/E01.4K.HEVC-GM.mp4", 31, 100),
-            item("/大主宰3D/S02 连载中/S02 4K NoSub/E02.4K.HEVC-GM.mp4", 32, 100),
-        ];
-        let curr = ShareSnapshot::with_items(&s.id, items);
-
-        let diff = diff_snapshots(None, &curr);
-        let hooks = MockHooks::default();
-        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
-        let outcome = futures::executor::block_on(ex.apply_with_run_id_tree(
-            "run-deep".into(),
-            &captured(),
-            &diff,
-        ));
-        assert_eq!(outcome.status, RunStatus::Completed);
-
-        let submitted: Vec<u64> = hooks
-            .batch_transfers
-            .lock()
-            .unwrap()
-            .iter()
-            .flat_map(|(_, ids, _)| ids.clone())
-            .collect();
-        // pruned 链上的每一层目录都不得被整目录直传
-        for (fs_id, label) in [
-            (1u64, "/大主宰3D"),
-            (2, "/S02 连载中"),
-            (3, "/S02 4K NoSub"),
-            (4, "/字幕文件(空壳)"),
-        ] {
-            assert!(
-                !submitted.contains(&fs_id),
-                "pruned 目录 {} (fs_id={}) 被整目录直传了: {:?}",
-                label,
-                fs_id,
-                submitted
-            );
-        }
-        // 存活文件与干净子目录必须被提交
-        assert!(submitted.contains(&31), "存活文件 E01 未被转存: {:?}", submitted);
-        assert!(submitted.contains(&32), "存活文件 E02 未被转存: {:?}", submitted);
-        assert!(submitted.contains(&5), "干净子目录 /花絮 未被整目录转存: {:?}", submitted);
-    }
-
-    /// pruned 目录若其后代也被逐层剔除，最终无存活子节点，则整目录被跳过（不提交）。
-    #[test]
-    fn test_fully_excluded_pruned_dir_submits_nothing() {
-        let dir = tempdir().unwrap();
-        let s = {
-            let mut s = sub();
-            s.targets = vec![SyncTarget::Netdisk(NetdiskTarget {
-                remote_path: "/dest".into(),
-                save_fs_id: 0,
-                conflict_strategy: None,
-            })];
-            s
-        };
-        let pm = ShareSyncPersistence::new(&dir.path().join("s.db")).unwrap();
-        pm.upsert_subscription(&s).unwrap();
-
-        // /root 标记 pruned，但其所有子项都被排除（快照里只剩它自己这个壳）。
-        let mut root = ShareSnapshotItem::new("/root", "root", 1, 0, true);
-        root.subtree_pruned = true;
-        let curr = ShareSnapshot::with_items(&s.id, vec![root]);
-
-        let diff = diff_snapshots(None, &curr);
-        let hooks = MockHooks::default();
-        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
-        let outcome = futures::executor::block_on(ex.apply_with_run_id_tree(
-            "run-empty".into(),
-            &captured(),
-            &diff,
-        ));
-        assert_eq!(outcome.status, RunStatus::Completed);
-        assert!(
-            hooks.batch_transfers.lock().unwrap().is_empty(),
-            "被完全排除的目录不应产生任何转存"
-        );
-        assert!(hooks.transfers.lock().unwrap().is_empty());
-    }
-
     #[test]
     fn test_timestamped_name() {
         let n = timestamped_name("file.txt");
@@ -3285,10 +3176,7 @@ mod tests {
         assert_eq!(outcome.status, RunStatus::Completed);
         assert_eq!(hooks.transfers.lock().unwrap().len(), 0);
         assert_eq!(hooks.downloads.lock().unwrap().len(), 1);
-        assert_eq!(
-            *hooks.download_netdisk_dirs.lock().unwrap(),
-            vec![None]
-        );
+        assert_eq!(*hooks.download_netdisk_dirs.lock().unwrap(), vec![None]);
     }
 
     #[test]
@@ -3663,7 +3551,10 @@ mod tests {
         // 回退确实发生:成功的那次下载是分享直下(netdisk_dir=None)。
         let dirs = hooks.download_netdisk_dirs.lock().unwrap();
         assert_eq!(dirs.len(), 1);
-        assert_eq!(dirs[0], None, "回退必须走分享直下(临时目录),netdisk_dir=None");
+        assert_eq!(
+            dirs[0], None,
+            "回退必须走分享直下(临时目录),netdisk_dir=None"
+        );
         assert_eq!(hooks.batch_downloads.lock().unwrap().len(), 1);
         let items = pm.list_run_items(&outcome.run_id).unwrap();
         assert!(!items.is_empty());

@@ -435,59 +435,6 @@
                   </el-form-item>
                 </el-card>
 
-                <!-- 分享同步 -->
-                <el-card id="section-sharesync" class="setting-card" shadow="hover">
-                  <template #header>
-                    <div class="card-header">
-                      <el-icon :size="20" color="#67c23a">
-                        <Connection />
-                      </el-icon>
-                      <span>分享同步</span>
-                    </div>
-                  </template>
-
-                  <el-form-item label="排除规则常用词表">
-                    <div class="preset-rules-editor">
-                      <div class="preset-rules-tags">
-                        <el-tag
-                            v-for="(p, i) in formData.share_sync!.exclude_preset_rules"
-                            :key="p + i"
-                            closable
-                            type="info"
-                            style="margin: 2px 4px 2px 0"
-                            @close="removePresetRule(i)"
-                        >{{ p }}</el-tag>
-                        <span
-                            v-if="formData.share_sync!.exclude_preset_rules.length === 0"
-                            class="preset-rules-empty"
-                        >暂无常用规则</span>
-                      </div>
-                      <div class="preset-rules-input-row">
-                        <!-- textarea：回车提交；粘贴多行 → 每行一条（与订阅编辑器一致）。
-                             逗号等标点是合法文件名字符，不作分隔。 -->
-                        <el-input
-                            v-model="presetRuleInput"
-                            type="textarea"
-                            :autosize="{ minRows: 1, maxRows: 4 }"
-                            resize="none"
-                            size="small"
-                            placeholder="输入规则后回车添加；可粘贴多行一次添加（每行一条）"
-                            style="width: 320px"
-                            @keydown.enter="onPresetRuleEnter"
-                        />
-                        <el-button size="small" plain type="primary" @click="addPresetRules">添加</el-button>
-                        <el-button size="small" text type="primary" @click="showPresetRuleHelp = !showPresetRuleHelp">
-                          <el-icon style="margin-right: 2px"><QuestionFilled /></el-icon>使用说明
-                        </el-button>
-                      </div>
-                    </div>
-                    <div class="form-tip">
-                      创建/编辑分享同步订阅时，词表中的规则可一键点选添加，免去重复手输。
-                    </div>
-                    <ExcludeRuleHelp v-if="showPresetRuleHelp" />
-                  </el-form-item>
-                </el-card>
-
                 <!-- 加密设置 -->
                 <el-card id="section-encryption" class="setting-card" shadow="hover">
                   <template #header>
@@ -924,7 +871,7 @@
                     </div>
                     <div class="about-item">
                       <span class="label">版本:</span>
-                      <span class="value">{{ APP_VERSION_LABEL }}</span>
+                      <span class="value">v2.1.1</span>
                     </div>
                     <div class="about-item">
                       <span class="label">后端技术:</span>
@@ -1003,8 +950,6 @@ import { ref, reactive, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { useIsMobile } from '@/utils/responsive'
-import { APP_VERSION_LABEL } from '@/utils/version'
-import { mergeRules, parseRuleInput } from '@/utils/excludeRules'
 import { useConfigStore } from '@/stores/config'
 import type { AppConfig, ProxyType, ProxyRuntimeStatus } from '@/api/config'
 import { getRecommendedConfig, resetToRecommended, getProxyStatus, testProxyConnection } from '@/api/config'
@@ -1014,7 +959,6 @@ import { FilePickerModal } from '@/components/FilePicker'
 import AuthSettingsSection from '@/components/settings/AuthSettingsSection.vue'
 import AccountManagementSection from '@/components/settings/AccountManagementSection.vue'
 import BudgetPanel from '@/views/settings/BudgetPanel.vue'
-import ExcludeRuleHelp from '@/components/ExcludeRuleHelp.vue'
 import {
   Check,
   RefreshLeft,
@@ -1037,7 +981,6 @@ import {
   Document,
   ArrowDown,
   Promotion,
-  QuestionFilled,
 } from '@element-plus/icons-vue'
 import { getTransferConfig, updateTransferConfig } from '@/api/config'
 import {
@@ -1071,32 +1014,6 @@ const formRef = ref<FormInstance>()
 const formData = ref<AppConfig | null>(null)
 const recommended = ref<any>(null)
 const transferBehavior = ref('transfer_only')
-
-// ==================== 分享同步：排除规则常用词表 ====================
-const presetRuleInput = ref('')
-const showPresetRuleHelp = ref(false)
-
-/** 提交输入框内容：按行拆成规则（行内逗号等标点属于规则本身，不切分；与订阅编辑器一致） */
-function addPresetRules() {
-  if (!formData.value?.share_sync) return
-  formData.value.share_sync.exclude_preset_rules = mergeRules(
-      formData.value.share_sync.exclude_preset_rules,
-      parseRuleInput(presetRuleInput.value),
-  )
-  presetRuleInput.value = ''
-}
-
-/** textarea 回车 = 提交而非换行；输入法组词期间的回车（选字）不触发 */
-function onPresetRuleEnter(e: Event) {
-  const ke = e as KeyboardEvent
-  if (ke.isComposing) return
-  ke.preventDefault()
-  addPresetRules()
-}
-
-function removePresetRule(i: number) {
-  formData.value?.share_sync?.exclude_preset_rules.splice(i, 1)
-}
 const showDirPicker = ref(false)
 
 // 锚点导航
@@ -1113,7 +1030,6 @@ const navItems = [
   { id: 'section-upload', label: '上传', color: '#e6a23c' },
   { id: 'section-conflict', label: '冲突策略', color: '#f56c6c' },
   { id: 'section-transfer', label: '转存', color: '#909399' },
-  { id: 'section-sharesync', label: '分享同步', color: '#67c23a' },
   { id: 'section-encryption', label: '加密', color: '#f56c6c' },
   { id: 'section-backup', label: '自动备份', color: '#67c23a' },
   { id: 'section-proxy', label: '网络代理', color: '#9b59b6' },
@@ -1242,11 +1158,6 @@ async function loadConfig() {
         default_upload_strategy: 'smart_dedup' as UploadConflictStrategy,
         default_download_strategy: 'overwrite' as DownloadConflictStrategy
       }
-    }
-
-    // 初始化分享同步配置（老后端不返回该段时兜底为空词表）
-    if (formData.value && !formData.value.share_sync) {
-      formData.value.share_sync = { exclude_preset_rules: [] }
     }
 
     // 初始化代理配置状态
@@ -1739,18 +1650,15 @@ onMounted(() => {
     const targetId = `section-${targetTab}`
     const valid = navItems.some((n) => n.id === targetId)
     if (valid) {
-      // 等待 DOM 完成首次渲染后再滚动。依赖 formData 的 section（v-if=formData）
-      // 要等 loadConfig 异步完成后才挂载，单次 nextTick 大概率扑空 —— 用短间隔
-      // 重试轮询兜底（最多 ~2s），账号等不依赖 formData 的 section 首次即命中。
-      const tryScrollToTarget = (attempt = 0) => {
+      // 等待 DOM 完成首次渲染后再滚动（loadConfig 是 async，但 navItems 中 section 的 DOM
+      // 在表单 v-if=formData 完成后才挂载；用 requestAnimationFrame 链等待 1 帧通常足够，
+      // 复杂场景下用 nextTick 多次等待。账号 section 不依赖 formData，所以可立即滚动）
+      nextTick(() => {
         if (document.getElementById(targetId)) {
           scrollToSection(targetId)
           activeSection.value = targetId
-        } else if (attempt < 20) {
-          setTimeout(() => tryScrollToTarget(attempt + 1), 100)
         }
-      }
-      nextTick(() => tryScrollToTarget())
+      })
     }
   }
 })
@@ -1888,33 +1796,6 @@ onUnmounted(() => {
   font-size: 12px;
   color: #999;
   line-height: 1.5;
-
-  code {
-    padding: 0 4px;
-    background: var(--el-fill-color-light);
-    border-radius: 3px;
-  }
-}
-
-// 分享同步：排除规则常用词表
-.preset-rules-editor {
-  width: 100%;
-}
-
-.preset-rules-tags {
-  min-height: 24px;
-}
-
-.preset-rules-empty {
-  font-size: 12px;
-  color: #999;
-}
-
-.preset-rules-input-row {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-top: 4px;
 }
 
 .value-display {

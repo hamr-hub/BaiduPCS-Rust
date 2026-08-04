@@ -280,6 +280,11 @@ pub struct RunsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ClearRunsQuery {
+    pub days: u32,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RunItemsQuery {
     pub page: Option<usize>,
     pub page_size: Option<usize>,
@@ -310,6 +315,33 @@ pub async fn list_runs(
         .list_runs(&id, page, ps)
         .map_err(map_share_err)?;
     Ok(Json(ApiResponse::success(list)))
+}
+
+/// DELETE /api/v1/share-sync/subscriptions/:id/runs?days=N
+///
+/// v2: 不再只清 `share_sync_runs` / `share_sync_run_items` 两张表 —— 同步清理
+/// `TransferManager` / `FolderDownloadManager` 内存里归属于该订阅的子任务,
+/// 否则这些「任务下载情况」会变成孤儿显示在 UI 上直到后端重启。
+pub async fn clear_runs_before_days(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ClearRunsQuery>,
+) -> ApiResult<Json<ApiResponse<serde_json::Value>>> {
+    let days = q.days.clamp(1, 3650);
+    let m = get_manager(&state).await?;
+    require_subscription(&m, &id)?;
+    let stats = m
+        .clear_runs_and_orphans(&id, days as u32)
+        .await
+        .map_err(map_share_err)?;
+    // 保持前端期望的 `{deleted, days}` 字段(向后兼容), 同时返回更细的统计
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "deleted": stats.db_deleted,
+        "days": stats.days,
+        "transfer_mem": stats.transfer_mem,
+        "transfer_hist": stats.transfer_hist,
+        "folder_count": stats.folder_count,
+    }))))
 }
 
 /// GET /api/v1/share-sync/runs/:id

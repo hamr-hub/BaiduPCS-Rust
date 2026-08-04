@@ -296,22 +296,27 @@ pub enum FolderEvent {
         owner_uid: Option<u64>,
     },
     /// 文件夹失败
-    Failed { folder_id: String, error: String,
+    Failed {
+        folder_id: String,
+        error: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_uid: Option<u64>,
     },
     /// 文件夹暂停
-    Paused { folder_id: String,
+    Paused {
+        folder_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_uid: Option<u64>,
     },
     /// 文件夹恢复
-    Resumed { folder_id: String,
+    Resumed {
+        folder_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_uid: Option<u64>,
     },
     /// 文件夹删除
-    Deleted { folder_id: String,
+    Deleted {
+        folder_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_uid: Option<u64>,
     },
@@ -595,7 +600,9 @@ pub enum TransferEvent {
         owner_uid: Option<u64>,
     },
     /// 任务完成
-    Completed { task_id: String, completed_at: i64,
+    Completed {
+        task_id: String,
+        completed_at: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_uid: Option<u64>,
     },
@@ -608,7 +615,8 @@ pub enum TransferEvent {
         owner_uid: Option<u64>,
     },
     /// 任务删除
-    Deleted { task_id: String,
+    Deleted {
+        task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_uid: Option<u64>,
     },
@@ -1175,12 +1183,15 @@ impl TaskEvent {
             }
             TaskEvent::Scan(ScanEvent::Started { .. }) => true,
             TaskEvent::Scan(ScanEvent::Progress { .. }) => true,
-            // 抓取阶段进度：run 正在跑但还没进入执行段，属于活跃事件，必须高频推送，
-            // 否则前端在最长的那段（递归列目录）反而收不到更新。
-            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ScanProgress { .. }) => true,
-            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::DiffDetected { .. }) => true,
-            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemScheduled { .. }) => true,
-            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemProgress { .. }) => true,
+            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::DiffDetected {
+                ..
+            }) => true,
+            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemScheduled {
+                ..
+            }) => true,
+            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemProgress {
+                ..
+            }) => true,
             _ => false,
         }
     }
@@ -1241,9 +1252,7 @@ pub enum AccountEvent {
     /// 活跃账号已切换。
     ///
     /// `new_active_uid = None` 表示删除最后一个账号、进入未登录状态。
-    Switched {
-        new_active_uid: Option<u64>,
-    },
+    Switched { new_active_uid: Option<u64> },
     /// 账号列表已变更（新增 / 删除 / 元数据更新）。
     ListChanged {
         accounts: Vec<crate::auth::AccountSummary>,

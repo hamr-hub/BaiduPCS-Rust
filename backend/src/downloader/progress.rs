@@ -1,23 +1,19 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// 速度分母下限（秒）。
-///
-/// 刚开始下载的头一小段时间里「已运行时长」还很小，若直接拿它当分母，
-/// 一个分片落盘就会算出天文数字。取下限后起步阶段宁可低估也不虚高。
-const MIN_SPEED_DENOM_SECS: f64 = 1.0;
+const DEFAULT_WINDOW_SECONDS: u64 = 10;
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+const MIN_MEASUREMENT_DURATION: Duration = Duration::from_secs(1);
 
-/// 速度计算器（使用滑动窗口）
+/// 速度计算器（使用累计字节快照滑动窗口）
 #[derive(Debug)]
 pub struct SpeedCalculator {
-    /// 数据点（时间，字节数）
+    /// 数据点（单调时间，累计字节数）
     samples: VecDeque<(Instant, u64)>,
-    /// 窗口大小（秒）
+    /// 统计窗口大小
     window_size: Duration,
     /// 累计下载字节数
     total_bytes: u64,
-    /// 第一个样本的时刻，用于起步阶段的分母（见 [`SpeedCalculator::speed`]）
-    started_at: Option<Instant>,
 }
 
 impl SpeedCalculator {
@@ -25,80 +21,79 @@ impl SpeedCalculator {
     pub fn new(window_seconds: u64) -> Self {
         Self {
             samples: VecDeque::new(),
-            window_size: Duration::from_secs(window_seconds),
+            window_size: Duration::from_secs(window_seconds.max(1)),
             total_bytes: 0,
-            started_at: None,
         }
     }
 
-    /// 使用默认窗口大小（5秒）
+    /// 使用默认窗口大小（10秒）
     pub fn with_default_window() -> Self {
-        Self::new(5)
+        Self::new(DEFAULT_WINDOW_SECONDS)
     }
 
-    /// 添加数据点
+    /// 累加收到的字节，并按最多每 500ms 一个快照进行采样。
     pub fn add_sample(&mut self, bytes: u64) {
-        let now = Instant::now();
-        self.started_at.get_or_insert(now);
-        self.total_bytes += bytes;
-        self.samples.push_back((now, bytes));
+        self.add_sample_at(bytes, Instant::now());
+    }
+
+    /// 记录一个定时快照并返回当前速度。
+    ///
+    /// 即使没有新字节，也要定期调用此方法，让窗口中的空闲时间参与平均速度计算。
+    pub fn refresh(&mut self) -> u64 {
+        self.refresh_at(Instant::now())
+    }
+
+    fn add_sample_at(&mut self, bytes: u64, now: Instant) {
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.record_snapshot(now);
+    }
+
+    fn refresh_at(&mut self, now: Instant) -> u64 {
+        self.record_snapshot(now);
+        self.speed()
+    }
+
+    fn record_snapshot(&mut self, now: Instant) {
+        let should_record = self
+            .samples
+            .back()
+            .map(|(timestamp, _)| now.duration_since(*timestamp) >= SAMPLE_INTERVAL)
+            .unwrap_or(true);
+
+        if should_record {
+            self.samples.push_back((now, self.total_bytes));
+        }
         self.cleanup_old_samples(now);
     }
 
-    /// 清理超出窗口的旧数据
+    /// 清理超出窗口的旧快照，同时保留一个窗口边界前的基准点。
     fn cleanup_old_samples(&mut self, now: Instant) {
-        while let Some((timestamp, _)) = self.samples.front() {
-            if now.duration_since(*timestamp) > self.window_size {
-                self.samples.pop_front();
-            } else {
-                break;
-            }
+        while self.samples.len() > 1
+            && now.duration_since(self.samples[1].0) > self.window_size
+        {
+            self.samples.pop_front();
         }
     }
 
     /// 计算当前速度（字节/秒）
-    ///
-    /// 分母取**固定的窗口长度**（起步阶段取"已运行时长"），而不是"最早样本到现在"。
-    ///
-    /// 原实现是 `窗口内字节数 / (now - 最早样本时间)`，样本稀疏时分母会塌缩：
-    /// 下载是按分片落盘的，`progress_callback` 并非匀速调用 —— 实测出现过
-    /// 「连续 5 秒 downloaded 不动，然后一次跳 256KB」，那一刻窗口里只剩一两个
-    /// 间隔几十毫秒的样本，算出 `256KB / 0.05s ≈ 5.2 MB/s`，而真实速率只有
-    /// 约 65 KB/s。加上 `samples.len() < 2` 直接返回 0 的分支，界面上就表现为
-    /// 速度在 0 / 285KB/s / 5.2MB/s 之间乱跳。
-    ///
-    /// 改为固定分母后，「窗口内传了多少字节」除以「窗口有多长」，正是该窗口的
-    /// 平均速率，不会被单个分片的落盘瞬间放大。
     pub fn speed(&self) -> u64 {
-        let Some(started) = self.started_at else {
+        let (Some((first_time, first_bytes)), Some((last_time, last_bytes))) =
+            (self.samples.front(), self.samples.back())
+        else {
             return 0;
         };
-        let now = Instant::now();
 
-        // 只统计**仍在窗口内**的样本。
-        //
-        // 不能直接 sum 全部：`cleanup_old_samples` 只在 `add_sample` 里调用，
-        // 下载停下来之后没有新样本进来，过期样本永远不会被淘汰 —— 速度就会
-        // 一直停在最后那个值不动（实测见过卡在 5.33 MB/s 好几秒）。
-        let total_bytes: u64 = self
-            .samples
-            .iter()
-            .filter(|(ts, _)| now.duration_since(*ts) <= self.window_size)
-            .map(|(_, bytes)| bytes)
-            .sum();
-        if total_bytes == 0 {
-            // 窗口内一个字节都没有 = 确实停了
+        let duration = last_time.duration_since(*first_time);
+        if duration < MIN_MEASUREMENT_DURATION {
             return 0;
         }
 
-        // 起步阶段（运行时长还不足一个窗口）用已运行时长，否则用窗口长度。
-        // 再兜一个下限，避免最开始几十毫秒内把一个分片算成天文数字。
-        let elapsed = now.duration_since(started).as_secs_f64();
-        let denom = elapsed
-            .min(self.window_size.as_secs_f64())
-            .max(MIN_SPEED_DENOM_SECS);
+        let bytes = last_bytes.saturating_sub(*first_bytes);
+        if bytes == 0 {
+            return 0;
+        }
 
-        (total_bytes as f64 / denom) as u64
+        (bytes as f64 / duration.as_secs_f64()) as u64
     }
 
     /// 获取累计下载字节数
@@ -116,9 +111,6 @@ impl SpeedCalculator {
     pub fn reset(&mut self) {
         self.samples.clear();
         self.total_bytes = 0;
-        // 必须一并清掉：否则复用这个计算器时「已运行时长」还是上一轮的，
-        // 起步阶段会直接用满窗口做分母，把刚开始的一点点字节算成很低的速度。
-        self.started_at = None;
     }
 }
 
@@ -161,7 +153,6 @@ pub fn format_eta(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
 
     #[test]
     fn test_speed_calculator_creation() {
@@ -181,61 +172,56 @@ mod tests {
         assert_eq!(calc.total_bytes(), 3072);
     }
 
-    /// 短时间内落盘一大块**不能**被算成天文速度。
-    ///
-    /// 这是实测踩到的坑：下载按分片落盘，`progress_callback` 并非匀速调用 ——
-    /// 出现过「连续 5 秒 downloaded 不动，然后一次跳 256KB」，旧实现用
-    /// 「最早样本到现在」当分母，算出 `256KB / 0.05s ≈ 5.2 MB/s`，
-    /// 而真实速率只有约 65 KB/s。
-    ///
-    /// 注：本测试的前身断言的恰恰是旧行为（2MB/0.1s 要 >10MB/s），
-    /// 那是把瞬时写盘爆发当成了下载速率。
     #[test]
-    fn test_burst_write_is_not_reported_as_huge_speed() {
+    fn test_speed_calculation() {
         let mut calc = SpeedCalculator::new(5);
+        let start = Instant::now();
 
-        calc.add_sample(1024 * 1024); // 1MB
-        thread::sleep(Duration::from_millis(100));
-        calc.add_sample(1024 * 1024); // 1MB
+        calc.refresh_at(start);
+        calc.add_sample_at(1024 * 1024, start + Duration::from_millis(500));
+        calc.add_sample_at(1024 * 1024, start + Duration::from_secs(1));
 
-        let speed = calc.speed();
-        // 分母有 1 秒下限：2MB / 1s = 2MB/s，绝不该是 20MB/s
-        assert!(
-            speed <= 2 * 1024 * 1024,
-            "0.1 秒内落盘 2MB 不应被算成 {} B/s（分母塌缩）",
-            speed
-        );
-        assert!(speed > 0, "有字节进来就该有速度");
+        assert_eq!(calc.speed(), 2 * 1024 * 1024);
     }
 
-    /// 窗口内的平均速率：分母是窗口长度，不随样本疏密漂移。
     #[test]
-    fn test_speed_uses_window_as_denominator() {
-        // 窗口 1 秒，方便测试
-        let mut calc = SpeedCalculator::new(1);
-        calc.add_sample(100_000);
-        // 跑满一个窗口后，分母应为窗口长度而非「到现在的时长」
-        thread::sleep(Duration::from_millis(1100));
-        calc.add_sample(100_000);
+    fn test_speed_requires_warmup() {
+        let mut calc = SpeedCalculator::new(10);
+        let start = Instant::now();
 
-        let speed = calc.speed();
-        // 第一个样本已被窗口淘汰，窗口内只剩 100_000 字节；
-        // 分母取 max(窗口 1s, 下限 1s) = 1s → 约 100 KB/s
-        assert!(
-            (50_000..=150_000).contains(&speed),
-            "窗口平均速率应在 100KB/s 量级，实际 {}",
-            speed
-        );
-    }
+        calc.refresh_at(start);
+        calc.add_sample_at(1024 * 1024, start + Duration::from_millis(500));
 
-    /// 窗口内没有任何字节 = 确实停了，速度为 0（而不是沿用旧值）。
-    #[test]
-    fn test_speed_zero_when_window_empty() {
-        let mut calc = SpeedCalculator::new(1);
-        calc.add_sample(500_000);
-        thread::sleep(Duration::from_millis(1200));
-        // 不再有新样本，窗口内已被清空
         assert_eq!(calc.speed(), 0);
+    }
+
+    #[test]
+    fn test_idle_time_reduces_speed_to_zero() {
+        let mut calc = SpeedCalculator::new(10);
+        let start = Instant::now();
+
+        calc.refresh_at(start);
+        for second in 1..=10 {
+            calc.add_sample_at(1024 * 1024, start + Duration::from_secs(second));
+        }
+        assert_eq!(calc.speed(), 1024 * 1024);
+
+        for second in 11..=21 {
+            calc.refresh_at(start + Duration::from_secs(second));
+        }
+        assert_eq!(calc.speed(), 0);
+    }
+
+    #[test]
+    fn test_snapshot_count_is_bounded() {
+        let mut calc = SpeedCalculator::new(10);
+        let start = Instant::now();
+
+        for step in 0..=120 {
+            calc.add_sample_at(1024, start + Duration::from_millis(step * 500));
+        }
+
+        assert!(calc.samples.len() <= 22);
     }
 
     #[test]

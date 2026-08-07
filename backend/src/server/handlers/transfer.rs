@@ -285,8 +285,20 @@ pub async fn get_all_transfers(
         None => {
             // 全局共享历史库会被每个账号的 get_all_tasks 各捞一遍，跨账号聚合时
             // 按 id 去重，避免同一历史任务因账号数 N 而重复出现 N 次。
+            //
+            // 去重是「先到先得」，所以**必须先收内存里的活跃任务**：历史库里同一条
+            // 任务会被非归属账号的 manager 用 convert_history_to_task 重建，那份副本的
+            // transferred_count 是按「全部成功」伪造的。若让它先进 seen，部分成功的
+            // 任务会被显示成「7/7 全部成功」，把真实进度盖掉。
             let mut all = Vec::new();
             let mut seen = std::collections::HashSet::new();
+            for (_uid, tm) in app_state.list_transfer_managers() {
+                for t in tm.get_live_tasks().await {
+                    if seen.insert(t.id.clone()) {
+                        all.push(t);
+                    }
+                }
+            }
             for (_uid, tm) in app_state.list_transfer_managers() {
                 for t in tm.get_all_tasks().await {
                     if seen.insert(t.id.clone()) {

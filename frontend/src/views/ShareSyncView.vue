@@ -152,8 +152,12 @@
             <div class="active-task-card">
               <div class="task-progress-header is-toggle" @click.stop="toggleSubtasks(s.id)">
                 <div class="task-status-info">
-                  <el-icon :size="16" class="status-icon text-blue-500"><Loading class="is-loading" /></el-icon>
-                  <span class="task-status-text">进行中子任务（{{ subtasksOf(s.id).length }}）</span>
+                  <!-- 全在排队时不转圈：转圈意味着"在动"，而这时一个字节都没动 -->
+                  <el-icon v-if="isWaitingForSlot(s.id)" :size="16" class="status-icon text-gray-400"><Clock /></el-icon>
+                  <el-icon v-else :size="16" class="status-icon text-blue-500"><Loading class="is-loading" /></el-icon>
+                  <span class="task-status-text">
+                    {{ isWaitingForSlot(s.id) ? '等待中' : '进行中子任务' }}（{{ subtasksOf(s.id).length }}）
+                  </span>
                 </div>
                 <el-icon :size="14" class="toggle-icon">
                   <ArrowDown v-if="subtasksExpanded(s.id)" />
@@ -529,6 +533,34 @@ const activeSubtasks = ref<Map<string, ShareSyncSubtask[]>>(new Map())
 
 function subtasksOf(id: string): ShareSyncSubtask[] {
   return activeSubtasks.value.get(id) ?? []
+}
+
+/**
+ * 转存段真正在干活的状态。
+ *
+ * 注意不含 `downloading`：转存任务在下载阶段会被标成 `TransferStatus::Downloading`，
+ * 那只是它对自己下载子任务的镜像，不代表转存段还在做事。若把它当成「在干活」，
+ * 下面的 `isWaitingForSlot` 会永远返回 false（列表里始终有这条转存任务）。
+ */
+const TRANSFER_ACTIVE = new Set(['checkingshare', 'transferring', 'cleaning'])
+
+/**
+ * 该订阅的下载子任务是不是全都还在排队（没有一个真的在跑）。
+ *
+ * 下载槽位数 = max_concurrent_tasks（非会员 1 / VIP 3 / SVIP 5）。同时触发多个
+ * 订阅时，抢不到槽位的那些子任务停在 `pending`，此时卡片仍写「进行中子任务」会
+ * 让用户以为在下载、实际一个字节没动。槽位多的时候本来就能几个订阅一起跑，
+ * 这个状态自然不会出现。
+ *
+ * 只看 `kind === 'download'`：子任务列表里还混着转存段那条任务，拿它一起判会
+ * 误判（见 `TRANSFER_ACTIVE`）。转存段确实在干活时也不算「等待中」——那时是真
+ * 有进展，只是进展不在下载段。
+ */
+function isWaitingForSlot(id: string): boolean {
+  const list = subtasksOf(id).filter(st => !SUBTASK_TERMINAL.has(st.status))
+  if (list.some(st => st.kind === 'transfer' && TRANSFER_ACTIVE.has(st.status))) return false
+  const downloads = list.filter(st => st.kind === 'download')
+  return downloads.length > 0 && downloads.every(st => st.status === 'pending')
 }
 
 // ==================== 抓取阶段进度 ====================

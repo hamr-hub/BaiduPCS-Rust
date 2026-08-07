@@ -136,6 +136,9 @@ impl ShareSyncPersistence {
                 subscription_id TEXT NOT NULL,
                 captured_at INTEGER NOT NULL,
                 item_count INTEGER NOT NULL,
+                -- NULL = 基线快照（diff 依据）；非 NULL = 该轮 run 的候选快照（尚未生效）。
+                -- 见下方 ALTER 迁移处的说明。
+                run_id TEXT,
                 FOREIGN KEY (subscription_id) REFERENCES share_subscriptions(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_share_snapshots_sub_time
@@ -232,6 +235,13 @@ impl ShareSyncPersistence {
             "ALTER TABLE share_sync_runs ADD COLUMN phase TEXT",
             // 多账号隔离：老库（含早期把 share_subscriptions 建在独立库的版本）补 owner_uid 列
             "ALTER TABLE share_subscriptions ADD COLUMN owner_uid INTEGER NOT NULL DEFAULT 0",
+            // 快照归属：区分「基线快照」与「某轮 run 的候选快照」。
+            //   run_id IS NULL  → 基线快照，diff 的依据（`latest_snapshot`）
+            //   run_id = <run>  → 候选快照，该轮抓取所得，**尚未生效**
+            // 抓取阶段就落候选，run 干净成功时才 `promote_snapshot` 提升为基线。
+            // 这样进程重启后仍能拿回那一轮的快照，从而给中断的 run 收尾（续跑）。
+            // 迁移安全性：已有行 run_id 为 NULL，全部视为基线，与旧语义完全一致。
+            "ALTER TABLE share_snapshots ADD COLUMN run_id TEXT",
         ] {
             if let Err(e) = conn.execute(ddl, []) {
                 let msg = e.to_string();
@@ -245,6 +255,13 @@ impl ShareSyncPersistence {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_share_subs_owner
              ON share_subscriptions(owner_uid)",
+            [],
+        )?;
+        // 同理：run_id 索引也必须在 ALTER 之后建（老库的 share_snapshots 没有该列）。
+        // 用于重启时按 run 取回候选快照。
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_snapshots_run
+             ON share_snapshots(run_id)",
             [],
         )?;
         Ok(())
@@ -361,19 +378,41 @@ impl ShareSyncPersistence {
     // Snapshots
     // ===================================================
 
-    /// 保存一次完整快照
+    /// 保存一次完整快照，作为**基线**（`run_id = NULL`，立即对 diff 生效）。
     pub fn save_snapshot(&self, snap: &ShareSnapshot) -> Result<(), ShareSyncError> {
+        self.save_snapshot_inner(snap, None)
+    }
+
+    /// 保存一次完整快照，作为某轮 run 的**候选**（`run_id = Some`，尚不对 diff 生效）。
+    ///
+    /// 抓取阶段就落库，目的是让进程重启后仍能拿回这一轮的快照，从而给被中断的 run
+    /// 收尾（见 [`Self::snapshot_for_run`] / [`Self::promote_snapshot`]）。
+    /// 在被提升之前，[`Self::latest_snapshot`] 不会看到它。
+    pub fn save_candidate_snapshot(
+        &self,
+        snap: &ShareSnapshot,
+        run_id: &str,
+    ) -> Result<(), ShareSyncError> {
+        self.save_snapshot_inner(snap, Some(run_id))
+    }
+
+    fn save_snapshot_inner(
+        &self,
+        snap: &ShareSnapshot,
+        run_id: Option<&str>,
+    ) -> Result<(), ShareSyncError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO share_snapshots
-             (id, subscription_id, captured_at, item_count)
-             VALUES (?1, ?2, ?3, ?4)",
+             (id, subscription_id, captured_at, item_count, run_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 snap.id,
                 snap.subscription_id,
                 snap.captured_at.timestamp(),
-                snap.items.len() as i64
+                snap.items.len() as i64,
+                run_id
             ],
         )?;
         // 简化：每次保存前先清空该 snapshot 的 items（防止 ON CONFLICT 触发 unique 冲突）
@@ -402,30 +441,41 @@ impl ShareSyncPersistence {
         Ok(())
     }
 
-    /// 获取某订阅最近的快照
-    pub fn latest_snapshot(
-        &self,
-        subscription_id: &str,
-    ) -> Result<Option<ShareSnapshot>, ShareSyncError> {
+    /// 取回某轮 run 的候选快照（重启续跑时用来给中断的 run 收尾）。
+    pub fn snapshot_for_run(&self, run_id: &str) -> Result<Option<ShareSnapshot>, ShareSyncError> {
         let conn = self.conn.lock().unwrap();
-        let row: Option<(String, i64)> = conn
+        let row: Option<(String, String, i64)> = conn
             .query_row(
-                "SELECT id, captured_at FROM share_snapshots
-                 WHERE subscription_id = ?1
-                 ORDER BY captured_at DESC LIMIT 1",
-                params![subscription_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT id, subscription_id, captured_at FROM share_snapshots
+                 WHERE run_id = ?1 LIMIT 1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((id, captured_at)) = row else {
+        let Some((id, subscription_id, captured_at)) = row else {
             return Ok(None);
         };
+        let items = Self::load_snapshot_items(&conn, &id)?;
+        Ok(Some(ShareSnapshot {
+            id,
+            subscription_id,
+            captured_at: chrono::DateTime::from_timestamp(captured_at, 0)
+                .unwrap_or_else(chrono::Utc::now),
+            items,
+        }))
+    }
+
+    /// 读取某个快照的全部条目（`latest_snapshot` / `snapshot_for_run` 共用）。
+    fn load_snapshot_items(
+        conn: &rusqlite::Connection,
+        snapshot_id: &str,
+    ) -> Result<Vec<ShareSnapshotItem>, ShareSyncError> {
         let mut stmt = conn.prepare(
             "SELECT path, fs_id, size, is_dir, name
              FROM share_snapshot_items WHERE snapshot_id = ?1",
         )?;
         let items = stmt
-            .query_map(params![id], |row| {
+            .query_map(params![snapshot_id], |row| {
                 let path: String = row.get(0)?;
                 let fs_id: i64 = row.get(1)?;
                 let size: i64 = row.get(2)?;
@@ -444,6 +494,79 @@ impl ShareSyncPersistence {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        Ok(items)
+    }
+
+    /// 把某轮 run 的候选快照提升为基线（单事务：删旧基线 + 清 run_id）。
+    ///
+    /// **只有 run 干净成功时才允许调用**（判据见 manager 侧的
+    /// `should_advance_snapshot_baseline` + 无资源类跳过）。提早提升会让尚未真正
+    /// 落地的文件被当作"已同步"，下一次 diff 不再包含它们 —— 永久漏同步。
+    ///
+    /// 返回 `true` 表示确实提升了某个候选；`false` 表示该 run 没有候选快照。
+    pub fn promote_snapshot(&self, run_id: &str) -> Result<bool, ShareSyncError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let target: Option<(String, String)> = tx
+            .query_row(
+                "SELECT id, subscription_id FROM share_snapshots WHERE run_id = ?1 LIMIT 1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((snap_id, sub_id)) = target else {
+            return Ok(false);
+        };
+
+        // 先删该订阅的旧基线（含其 items，靠 ON DELETE CASCADE），再把候选转正。
+        // 必须同事务：中途失败会留下「无基线」或「双基线」两种坏状态。
+        tx.execute(
+            "DELETE FROM share_snapshots WHERE subscription_id = ?1 AND run_id IS NULL",
+            params![sub_id],
+        )?;
+        tx.execute(
+            "UPDATE share_snapshots SET run_id = NULL WHERE id = ?1",
+            params![snap_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 删除某轮 run 的候选快照（放弃续跑 / run 未干净成功时清理，防止候选累积）。
+    pub fn delete_snapshot_for_run(&self, run_id: &str) -> Result<usize, ShareSyncError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM share_snapshots WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        Ok(n)
+    }
+
+    /// 获取某订阅最近的**基线**快照（diff 的依据）。
+    ///
+    /// `run_id IS NULL` 这个过滤是关键：抓取阶段落库的**候选快照**（`run_id` 非空）
+    /// 尚未生效，绝不能被当成基线 —— 否则本轮还没真正落地的文件就会被当作"已同步"，
+    /// 下一次 diff 不再包含它们，造成**永久漏同步**。
+    /// 候选只有在 run 干净成功时才由 [`Self::promote_snapshot`] 提升为基线。
+    pub fn latest_snapshot(
+        &self,
+        subscription_id: &str,
+    ) -> Result<Option<ShareSnapshot>, ShareSyncError> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT id, captured_at FROM share_snapshots
+                 WHERE subscription_id = ?1 AND run_id IS NULL
+                 ORDER BY captured_at DESC LIMIT 1",
+                params![subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((id, captured_at)) = row else {
+            return Ok(None);
+        };
+        let items = Self::load_snapshot_items(&conn, &id)?;
         Ok(Some(ShareSnapshot {
             id,
             subscription_id: subscription_id.to_string(),
@@ -484,6 +607,28 @@ impl ShareSyncPersistence {
     /// 更新 run 的当前阶段（`scanning` / `diffing` / `executing`）。
     ///
     /// 阶段只是给用户看的展示信息，写失败不应中断同步 —— 调用方忽略返回值即可。
+    /// 把一条被中断的 run 重新标记为 `running`（重启续跑接管时调用）。
+    ///
+    /// 必须有这一步：`mark_running_runs_interrupted()` 只收编 `status = 'running'`
+    /// 的 run。续跑接管后若把状态留在 `interrupted`，进程再被杀一次，下次启动就
+    /// **找不到这条 run**——不收编、不续跑，那批活儿直接变孤儿。
+    ///
+    /// 只对 `interrupted` 生效，避免误改终态 run。
+    pub fn mark_run_running(&self, run_id: &str) -> Result<(), ShareSyncError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE share_sync_runs
+             SET status = ?1, finished_at = NULL, error = NULL
+             WHERE id = ?2 AND status = ?3",
+            params![
+                RunStatus::Running.as_str(),
+                run_id,
+                RunStatus::Interrupted.as_str()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn update_run_phase(&self, run_id: &str, phase: &str) -> Result<(), ShareSyncError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1126,6 +1271,199 @@ mod tests {
         assert_eq!(latest.items[0].path, "/a.txt");
     }
 
+    /// 候选快照（run_id 非空）在被提升之前**绝不能**被 `latest_snapshot` 看到。
+    ///
+    /// 这是整个续跑机制的安全底线：候选代表"本轮抓到了什么"，但那批文件还没真正
+    /// 落地。若它被当成基线，下一次 diff 就不再包含这些文件 —— 永久漏同步。
+    #[test]
+    fn test_candidate_snapshot_is_not_visible_as_baseline() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+
+        // 已有一份基线
+        let baseline = ShareSnapshot::with_items(
+            &s.id,
+            vec![ShareSnapshotItem::new("/old.txt", "old.txt", 1, 100, false)],
+        );
+        mgr.save_snapshot(&baseline).unwrap();
+
+        // 本轮抓取落候选
+        let candidate = ShareSnapshot::with_items(
+            &s.id,
+            vec![
+                ShareSnapshotItem::new("/old.txt", "old.txt", 1, 100, false),
+                ShareSnapshotItem::new("/new.txt", "new.txt", 2, 200, false),
+            ],
+        );
+        mgr.save_candidate_snapshot(&candidate, "run-1").unwrap();
+
+        // 基线必须还是旧的那份
+        let latest = mgr.latest_snapshot(&s.id).unwrap().unwrap();
+        assert_eq!(latest.id, baseline.id, "候选不得顶替基线");
+        assert_eq!(latest.items.len(), 1);
+
+        // 但按 run 能取回候选（重启续跑靠它）
+        let got = mgr.snapshot_for_run("run-1").unwrap().unwrap();
+        assert_eq!(got.id, candidate.id);
+        assert_eq!(got.items.len(), 2);
+        assert_eq!(got.subscription_id, s.id);
+    }
+
+    /// 提升候选：旧基线被替换，候选转正，且只保留一份基线。
+    #[test]
+    fn test_promote_snapshot_replaces_baseline() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+
+        let baseline = ShareSnapshot::with_items(
+            &s.id,
+            vec![ShareSnapshotItem::new("/old.txt", "old.txt", 1, 100, false)],
+        );
+        mgr.save_snapshot(&baseline).unwrap();
+        let candidate = ShareSnapshot::with_items(
+            &s.id,
+            vec![ShareSnapshotItem::new("/new.txt", "new.txt", 2, 200, false)],
+        );
+        mgr.save_candidate_snapshot(&candidate, "run-1").unwrap();
+
+        assert!(mgr.promote_snapshot("run-1").unwrap(), "应提升成功");
+
+        let latest = mgr.latest_snapshot(&s.id).unwrap().unwrap();
+        assert_eq!(latest.id, candidate.id, "候选应已转正");
+        assert_eq!(latest.items[0].path, "/new.txt");
+        // 转正后不再是任何 run 的候选
+        assert!(mgr.snapshot_for_run("run-1").unwrap().is_none());
+        // 没有候选时提升是 no-op，不报错
+        assert!(!mgr.promote_snapshot("run-nonexistent").unwrap());
+    }
+
+    /// 续跑接管后必须把 run 标回 `running`，否则**再中断一次就找不回来了**。
+    ///
+    /// 实测踩到过：第一次重启接管成功，接管跑到一半又被杀；第二次重启时
+    /// `mark_running_runs_interrupted()` 只认 `running`，而这条 run 还停在
+    /// `interrupted` —— 一条续跑日志都没有，那批下载彻底变成孤儿。
+    #[test]
+    fn test_resumed_run_can_be_interrupted_again() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        mgr.start_run("run-1", &s.id, now).unwrap();
+
+        // 第一次重启：收编
+        let first = mgr.mark_running_runs_interrupted().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(mgr.get_run("run-1").unwrap().unwrap().status, "interrupted");
+
+        // 续跑接管 → 标回 running
+        mgr.mark_run_running("run-1").unwrap();
+        assert_eq!(mgr.get_run("run-1").unwrap().unwrap().status, "running");
+
+        // 第二次重启：仍能收编（这条不过就意味着孤儿）
+        let second = mgr.mark_running_runs_interrupted().unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "接管过的 run 再中断一次必须还能被收编，否则永远续不回来"
+        );
+    }
+
+    /// `mark_run_running` 只对 `interrupted` 生效，不得复活终态 run。
+    #[test]
+    fn test_mark_run_running_does_not_revive_finished_runs() {
+        use crate::share_sync::types::DiffSummary;
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        for (id, st) in [
+            ("run-done", RunStatus::Completed),
+            ("run-failed", RunStatus::Failed),
+        ] {
+            mgr.start_run(id, &s.id, now).unwrap();
+            mgr.finish_run(id, now, st, &DiffSummary::default(), None)
+                .unwrap();
+            mgr.mark_run_running(id).unwrap();
+            assert_eq!(
+                mgr.get_run(id).unwrap().unwrap().status,
+                st.as_str(),
+                "终态 run 不该被 mark_run_running 复活"
+            );
+        }
+    }
+
+    /// 候选快照的生命周期：run 未干净成功时**不得**留下候选，也不得动基线。
+    ///
+    /// 对应 manager 侧两条清理路径（`fail_run`、收尾的 else 分支）。漏掉任一条，
+    /// 候选会在库里无限累积；而误走成提升，则会把没落地的文件写进基线 → 永久漏同步。
+    #[test]
+    fn test_candidate_lifecycle_on_unsuccessful_run() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+
+        let baseline = ShareSnapshot::with_items(
+            &s.id,
+            vec![ShareSnapshotItem::new("/old.txt", "old.txt", 1, 100, false)],
+        );
+        mgr.save_snapshot(&baseline).unwrap();
+
+        // 连着三轮都没干净成功，每轮都落了候选、又都被清理
+        for run in ["run-1", "run-2", "run-3"] {
+            let candidate = ShareSnapshot::with_items(
+                &s.id,
+                vec![ShareSnapshotItem::new("/new.txt", "new.txt", 2, 200, false)],
+            );
+            mgr.save_candidate_snapshot(&candidate, run).unwrap();
+            // 未成功 → 删候选（不提升）
+            mgr.delete_snapshot_for_run(run).unwrap();
+        }
+
+        // 基线始终是最早那份，没有被任何候选顶替
+        let latest = mgr.latest_snapshot(&s.id).unwrap().unwrap();
+        assert_eq!(latest.id, baseline.id);
+        assert_eq!(latest.items[0].path, "/old.txt");
+
+        // 库里只剩基线这一份快照，候选没有累积
+        let total: i64 = {
+            let conn = mgr.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM share_snapshots WHERE subscription_id = ?1",
+                params![s.id],
+                |r| r.get(0),
+            )
+                .unwrap()
+        };
+        assert_eq!(total, 1, "候选未被清理会在库里累积");
+    }
+
+    /// 放弃续跑时删候选：基线不受影响，候选不再累积。
+    #[test]
+    fn test_delete_candidate_snapshot_keeps_baseline() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+
+        let baseline = ShareSnapshot::with_items(
+            &s.id,
+            vec![ShareSnapshotItem::new("/old.txt", "old.txt", 1, 100, false)],
+        );
+        mgr.save_snapshot(&baseline).unwrap();
+        let candidate = ShareSnapshot::with_items(&s.id, vec![]);
+        mgr.save_candidate_snapshot(&candidate, "run-1").unwrap();
+
+        assert_eq!(mgr.delete_snapshot_for_run("run-1").unwrap(), 1);
+        assert!(mgr.snapshot_for_run("run-1").unwrap().is_none());
+        assert_eq!(
+            mgr.latest_snapshot(&s.id).unwrap().unwrap().id,
+            baseline.id,
+            "删候选不得动基线"
+        );
+    }
+
     #[test]
     fn test_cascade_delete_subscription_removes_snapshots_runs() {
         let (_dir, mgr) = fresh();
@@ -1571,5 +1909,45 @@ mod tests {
         let items = mgr.list_run_items("r1").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, "completed");
+    }
+
+    /// 老库（`share_snapshots` 没有 `run_id` 列）升级后，**已有快照必须继续被当成基线**。
+    ///
+    /// 这是迁移的安全底线：若迁移后 `latest_snapshot` 读不到老快照，diff 会认为
+    /// "从未同步过"，导致整个分享**全量重同步**。
+    #[test]
+    fn test_legacy_db_snapshots_remain_baseline_after_migration() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("legacy_snap.db");
+        {
+            let conn = Connection::open(&p).unwrap();
+            // 老结构：share_snapshots 无 run_id 列
+            conn.execute_batch(
+                "CREATE TABLE share_subscriptions (id TEXT PRIMARY KEY, name TEXT, share_url TEXT, password TEXT, config_json TEXT, enabled INTEGER, created_at INTEGER, updated_at INTEGER);
+                 CREATE TABLE share_snapshots (id TEXT PRIMARY KEY, subscription_id TEXT, captured_at INTEGER, item_count INTEGER);
+                 CREATE TABLE share_snapshot_items (id INTEGER PRIMARY KEY AUTOINCREMENT, snapshot_id TEXT, path TEXT, fs_id INTEGER, size INTEGER, is_dir INTEGER, name TEXT);"
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO share_snapshots (id, subscription_id, captured_at, item_count) VALUES ('snap-old', 'sub1', 100, 1)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO share_snapshot_items (snapshot_id, path, fs_id, size, is_dir, name) VALUES ('snap-old', '/legacy.txt', 7, 42, 0, 'legacy.txt')",
+                [],
+            ).unwrap();
+        }
+
+        // 走完整 init（含 ALTER 补列 + 建索引）
+        let mgr = ShareSyncPersistence::new(&p).unwrap();
+
+        let latest = mgr
+            .latest_snapshot("sub1")
+            .unwrap()
+            .expect("老库快照迁移后必须仍是基线，否则会触发全量重同步");
+        assert_eq!(latest.id, "snap-old");
+        assert_eq!(latest.items.len(), 1);
+        assert_eq!(latest.items[0].path, "/legacy.txt");
+        // 老快照不属于任何 run
+        assert!(mgr.snapshot_for_run("any-run").unwrap().is_none());
     }
 }

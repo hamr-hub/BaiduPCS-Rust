@@ -395,12 +395,41 @@ impl DownloadTask {
     /// 标记为暂停
     pub fn mark_paused(&mut self) {
         self.status = TaskStatus::Paused;
+        // 🔥 暂停即不再产生流量，瞬时速度必须归零。
+        //
+        // 上层按子任务速度求和聚合文件夹 / 分享同步的整体速度；若这里不清零，
+        // 暂停任务会一直保留暂停那一刻的瞬时值并被累加进去，表现为
+        // 「只有一个任务在跑，界面却显示好几 MB/s」。
+        self.speed = 0;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 暂停必须把瞬时速度归零。
+    ///
+    /// 上层（文件夹进度、分享同步子任务进度）是按子任务 `speed` 求和得到整体速度的。
+    /// 不清零的话，暂停/排队中的任务会一直贡献暂停那一刻的旧值 —— 实测出现过
+    /// 「只有 1 个任务在跑（78 KB/s），界面显示 4.39 MB/s」。
+    #[test]
+    fn test_mark_paused_clears_speed() {
+        let mut task = DownloadTask::new(
+            1,
+            "/a.bin".into(),
+            std::path::PathBuf::from("./a.bin"),
+            1024,
+            Uid::default(),
+        );
+        task.status = TaskStatus::Downloading;
+        task.speed = 4_600_000;
+
+        task.mark_paused();
+
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(task.speed, 0, "暂停后不得残留速度，否则会被上层累加");
+    }
 
     #[test]
     fn test_task_creation() {

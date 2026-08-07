@@ -525,6 +525,9 @@ impl ChunkScheduler {
     fn start_scheduling(&self) {
         let active_tasks = self.active_tasks.clone();
         let max_global_threads = self.max_global_threads.clone();
+        // 🔍 诊断用：活跃任务数理应 <= max_concurrent_tasks（任务槽上限）。
+        // 若超出，说明有任务绕过了 task_slot_pool 直接进入活跃集合（见下方告警）。
+        let max_concurrent_tasks_diag = self.max_concurrent_tasks.clone();
         let active_chunk_count = self.active_chunk_count.clone();
         let slot_pool = self.slot_pool.clone();
         let scheduler_running = self.scheduler_running.clone();
@@ -570,6 +573,25 @@ impl ChunkScheduler {
                         for task_info in tasks.values() {
                             let health = task_info.url_health.lock().await;
                             health.reset_speed_windows();
+                        }
+                    }
+
+                    // 🔍 槽位诊断：活跃任务数超过任务槽上限 = 有任务绕过了 task_slot_pool
+                    //
+                    // 正常情况下能进入活跃集合的任务都持有槽位（全局固定位 / 备份位 /
+                    // 文件夹固定位或借调位），所以 active 数不会超过 max_concurrent_tasks。
+                    // 一旦超出，说明存在"无槽位却被拉起"的路径 —— 这些任务会和正常任务
+                    // 一起参与下面的 round-robin 分片调度，把有限的线程摊薄，
+                    // 表现为多个任务都显示「下载中」但各自速度忽高忽低、交替推进。
+                    //
+                    // 只在任务数变化时求值，不会每轮刷屏。
+                    if current_task_count != last_count {
+                        let slot_limit = max_concurrent_tasks_diag.load(Ordering::SeqCst);
+                        if current_task_count > slot_limit {
+                            warn!(
+                                "⚠️ 槽位诊断: 活跃任务数 {} 超过任务槽上限 {}，存在绕过 task_slot_pool 被拉起的任务；活跃任务={:?}",
+                                current_task_count, slot_limit, task_ids
+                            );
                         }
                     }
 

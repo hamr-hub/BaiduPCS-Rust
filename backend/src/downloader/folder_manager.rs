@@ -21,6 +21,29 @@ use crate::persistence::{
     PersistenceManager,
 };
 
+/// 文件夹下载任务的槽位优先级。
+///
+/// 归属 `backup_config_id` 的文件夹下载（自动备份、以及分享同步的
+/// `share-sync:{订阅id}` 内部下载）是**后台任务**，必须与单文件下载段
+/// （`DownloadManager::create_backup_task` → `TaskPriority::Backup`）同档：
+/// - 只使用空闲槽位，不抢占任何在跑的任务；
+/// - 自身可被用户手动发起的下载（`Normal`）抢占，即"后台让位给前台"。
+///
+/// 之前这里无条件用 `Normal`，两个后果：
+/// 1. 后台同步占住槽位后**用户临时想下载别的文件会被挡住**（Normal 抢不动 Normal）；
+/// 2. 分享同步的文件夹会把**同一个订阅**里正在跑的单文件下载（Backup）踢下槽位。
+///
+/// 只有用户手动发起（`backup_config_id == None`）的文件夹下载才是 `Normal`。
+fn folder_slot_priority(
+    backup_config_id: Option<&str>,
+) -> crate::task_slot_pool::TaskPriority {
+    if backup_config_id.is_some() {
+        crate::task_slot_pool::TaskPriority::Backup
+    } else {
+        crate::task_slot_pool::TaskPriority::Normal
+    }
+}
+
 /// 文件夹下载管理器
 #[derive(Debug)]
 pub struct FolderDownloadManager {
@@ -1698,13 +1721,15 @@ impl FolderDownloadManager {
         // 🔥 按 folder.owner_uid 解析 download_manager（per-uid）
         let dm_for_owner: Option<Arc<DownloadManager>> = self.download_manager_for(owner_uid).await;
 
-        // 🔥 尝试为文件夹分配固定任务位（使用优先级分配，可抢占备份任务）
+        // 🔥 尝试为文件夹分配固定任务位（优先级见 `folder_slot_priority`）
+        let slot_priority = folder_slot_priority(folder.backup_config_id.as_deref());
         let (mut fixed_slot_id, mut preempted_task_id) = {
             if let Some(ref dm) = dm_for_owner {
                 let slot_pool = dm.task_slot_pool();
-                // 文件夹主任务使用 Normal 优先级，可以抢占备份任务
+                // 优先级见 `folder_slot_priority`：用户手动发起 → Normal（可抢占备份
+                // 任务）；自动备份 / 分享同步内部 → Backup（只用空闲槽、不抢占）
                 if let Some((slot_id, preempted)) = slot_pool.allocate_fixed_slot_with_priority(
-                    &folder_id, true, crate::task_slot_pool::TaskPriority::Normal
+                    &folder_id, true, slot_priority
                 ).await {
                     (Some(slot_id), preempted)
                 } else {
@@ -1717,21 +1742,21 @@ impl FolderDownloadManager {
 
         // 🔥 处理被抢占的备份任务
         if let Some(preempted_id) = preempted_task_id.take() {
-            info!("文件夹 {} 抢占了备份任务 {} 的槽位", folder_id, preempted_id);
+            info!("文件夹 {} 抢占了槽位持有者 {}", folder_id, preempted_id);
             if let Some(ref dm) = dm_for_owner {
-                // 暂停被抢占的备份任务并加入等待队列
-                if let Err(e) = dm.pause_task(&preempted_id, true).await {
-                    warn!("暂停被抢占的备份任务 {} 失败: {}", preempted_id, e);
-                }
-                // 将被抢占的任务加入等待队列末尾
-                dm.add_preempted_backup_to_queue(&preempted_id).await;
+                // 被抢占者可能是单文件任务，也可能是另一个文件夹 —— 统一分发
+                dm.handle_preempted_slot_owner(&preempted_id).await;
             }
         }
 
         // 🔥 如果没有空闲槽位，尝试从同一账号的其他文件夹回收借调位
         // 这确保了多个文件夹任务之间的公平性：每个文件夹至少能获得一个固定位
         // reclaim 必须按 owner_uid 过滤，避免跨账号误回收
-        if fixed_slot_id.is_none() {
+        //
+        // 🔥 后台文件夹（Backup 优先级）不参与回收：回收会削减其它文件夹已经拿到的
+        // 并行度，等同于「抢别人的资源」，与 Backup「只用空闲槽」的语义冲突。
+        // 拿不到就等空槽，由等待队列按 FIFO 唤醒。
+        if fixed_slot_id.is_none() && slot_priority == crate::task_slot_pool::TaskPriority::Normal {
             info!("文件夹 {} 无空闲槽位，尝试回收同账号其他文件夹的借调位", folder_id);
             if let Some(reclaimed_slot_id) = self
                 .reclaim_borrowed_slot_for_owner(owner_uid)
@@ -1741,7 +1766,7 @@ impl FolderDownloadManager {
                 if let Some(ref dm) = dm_for_owner {
                     let slot_pool = dm.task_slot_pool();
                     if let Some((slot_id, preempted)) = slot_pool.allocate_fixed_slot_with_priority(
-                        &folder_id, true, crate::task_slot_pool::TaskPriority::Normal
+                        &folder_id, true, slot_priority
                     ).await {
                         fixed_slot_id = Some(slot_id);
                         info!(
@@ -1750,11 +1775,8 @@ impl FolderDownloadManager {
                         );
                         // 处理可能被抢占的备份任务
                         if let Some(preempted_id) = preempted {
-                            info!("文件夹 {} 抢占了备份任务 {} 的槽位", folder_id, preempted_id);
-                            if let Err(e) = dm.pause_task(&preempted_id, true).await {
-                                warn!("暂停被抢占的备份任务 {} 失败: {}", preempted_id, e);
-                            }
-                            dm.add_preempted_backup_to_queue(&preempted_id).await;
+                            info!("文件夹 {} 抢占了槽位持有者 {}", folder_id, preempted_id);
+                            dm.handle_preempted_slot_owner(&preempted_id).await;
                         }
                     }
                 }
@@ -1769,18 +1791,32 @@ impl FolderDownloadManager {
         }
 
         // 🔥 按池子容量计算可借调槽位（固定槽位保留 1 个）
-        // 支持抢占备份任务：如果空闲槽位不足，会抢占备份任务的槽位
+        // - Normal（用户手动）：空闲槽不够时可抢占备份任务的槽位
+        // - Backup（自动备份 / 分享同步）：只借空闲槽，绝不抢占 —— 否则会绕过固定位
+        //   的优先级限制，从借调这条路把别人的槽抢走
+        let is_normal_priority = slot_priority == crate::task_slot_pool::TaskPriority::Normal;
         let (borrowed_slot_ids, preempted_backup_tasks) = {
             if let Some(ref dm) = dm_for_owner {
                 let slot_pool = dm.task_slot_pool();
-                let available = slot_pool.available_borrow_slots().await;
+                let available = if is_normal_priority {
+                    slot_pool.available_borrow_slots().await
+                } else {
+                    slot_pool.available_slots().await
+                };
                 let fixed_reserved = if fixed_slot_id.is_some() { 1 } else { 0 };
                 let max_borrowable = slot_pool.max_slots().saturating_sub(fixed_reserved);
                 let to_borrow = available.min(max_borrowable);
-                if to_borrow > 0 {
+                if to_borrow == 0 {
+                    (Vec::new(), Vec::new())
+                } else if is_normal_priority {
                     slot_pool.allocate_borrowed_slots(&folder_id, to_borrow).await
                 } else {
-                    (Vec::new(), Vec::new())
+                    (
+                        slot_pool
+                            .allocate_borrowed_slots_no_preempt(&folder_id, to_borrow)
+                            .await,
+                        Vec::new(),
+                    )
                 }
             } else {
                 (Vec::new(), Vec::new())
@@ -1798,11 +1834,7 @@ impl FolderDownloadManager {
             if let Some(ref dm) = dm_for_owner {
                 for preempted_id in &preempted_backup_tasks {
                     // 暂停被抢占的备份任务
-                    if let Err(e) = dm.pause_task(preempted_id, true).await {
-                        warn!("暂停被抢占的备份任务 {} 失败: {}", preempted_id, e);
-                    }
-                    // 将被抢占的任务加入等待队列末尾
-                    dm.add_preempted_backup_to_queue(preempted_id).await;
+                    dm.handle_preempted_slot_owner(preempted_id).await;
                 }
             }
         }
@@ -2618,8 +2650,15 @@ impl FolderDownloadManager {
     pub async fn resume_folder(&self, folder_id: &str) -> Result<()> {
         info!("恢复文件夹下载: {}", folder_id);
 
-        // 🔥 同时取出 folder.owner_uid 用于路由 download_manager
-        let (folder_info, old_status, new_status, folder_owner_uid_for_routing) = {
+        // 🔥 同时取出 folder.owner_uid 用于路由 download_manager，
+        // 以及 backup_config_id —— 决定重新申请槽位时用哪档优先级（见 `folder_slot_priority`）
+        let (
+            folder_info,
+            old_status,
+            new_status,
+            folder_owner_uid_for_routing,
+            folder_backup_config_id,
+        ) = {
             let mut folders = self.folders.write().await;
             let folder = folders
                 .get_mut(folder_id)
@@ -2647,6 +2686,7 @@ impl FolderDownloadManager {
 
             let new_status = format!("{:?}", folder.status).to_lowercase();
             let owner_uid = folder.owner_uid;
+            let backup_config_id = folder.backup_config_id.clone();
 
             (
                 (
@@ -2657,6 +2697,7 @@ impl FolderDownloadManager {
                 old_status,
                 new_status,
                 owner_uid,
+                backup_config_id,
             )
         };
 
@@ -2676,10 +2717,13 @@ impl FolderDownloadManager {
         // 暂停时释放了所有槽位，恢复时需要重新分配
         let slot_pool = download_manager.task_slot_pool();
 
-        // 1. 先分配固定位（使用优先级分配，可抢占备份任务）
+        // 1. 先分配固定位
+        // 与创建路径同款：后台文件夹（自动备份 / 分享同步）走 Backup 优先级，
+        // 恢复时同样只用空闲槽、不抢占。
+        let slot_priority = folder_slot_priority(folder_backup_config_id.as_deref());
         let (mut fixed_slot_id, mut preempted_task_id) =
             if let Some((slot_id, preempted)) = slot_pool.allocate_fixed_slot_with_priority(
-                folder_id, true, crate::task_slot_pool::TaskPriority::Normal
+                folder_id, true, slot_priority
             ).await {
                 (Some(slot_id), preempted)
             } else {
@@ -2690,17 +2734,14 @@ impl FolderDownloadManager {
         if let Some(preempted_id) = preempted_task_id.take() {
             info!("恢复文件夹 {} 抢占了备份任务 {} 的槽位", folder_id, preempted_id);
             // 暂停被抢占的备份任务并加入等待队列
-            if let Err(e) = download_manager.pause_task(&preempted_id, true).await {
-                warn!("暂停被抢占的备份任务 {} 失败: {}", preempted_id, e);
-            }
-            // 将被抢占的任务加入等待队列末尾
-            download_manager.add_preempted_backup_to_queue(&preempted_id).await;
+            download_manager.handle_preempted_slot_owner(&preempted_id).await;
         }
 
         // 🔥 如果没有空闲槽位，尝试从同一账号的其他文件夹回收借调位
         // 这确保了多个文件夹任务之间的公平性：每个文件夹至少能获得一个固定位
         // reclaim 必须按 owner_uid 过滤，避免跨账号误回收
-        if fixed_slot_id.is_none() {
+        // 🔥 后台文件夹（Backup 优先级）不参与回收，理由同创建路径
+        if fixed_slot_id.is_none() && slot_priority == crate::task_slot_pool::TaskPriority::Normal {
             info!("恢复文件夹 {} 无空闲槽位，尝试回收同账号其他文件夹的借调位", folder_id);
             if let Some(reclaimed_slot_id) = self
                 .reclaim_borrowed_slot_for_owner(folder_owner_uid_for_routing)
@@ -2708,7 +2749,7 @@ impl FolderDownloadManager {
             {
                 // 回收成功，重新分配固定位（使用优先级分配）
                 if let Some((slot_id, preempted)) = slot_pool.allocate_fixed_slot_with_priority(
-                    folder_id, true, crate::task_slot_pool::TaskPriority::Normal
+                    folder_id, true, slot_priority
                 ).await {
                     fixed_slot_id = Some(slot_id);
                     info!(
@@ -2717,11 +2758,8 @@ impl FolderDownloadManager {
                     );
                     // 处理可能被抢占的备份任务
                     if let Some(preempted_id) = preempted {
-                        info!("恢复文件夹 {} 抢占了备份任务 {} 的槽位", folder_id, preempted_id);
-                        if let Err(e) = download_manager.pause_task(&preempted_id, true).await {
-                            warn!("暂停被抢占的备份任务 {} 失败: {}", preempted_id, e);
-                        }
-                        download_manager.add_preempted_backup_to_queue(&preempted_id).await;
+                        info!("恢复文件夹 {} 抢占了槽位持有者 {}", folder_id, preempted_id);
+                        download_manager.handle_preempted_slot_owner(&preempted_id).await;
                     }
                 }
             }
@@ -2738,15 +2776,28 @@ impl FolderDownloadManager {
         }
 
         // 2. 按池子容量计算可借调槽位（固定槽位保留 1 个）
-        // 支持抢占备份任务：如果空闲槽位不足，会抢占备份任务的槽位
-        let available = slot_pool.available_borrow_slots().await;
+        // - Normal（用户手动）：空闲槽不够时可抢占备份任务的槽位
+        // - Backup（自动备份 / 分享同步）：只借空闲槽，绝不抢占（理由同创建路径）
+        let is_normal_priority = slot_priority == crate::task_slot_pool::TaskPriority::Normal;
+        let available = if is_normal_priority {
+            slot_pool.available_borrow_slots().await
+        } else {
+            slot_pool.available_slots().await
+        };
         let fixed_reserved = if fixed_slot_id.is_some() { 1 } else { 0 };
         let max_borrowable = slot_pool.max_slots().saturating_sub(fixed_reserved);
         let to_borrow = available.min(max_borrowable);
-        let (borrowed_slot_ids, preempted_backup_tasks) = if to_borrow > 0 {
+        let (borrowed_slot_ids, preempted_backup_tasks) = if to_borrow == 0 {
+            (Vec::new(), Vec::new())
+        } else if is_normal_priority {
             slot_pool.allocate_borrowed_slots(folder_id, to_borrow).await
         } else {
-            (Vec::new(), Vec::new())
+            (
+                slot_pool
+                    .allocate_borrowed_slots_no_preempt(folder_id, to_borrow)
+                    .await,
+                Vec::new(),
+            )
         };
 
         // 🔥 处理被抢占的备份任务（暂停并加入等待队列）
@@ -2759,11 +2810,7 @@ impl FolderDownloadManager {
             );
             for preempted_id in &preempted_backup_tasks {
                 // 暂停被抢占的备份任务
-                if let Err(e) = download_manager.pause_task(preempted_id, true).await {
-                    warn!("暂停被抢占的备份任务 {} 失败: {}", preempted_id, e);
-                }
-                // 将被抢占的任务加入等待队列末尾
-                download_manager.add_preempted_backup_to_queue(preempted_id).await;
+                download_manager.handle_preempted_slot_owner(preempted_id).await;
             }
         }
 
@@ -3753,19 +3800,80 @@ impl FolderDownloadManager {
         let mut folders_guard = self.folders.write().await;
         match folders_guard.get_mut(folder_id) {
             Some(folder) => {
-                if folder.fixed_slot_subtask.is_none() {
-                    folder.fixed_slot_subtask = Some(task_id.to_string());
-                    info!(
-                        "分配文件夹固定槽位: folder={}, task={}",
-                        folder_id, task_id
-                    );
-                    true
-                } else {
-                    // 已被占用
-                    false
+                // 🔥 发放「文件夹固定槽位」必须同时满足两个条件：
+                //   1. 文件夹自己**确实持有**一个 fixed_slot_id
+                //   2. 该固定位还没被别的子任务占用
+                //
+                // 条件 1 原本缺失，只判了条件 2。后果（issue #138 实测确认）：
+                // 文件夹创建时若抢不到槽位（例如只有 1 个任务槽、且已被另一个文件夹
+                // 以 Normal 优先级持有 —— Normal 抢不动 Normal），fixed_slot_id 会是
+                // None，而且没有任何重试补偿。此时仍然返回 true 的话，子任务会带着
+                // `uses_folder_fixed_slot=true` 被拉起，却不占用 task_slot_pool 的任何
+                // 槽位 —— 直接绕过任务槽上限进入活跃集合。
+                //
+                // 实测日志（1 个任务槽、3 个目录分享同步）：
+                //   文件夹 4803c7cd 无法获得固定任务位
+                //   → 分配文件夹固定槽位: folder=4803c7cd, folder_fixed_slot_id=None
+                //   → ⚠️ 活跃任务数 2 超过任务槽上限 1
+                // 两个任务随后在 ChunkScheduler 里 round-robin 瓜分唯一的下载线程，
+                // 表现为多个同步都「在下载」但交替推进、谁也不快。
+                //
+                // 加上条件 1 后，这类子任务会回落到调用方的全局槽位分配路径，
+                // 拿不到就正常进等待队列，等持有者释放后再按序拉起。
+                match (folder.fixed_slot_id, folder.fixed_slot_subtask.is_none()) {
+                    (Some(fixed_slot_id), true) => {
+                        folder.fixed_slot_subtask = Some(task_id.to_string());
+                        info!(
+                            "分配文件夹固定槽位: folder={}, task={}, slot_id={}",
+                            folder_id, task_id, fixed_slot_id
+                        );
+                        true
+                    }
+                    (None, _) => {
+                        // 文件夹自己都没槽位，发不出去。
+                        // 用 debug 而非 warn：等待队列监控每秒都会重试排队中的子任务，
+                        // 这里会被高频命中，warn 会刷屏。
+                        debug!(
+                            "文件夹 {} 未持有固定槽位，子任务 {} 不走文件夹固定位（回落到全局槽位分配 / 等待队列）",
+                            folder_id, task_id
+                        );
+                        false
+                    }
+                    // 固定位已被别的子任务占用
+                    (Some(_), false) => false,
                 }
             }
             None => false,
+        }
+    }
+
+    /// 🔥 该 id 是否是一个已知的文件夹下载。
+    ///
+    /// 用于区分「被抢占的槽位持有者」到底是单文件下载任务还是文件夹：
+    /// 文件夹主任务持有固定位时，`task_slot_pool` 里记录的 owner 是 **folder_id**，
+    /// 不是下载任务 id。
+    pub async fn is_known_folder(&self, folder_id: &str) -> bool {
+        self.folders.read().await.contains_key(folder_id)
+    }
+
+    /// 🔥 查询文件夹子任务申请全局槽位时应使用的优先级。
+    ///
+    /// 子任务的优先级必须**跟随所属文件夹**：后台文件夹（自动备份 / 分享同步，
+    /// 带 `backup_config_id`）的子任务同样是后台任务，不该抢占别人的槽位。
+    ///
+    /// 否则会出现"优先级降一层再现"：文件夹主任务已按 `folder_slot_priority`
+    /// 降为 `Backup`，但它的子任务在回落到全局槽位分配时若仍用 `SubTask`(20)，
+    /// 照样能抢占 `Backup`(30) —— 后台同步依旧会把别的后台下载踢下槽位。
+    ///
+    /// 文件夹不存在时返回 `SubTask`（维持旧行为，不影响非文件夹路径）。
+    pub async fn subtask_slot_priority(
+        &self,
+        folder_id: &str,
+    ) -> crate::task_slot_pool::TaskPriority {
+        let folders = self.folders.read().await;
+        match folders.get(folder_id) {
+            Some(f) if f.backup_config_id.is_some() => crate::task_slot_pool::TaskPriority::Backup,
+            _ => crate::task_slot_pool::TaskPriority::SubTask,
         }
     }
 
@@ -4065,5 +4173,205 @@ impl FolderDownloadManager {
         tokio::fs::remove_dir(src).await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归 issue #138：文件夹自己没拿到固定槽位时，绝不能把「文件夹固定槽位」
+    /// 发给子任务 —— 否则子任务会带着 `uses_folder_fixed_slot=true` 被拉起，
+    /// 不占用 task_slot_pool 的任何槽位，直接绕过任务槽上限。
+    ///
+    /// 复现条件（实测日志）：只有 1 个任务槽，且已被另一个文件夹以 Normal 优先级
+    /// 持有。第二个文件夹 `allocate_fixed_slot_with_priority` 失败（Normal 抢不动
+    /// Normal），`fixed_slot_id` 保持 None 且无重试补偿。
+    #[tokio::test]
+    async fn test_no_fixed_slot_grant_when_folder_holds_none() {
+        let fm = FolderDownloadManager::new(PathBuf::from("."));
+
+        // 没抢到槽位的文件夹：fixed_slot_id = None
+        let mut slotless = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        slotless.fixed_slot_id = None;
+        let slotless_id = slotless.id.clone();
+
+        // 正常持有槽位的文件夹
+        let mut holder = FolderDownload::new("/b".into(), PathBuf::from("./b"));
+        holder.fixed_slot_id = Some(0);
+        let holder_id = holder.id.clone();
+
+        {
+            let mut folders = fm.folders.write().await;
+            folders.insert(slotless_id.clone(), slotless);
+            folders.insert(holder_id.clone(), holder);
+        }
+
+        assert!(
+            !fm.try_allocate_fixed_slot_for_subtask(&slotless_id, "child-1").await,
+            "文件夹自己没有 fixed_slot_id，不能把固定槽位发给子任务"
+        );
+        // 拒绝之后不能留下占用痕迹，否则真拿到槽位时会误判为「已被占用」
+        {
+            let folders = fm.folders.read().await;
+            assert!(
+                folders.get(&slotless_id).unwrap().fixed_slot_subtask.is_none(),
+                "拒绝发放后不应登记 fixed_slot_subtask"
+            );
+        }
+
+        // 对照：持有槽位的文件夹正常发放，且只发一次
+        assert!(
+            fm.try_allocate_fixed_slot_for_subtask(&holder_id, "child-2").await,
+            "文件夹持有 fixed_slot_id 时应正常发放"
+        );
+        assert!(
+            !fm.try_allocate_fixed_slot_for_subtask(&holder_id, "child-3").await,
+            "固定位已被占用，不能重复发放给第二个子任务"
+        );
+    }
+
+    /// 文件夹不存在时不发放（防御性路径，避免误判为「拿到了槽位」）
+    #[tokio::test]
+    async fn test_no_fixed_slot_grant_for_unknown_folder() {
+        let fm = FolderDownloadManager::new(PathBuf::from("."));
+        assert!(
+            !fm.try_allocate_fixed_slot_for_subtask("nonexistent", "child").await
+        );
+    }
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+    use crate::task_slot_pool::{TaskPriority, TaskSlotPool};
+
+    /// 用户手动发起的文件夹下载是 Normal；归属 backup_config_id 的后台文件夹
+    /// （自动备份 / 分享同步）必须是 Backup，与单文件下载段
+    /// （`DownloadManager::create_backup_task`）同档。
+    #[test]
+    fn test_folder_slot_priority_by_backup_config() {
+        assert_eq!(folder_slot_priority(None), TaskPriority::Normal);
+        assert_eq!(
+            folder_slot_priority(Some("share-sync:sub-1")),
+            TaskPriority::Backup,
+            "分享同步内部文件夹下载必须走 Backup 档"
+        );
+        assert_eq!(
+            folder_slot_priority(Some("2f1c8a10-uuid-backup-config")),
+            TaskPriority::Backup,
+            "自动备份文件夹下载同样是后台任务"
+        );
+    }
+
+    /// 子任务优先级必须跟随所属文件夹，否则「主任务已降为 Backup」的修复
+    /// 会在子任务这一层原样再现（SubTask(20) 照样能抢占 Backup(30)）。
+    #[tokio::test]
+    async fn test_subtask_priority_follows_folder() {
+        let fm = FolderDownloadManager::new(PathBuf::from("."));
+
+        let mut background = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        background.backup_config_id = Some("share-sync:sub-1".into());
+        let bg_id = background.id.clone();
+
+        let manual = FolderDownload::new("/b".into(), PathBuf::from("./b"));
+        let manual_id = manual.id.clone();
+
+        {
+            let mut folders = fm.folders.write().await;
+            folders.insert(bg_id.clone(), background);
+            folders.insert(manual_id.clone(), manual);
+        }
+
+        assert_eq!(
+            fm.subtask_slot_priority(&bg_id).await,
+            TaskPriority::Backup,
+            "后台文件夹的子任务也是后台任务"
+        );
+        assert_eq!(
+            fm.subtask_slot_priority(&manual_id).await,
+            TaskPriority::SubTask,
+            "用户手动文件夹的子任务维持 SubTask"
+        );
+        assert_eq!(
+            fm.subtask_slot_priority("unknown").await,
+            TaskPriority::SubTask,
+            "取不到文件夹信息时回退旧行为"
+        );
+    }
+
+    /// 回归：文件夹被抢占后，必须能被识别成「文件夹」而不是「下载任务」。
+    ///
+    /// `task_slot_pool` 里文件夹固定位的 owner 是 **folder_id**。文件夹优先级还是
+    /// `Normal` 时它不可被抢占，这条路径是死代码；降为 `Backup` 后变得可达，
+    /// 而原来的处理写死按任务走 `pause_task`，结果是：
+    /// ```text
+    /// 抢占备份任务槽位: preempted_task=Some("<folder_id>")
+    /// 暂停被抢占的备份任务 <folder_id> 失败: 任务不存在
+    /// ⚠️ 槽位诊断: 活跃任务数 2 超过任务槽上限 1
+    /// ```
+    /// 槽位被拿走、文件夹却仍在跑。`is_known_folder` 就是分发的依据。
+    #[tokio::test]
+    async fn test_preempted_owner_is_recognized_as_folder() {
+        let fm = FolderDownloadManager::new(PathBuf::from("."));
+
+        let folder = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        let folder_id = folder.id.clone();
+        {
+            fm.folders.write().await.insert(folder_id.clone(), folder);
+        }
+
+        assert!(
+            fm.is_known_folder(&folder_id).await,
+            "文件夹 id 必须能被识别，否则会被当成下载任务去 pause_task"
+        );
+        assert!(
+            !fm.is_known_folder("some-download-task-id").await,
+            "普通下载任务 id 不应被当成文件夹"
+        );
+    }
+
+    /// 回归 issue #138 的两条核心诉求：
+    /// ① 后台同步不得抢占正在跑的其它后台下载；
+    /// ② 后台同步必须给用户手动发起的下载让位。
+    #[tokio::test]
+    async fn test_background_folder_yields_to_user_but_not_preempts_peers() {
+        // 非会员：max_concurrent_tasks = 1
+        let pool = TaskSlotPool::new(1);
+
+        // 分享同步的单文件下载先拿到唯一的槽位
+        assert_eq!(pool.allocate_backup_slot("share-sync-file").await, Some(0));
+
+        // ① 另一个订阅的文件夹下载（后台档）来抢 —— 必须抢不到
+        assert!(
+            pool.allocate_fixed_slot_with_priority(
+                "folder-from-other-sub",
+                true,
+                folder_slot_priority(Some("share-sync:sub-2")),
+            )
+                .await
+                .is_none(),
+            "后台文件夹不得抢占正在跑的后台下载"
+        );
+        // 借调路径也不能成为绕过优先级的后门
+        assert!(
+            pool.allocate_borrowed_slots_no_preempt("folder-from-other-sub", 1)
+                .await
+                .is_empty(),
+            "后台文件夹借调时同样不得抢占"
+        );
+        // 槽位仍归原任务
+        assert_eq!(
+            pool.get_task_slot("share-sync-file").await.map(|(id, _)| id),
+            Some(0)
+        );
+
+        // ② 用户手动发起的下载（Normal）必须能把后台任务挤下去
+        let (slot_id, preempted) = pool
+            .allocate_fixed_slot_with_priority("user-folder", true, folder_slot_priority(None))
+            .await
+            .expect("用户手动发起的下载应能抢占后台任务");
+        assert_eq!(slot_id, 0);
+        assert_eq!(preempted.as_deref(), Some("share-sync-file"));
     }
 }

@@ -386,6 +386,37 @@ mod tests {
         assert!(matches!(e, ShareSyncError::FileSystemError(_)));
     }
 
+    /// 回归：网盘空间不足**不得**被归类成「文件数超限」而触发二分。
+    ///
+    /// 实测踩到过：百度返回 `errno=12 + info[0].errno=-32`（剩余空间不足），
+    /// 该响应里没有 `target_file_nums_limit` 字段，client.rs 旧代码
+    /// `unwrap_or(0)` 后判定「转存文件数 32 超过上限 0」，命中
+    /// `DIR_AMBIGUOUS_KEYWORDS` 的「超过上限」→ 被当成可二分重试，
+    /// 执行器一路对半拆到每批 1 个文件、全部失败，日志刷出 347 次 errno=-32
+    /// 仍在原地空转。空间不足是资源类错误，拆多小都没用，必须走 Quota 早停。
+    #[test]
+    fn test_disk_full_is_quota_not_bisectable() {
+        // client.rs 现在给出的文案
+        let e = ShareSyncError::TransferError(
+            "转存失败: 所有批次转存失败: batch_1: 网盘空间不足，无法转存（剩余空间不足，无法转存）"
+                .into(),
+        );
+        assert_eq!(
+            e.category(),
+            ErrorCategory::Quota,
+            "空间不足必须归 Quota（早停），不能是可二分"
+        );
+        assert!(!e.should_retry(), "空间不足重试无意义");
+
+        // 真正的文件数超限（info errno=130）仍应触发二分
+        let e = ShareSyncError::TransferError("转存文件数 3499 超过上限 500".into());
+        assert_eq!(
+            e.category(),
+            ErrorCategory::DirTransferAmbiguous,
+            "真正的文件数超限仍要二分拆批"
+        );
+    }
+
     #[test]
     fn test_error_category_quota_detected() {
         let e = ShareSyncError::TransferError("转存失败：网盘空间不足".into());

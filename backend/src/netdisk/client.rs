@@ -2903,13 +2903,45 @@ impl NetdiskClient {
                             transferred_fs_ids: vec![],
                         });
                     }
+                    // 🔥 内层 errno=-32 是**网盘剩余空间不足**，必须在下面的
+                    // "文件数超限" 检查之前拦住。
+                    //
+                    // 这条响应里没有 `target_file_nums_limit` 字段，掉到下面会被
+                    // `unwrap_or(0)` 算成「转存文件数 32 超过上限 0」——文案离谱，
+                    // 更糟的是 share_sync 按「超过上限」把它归类为**可二分重试**
+                    // （见 share_sync/error.rs：真正的文件数超限是 info errno=130），
+                    // 于是执行器一路对半拆批、每批都因空间不足失败，
+                    // 实测刷出 347 次 errno=-32 还在原地空转。
+                    //
+                    // 空间不足属于资源类错误，拆多小都没用，要走 quota_full 早停。
+                    if inner_errno == -32 {
+                        let show_msg = json["show_msg"].as_str().unwrap_or_default();
+                        let detail = if show_msg.is_empty() {
+                            String::new()
+                        } else {
+                            format!("（{}）", show_msg)
+                        };
+                        return Ok(crate::transfer::TransferResult {
+                            success: false,
+                            transferred_paths: vec![],
+                            from_paths: vec![],
+                            // 文案必须含「网盘空间不足」：share_sync/error.rs 按该关键字
+                            // 归类为 quota_full（不重试、提示用户清理后手动触发）
+                            error: Some(format!("网盘空间不足，无法转存{}", detail)),
+                            transferred_fs_ids: vec![],
+                        });
+                    }
                 }
             }
 
             // 检查转存数量限制
+            //
+            // 只有响应里**确实带了** `target_file_nums_limit`（>0）才做这个判断。
+            // 字段缺失时 `unwrap_or(0)` 会让任意文件数都"超过上限 0"，把别的错误
+            // （典型如上面的 -32 空间不足）误判成可二分重试的文件数超限。
             let target_file_nums = json["target_file_nums"].as_u64().unwrap_or(0);
             let target_file_nums_limit = json["target_file_nums_limit"].as_u64().unwrap_or(0);
-            if target_file_nums > target_file_nums_limit {
+            if target_file_nums_limit > 0 && target_file_nums > target_file_nums_limit {
                 return Ok(crate::transfer::TransferResult {
                     success: false,
                     transferred_paths: vec![],
@@ -5096,13 +5128,36 @@ mod transfer_preservation_tests {
                             transferred_fs_ids: vec![],
                         };
                     }
+                    // 🔥 内层 errno=-32 是网盘剩余空间不足，必须在下面的
+                    // 「文件数超限」检查之前拦住（理由同另一处同名逻辑：
+                    // 该响应无 target_file_nums_limit 字段，会被误判成可二分重试的
+                    // 文件数超限，导致执行器反复对半拆批空转）。
+                    if inner_errno == -32 {
+                        let show_msg = json["show_msg"].as_str().unwrap_or_default();
+                        let detail = if show_msg.is_empty() {
+                            String::new()
+                        } else {
+                            format!("（{}）", show_msg)
+                        };
+                        return TransferResult {
+                            success: false,
+                            transferred_paths: vec![],
+                            from_paths: vec![],
+                            // 关键字「网盘空间不足」用于 share_sync 归类 quota_full
+                            error: Some(format!("网盘空间不足，无法转存{}", detail)),
+                            transferred_fs_ids: vec![],
+                        };
+                    }
                 }
             }
 
             // 检查转存数量限制
+            //
+            // 只有响应确实带了 `target_file_nums_limit`（>0）才判定，
+            // 否则字段缺失时 `unwrap_or(0)` 会把任意错误都算成「超过上限 0」。
             let target_file_nums = json["target_file_nums"].as_u64().unwrap_or(0);
             let target_file_nums_limit = json["target_file_nums_limit"].as_u64().unwrap_or(0);
-            if target_file_nums > target_file_nums_limit {
+            if target_file_nums_limit > 0 && target_file_nums > target_file_nums_limit {
                 return TransferResult {
                     success: false,
                     transferred_paths: vec![],
@@ -5281,6 +5336,62 @@ mod transfer_preservation_tests {
         let error_msg = result.error.unwrap();
         assert!(error_msg.contains("同名文件已存在"));
         assert!(error_msg.contains("existing.txt"));
+    }
+
+    /// 回归：`errno=12 + info[0].errno=-32`（网盘剩余空间不足）必须报「网盘空间不足」，
+    /// 不能被算成「转存文件数超过上限 0」。
+    ///
+    /// 百度这条响应**不带** `target_file_nums_limit` 字段。旧代码 `unwrap_or(0)`
+    /// 后判定「32 > 0」→ 输出「转存文件数 32 超过上限 0」，而 share_sync 按
+    /// 「超过上限」把它归类成可二分重试，于是执行器一路对半拆批、每批都因空间不足
+    /// 失败，实测刷出 347 次 errno=-32 仍在原地空转。
+    ///
+    /// 报文取自真实日志。
+    #[test]
+    fn test_errno_12_inner_minus32_is_quota_not_file_limit() {
+        let response = json!({
+            "errno": 12,
+            "info": [{ "errno": -32, "path": "/顾先生，你的爱太迟了" }],
+            "show_msg": "剩余空间不足，无法转存",
+            "target_file_nums": 32,
+            "target_size": 3815963884u64,
+            "task_id": 0
+        })
+            .to_string();
+
+        let result = parse_transfer_response(&response);
+        assert!(!result.success);
+        let error_msg = result.error.unwrap();
+        assert!(
+            error_msg.contains("网盘空间不足"),
+            "必须含该关键字，share_sync 据此归类 quota_full 早停；实际={}",
+            error_msg
+        );
+        assert!(
+            !error_msg.contains("超过上限"),
+            "不得命中二分关键字，否则会无意义地反复拆批；实际={}",
+            error_msg
+        );
+    }
+
+    /// 缺少 `target_file_nums_limit` 字段时，不得把任意文件数判成「超过上限 0」。
+    #[test]
+    fn test_missing_file_limit_field_does_not_trigger_limit_error() {
+        let response = json!({
+            "errno": 12,
+            "info": [{ "errno": -9, "path": "/x" }],
+            "target_file_nums": 5
+        })
+            .to_string();
+
+        let result = parse_transfer_response(&response);
+        assert!(!result.success);
+        let error_msg = result.error.unwrap();
+        assert!(
+            !error_msg.contains("超过上限"),
+            "字段缺失时不该判超限，应回落到通用失败；实际={}",
+            error_msg
+        );
     }
 
     #[test]

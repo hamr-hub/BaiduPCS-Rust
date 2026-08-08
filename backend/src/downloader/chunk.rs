@@ -660,22 +660,29 @@ mod tests {
 
     #[test]
     fn test_chunk_calculation() {
-        // 测试完整分片
-        let manager = ChunkManager::new(100, 10, Uid::default());
-        assert_eq!(manager.chunk_count(), 10);
-        assert_eq!(manager.chunks[0].range, 0..10);
-        assert_eq!(manager.chunks[9].range, 90..100);
+        // 🔥 尺寸必须大于 SMALL_FILE_SINGLE_CHUNK_THRESHOLD（10MB）：
+        //    小于等于该阈值的文件会被有意压成单分片（见 ChunkManager::new），
+        //    用字节级的小尺寸构造用例会永远得到 chunk_count() == 1。
+        const UNIT: u64 = SMALL_FILE_SINGLE_CHUNK_THRESHOLD; // 每片 10MB
 
-        // 测试不完整分片
-        let manager = ChunkManager::new(105, 10, Uid::default());
+        // 测试完整分片：100MB / 10MB = 10 片
+        let manager = ChunkManager::new(UNIT * 10, UNIT, Uid::default());
+        assert_eq!(manager.chunk_count(), 10);
+        assert_eq!(manager.chunks[0].range, 0..UNIT);
+        assert_eq!(manager.chunks[9].range, UNIT * 9..UNIT * 10);
+
+        // 测试不完整分片：最后一片不足 UNIT
+        let manager = ChunkManager::new(UNIT * 10 + 5, UNIT, Uid::default());
         assert_eq!(manager.chunk_count(), 11);
-        assert_eq!(manager.chunks[10].range, 100..105);
+        assert_eq!(manager.chunks[10].range, UNIT * 10..UNIT * 10 + 5);
         assert_eq!(manager.chunks[10].size(), 5);
     }
 
     #[test]
     fn test_progress_calculation() {
-        let mut manager = ChunkManager::new(1000, 100, Uid::default());
+        // 同上：需超过小文件单分片阈值，否则只会得到 1 个分片
+        const UNIT: u64 = SMALL_FILE_SINGLE_CHUNK_THRESHOLD; // 每片 10MB
+        let mut manager = ChunkManager::new(UNIT * 10, UNIT, Uid::default());
         assert_eq!(manager.progress(), 0.0);
 
         // 完成前5个分片
@@ -683,7 +690,7 @@ mod tests {
             manager.mark_completed(i);
         }
         assert_eq!(manager.completed_count(), 5);
-        assert_eq!(manager.downloaded_bytes(), 500);
+        assert_eq!(manager.downloaded_bytes(), UNIT * 5);
         assert_eq!(manager.progress(), 50.0);
 
         // 完成所有分片
@@ -696,7 +703,9 @@ mod tests {
 
     #[test]
     fn test_next_pending() {
-        let mut manager = ChunkManager::new(300, 100, Uid::default());
+        // 同上：需超过小文件单分片阈值，否则只会得到 1 个分片
+        const UNIT: u64 = SMALL_FILE_SINGLE_CHUNK_THRESHOLD; // 每片 10MB
+        let mut manager = ChunkManager::new(UNIT * 3, UNIT, Uid::default());
 
         let chunk1 = manager.next_pending();
         assert!(chunk1.is_some());

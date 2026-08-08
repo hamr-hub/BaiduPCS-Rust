@@ -583,6 +583,7 @@ impl DownloadManager {
                     task_id: format!("skipped-{}", uuid::Uuid::new_v4()),
                     filename,
                     reason: "文件已存在".to_string(),
+                    group_id: None,
 
                     owner_uid: Some(effective_uid.raw()),
                 })
@@ -5635,6 +5636,7 @@ impl DownloadManager {
                     task_id: format!("backup-skipped-{}", uuid::Uuid::new_v4()),
                     filename,
                     reason: "文件已存在".to_string(),
+                    group_id: None,
 
                     // 用调用方传入的 owner_uid，
                     // 不再用共享 manager 的 self.owner_uid（共享 manager 下不可靠）

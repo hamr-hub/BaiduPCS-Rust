@@ -644,6 +644,12 @@ impl AppState {
             let wal_dir = pm_arc.lock().await.wal_dir().clone();
             self.folder_download_manager.set_wal_dir(wal_dir.clone()).await;
 
+            // 🔥 注入全局配置：文件夹自身未携带冲突策略时（升级前创建的旧任务）
+            // 回退到用户在设置页配置的默认下载策略，而不是硬编码 Overwrite
+            self.folder_download_manager
+                .set_app_config(Arc::clone(&self.config))
+                .await;
+
             // 注入 ClientPool，支持按 folder.owner_uid 路由
             self.folder_download_manager
                 .set_client_pool(Arc::clone(&self.client_pool))

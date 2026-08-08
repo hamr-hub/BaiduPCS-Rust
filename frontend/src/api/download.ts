@@ -8,7 +8,15 @@ export { formatFileSize, formatSpeed, formatETA, extractFilename }
 export type DownloadConflictStrategy = 'overwrite' | 'skip' | 'auto_rename'
 
 /// 任务状态
-export type TaskStatus = 'pending' | 'downloading' | 'decrypting' | 'paused' | 'completed' | 'failed'
+export type TaskStatus =
+    | 'pending'
+    | 'downloading'
+    | 'decrypting'
+    | 'paused'
+    | 'completed'
+    | 'failed'
+    /** 因冲突策略被跳过：本地已存在同名文件，未创建真实下载任务 */
+    | 'skipped'
 
 /// 下载任务
 export interface DownloadTask {
@@ -209,6 +217,7 @@ export function getStatusText(status: TaskStatus): string {
     paused: '已暂停',
     completed: '已完成',
     failed: '失败',
+    skipped: '跳过',
   }
   return statusMap[status] || '未知'
 }
@@ -224,6 +233,7 @@ export function getStatusType(status: TaskStatus): 'success' | 'warning' | 'dang
     paused: 'info',
     completed: 'success',
     failed: 'danger',
+    skipped: 'info',
   }
   return typeMap[status] || 'info'
 }
@@ -246,6 +256,10 @@ export interface FolderDownload {
   total_size: number
   created_count: number
   completed_count: number
+  /** 因冲突策略跳过的文件数（本地已存在，未创建子任务） */
+  skipped_count: number
+  /** 因冲突策略跳过的字节数 */
+  skipped_size: number
   downloaded_size: number
   scan_completed: boolean
   scan_progress?: string
@@ -257,6 +271,23 @@ export interface FolderDownload {
   owner_uid?: number | null
   /** 标准化失败原因 */
   failure_reason?: string | null
+}
+
+/// 因冲突策略被跳过的文件明细（不产生真实下载任务）
+export interface SkippedFile {
+  relative_path: string
+  size: number
+  skipped_at: number
+}
+
+/**
+ * 获取文件夹因冲突策略跳过的文件明细
+ *
+ * 跳过的文件不会创建子任务，不出现在 /downloads/all 里，需单独取回后
+ * 以「跳过」状态补进详情列表。
+ */
+export async function getFolderSkippedFiles(folderId: string): Promise<SkippedFile[]> {
+  return apiClient.get(`/downloads/folder/${folderId}/skipped`)
 }
 
 /// 树形节点（用于展示）
@@ -287,6 +318,10 @@ export interface DownloadItem {
   folder?: FolderDownload
   total_files?: number
   completed_files?: number
+  /** 因冲突策略跳过的文件数（后端 flatten FolderDownload 后的字段名） */
+  skipped_count?: number
+  /** 因冲突策略跳过的字节数 */
+  skipped_size?: number
   // 单文件特有
   task?: DownloadTask
 }
@@ -532,6 +567,8 @@ export function mergeDownloadItems(
       folder: folder,
       total_files: folder.total_files,
       completed_files: completedFiles,
+      skipped_count: folder.skipped_count ?? 0,
+      skipped_size: folder.skipped_size ?? 0,
     })
   }
 
@@ -573,9 +610,12 @@ export interface DownloadItemFromBackend {
   total_files?: number
   created_count?: number
   completed_count?: number
+  skipped_count?: number
+  skipped_size?: number
   scan_completed?: boolean
   scan_progress?: string
   completed_files?: number
+  skipped_files?: number
   // 解密相关字段
   /** 是否为加密文件 */
   is_encrypted?: boolean

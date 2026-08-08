@@ -234,7 +234,7 @@
           <!-- 进度条 -->
           <div class="task-progress" v-if="item.status !== 'decrypting'">
             <el-progress
-                :percentage="Math.min(100, Math.max(0, (item.downloaded_size || 0) / (item.total_size || 1) * 100))"
+                :percentage="Math.min(100, Math.max(0, ((item.downloaded_size || 0) + (item.skipped_size || 0)) / (item.total_size || 1) * 100))"
                 :status="getProgressStatus(item.status!)"
                 :stroke-width="8"
             >
@@ -249,11 +249,21 @@
             <!-- 文件夹特有统计 -->
             <div v-if="item.type === 'folder'" class="stat-item">
               <span class="stat-label">进度:</span>
-              <span class="stat-value">{{ item.completed_files }}/{{ item.total_files }} 个文件</span>
+              <span class="stat-value">
+                {{ item.completed_files }}/{{ item.total_files }} 个文件
+                <span v-if="(item.skipped_count ?? 0) > 0" class="skipped-hint">
+                  (已跳过 {{ item.skipped_count }})
+                </span>
+              </span>
             </div>
             <div class="stat-item">
               <span class="stat-label">已下载:</span>
               <span class="stat-value">{{ formatFileSize(item.downloaded_size || 0) }}</span>
+            </div>
+            <!-- 跳过的文件不产生下载字节，只显示「已下载 0 B」会和 100% 的进度条自相矛盾 -->
+            <div class="stat-item" v-if="(item.skipped_size ?? 0) > 0">
+              <span class="stat-label">已跳过:</span>
+              <span class="stat-value">{{ formatFileSize(item.skipped_size || 0) }}</span>
             </div>
             <div class="stat-item">
               <span class="stat-label">总大小:</span>
@@ -301,6 +311,11 @@
             <div class="stat-label">已完成</div>
             <div class="stat-value success">{{ folderDetailDialog.completedFiles }}</div>
           </div>
+          <!-- 跳过策略命中的文件不会创建子任务，若不单独展示，用户会误以为队列卡住 -->
+          <div class="stat-card" v-if="folderDetailDialog.skippedFiles > 0">
+            <div class="stat-label">已跳过</div>
+            <div class="stat-value warning">{{ folderDetailDialog.skippedFiles }}</div>
+          </div>
           <div class="stat-card">
             <div class="stat-label">下载中</div>
             <div class="stat-value primary">{{ folderDetailDialog.downloadingFiles }}</div>
@@ -341,6 +356,22 @@
               </template>
             </el-input>
           </div>
+
+          <!-- 命中「跳过」策略的文件不会创建子任务，列表天然为空。
+               不加说明的话，用户看到的就是「已完成 + 进度 0% + 详情空白」，
+               无从判断到底发生了什么（issue #141 用户反馈）。 -->
+          <el-alert
+              v-if="folderDetailDialog.tasks.length === 0 && folderDetailDialog.skippedFiles > 0"
+              type="success"
+              :closable="false"
+              show-icon
+              style="margin-bottom: 12px"
+          >
+            <template #title>
+              本次共跳过 {{ folderDetailDialog.skippedFiles }} 个文件（本地已存在，符合「跳过」策略），
+              无需创建下载任务，因此子任务列表为空。
+            </template>
+          </el-alert>
 
           <el-table
               :data="filteredSubtasks"
@@ -420,6 +451,7 @@ import {ElMessage, ElMessageBox} from 'element-plus'
 import {
   getAllDownloadsMixed,
   getAllDownloads,
+  getFolderSkippedFiles,
   pauseDownload,
   resumeDownload,
   deleteDownload,
@@ -542,6 +574,7 @@ const folderDetailDialog = ref({
   folderName: '',
   totalFiles: 0,
   completedFiles: 0,
+  skippedFiles: 0,
   downloadingFiles: 0,
   pendingFiles: 0,
   failedFiles: 0,
@@ -1124,6 +1157,7 @@ function onFolderDetailClose() {
   folderDetailDialog.value.tasks = []
   folderDetailDialog.value.totalFiles = 0
   folderDetailDialog.value.completedFiles = 0
+  folderDetailDialog.value.skippedFiles = 0
   folderDetailDialog.value.downloadingFiles = 0
   folderDetailDialog.value.pendingFiles = 0
   folderDetailDialog.value.failedFiles = 0
@@ -1151,7 +1185,12 @@ async function refreshFolderDetail() {
 
   try {
     // 获取所有任务，然后过滤出属于该文件夹的任务
-    const allTasks = await getAllDownloads()
+    // 🔥 跳过的文件不会创建子任务，不在 /downloads/all 里，需单独取明细
+    //    否则「全部跳过」的文件夹详情就是一片空白（issue #141 用户反馈）
+    const [allTasks, skippedFiles] = await Promise.all([
+      getAllDownloads(),
+      getFolderSkippedFiles(folderId).catch(() => []),
+    ])
 
     // 🔥 防止异步响应覆盖：
     // 1. 弹窗已关/已换目录 → folderId 或 visible 不匹配
@@ -1196,6 +1235,7 @@ async function refreshFolderDetail() {
     // 不从内存子任务重新计数，因为已完成的子任务会被移除
     const folderItem = downloadItems.value.find((i) => i.id === folderId && i.type === 'folder')
     const folderCompletedFiles = folderItem?.completed_files ?? 0
+    const folderSkippedFiles = folderItem?.skipped_count ?? 0
     const folderTotalFiles = folderItem?.total_files ?? mergedTasks.length
 
     const downloadingFiles = mergedTasks.filter((t) => t.status === 'downloading').length
@@ -1205,12 +1245,40 @@ async function refreshFolderDetail() {
     const decryptingFiles = mergedTasks.filter((t) => t.status === 'decrypting').length
     // 未创建任务的文件数 = 总文件数 - 已完成(文件夹级累计值) - 非完成的内存子任务数
     // 注意：已完成子任务可能尚未从列表移除，要排除否则会被 completedFiles 和 tasks 同时计数
-    const activeTaskCount = mergedTasks.filter((t) => t.status !== 'completed').length
-    const notCreatedYet = Math.max(0, folderTotalFiles - folderCompletedFiles - activeTaskCount)
+    // 跳过行是合成的展示行、不是真实任务，且其文件数已由 folderSkippedFiles 单独扣除，
+    // 若计入 activeTaskCount 会让「待处理」被重复扣减
+    const activeTaskCount = mergedTasks.filter(
+        (t) => t.status !== 'completed' && t.status !== 'skipped',
+    ).length
+    // 跳过的文件已处理完且不会产生子任务，必须一并扣除，否则“待处理”会虚高
+    const notCreatedYet = Math.max(
+        0,
+        folderTotalFiles - folderCompletedFiles - folderSkippedFiles - activeTaskCount,
+    )
+
+    // 🔥 把跳过的文件合成「跳过」状态的行并入列表，让用户看到具体跳过了哪些文件。
+    //    合成 id 加 `skipped-` 前缀，避免与真实任务 id 冲突（这些行没有可操作性）。
+    for (const sf of skippedFiles) {
+      mergedTasks.push({
+        id: `skipped-${folderId}-${sf.relative_path}`,
+        fs_id: 0,
+        remote_path: sf.relative_path,
+        local_path: sf.relative_path,
+        filename: sf.relative_path.split('/').pop() || sf.relative_path,
+        total_size: sf.size,
+        downloaded_size: sf.size,
+        status: 'skipped',
+        speed: 0,
+        created_at: sf.skipped_at,
+        group_id: folderId,
+        relative_path: sf.relative_path,
+      } as unknown as DownloadTask)
+    }
 
     folderDetailDialog.value.tasks = mergedTasks
     folderDetailDialog.value.totalFiles = folderTotalFiles
     folderDetailDialog.value.completedFiles = folderCompletedFiles
+    folderDetailDialog.value.skippedFiles = folderSkippedFiles
     folderDetailDialog.value.downloadingFiles = downloadingFiles
     folderDetailDialog.value.pendingFiles = pendingFiles + notCreatedYet
     folderDetailDialog.value.failedFiles = failedFiles
@@ -1229,6 +1297,23 @@ function handleDownloadEvent(event: DownloadEvent) {
   const index = downloadItems.value.findIndex(item => item.id === taskId && item.type !== 'folder')
 
   switch (event.event_type) {
+    case 'skipped': {
+      // 🔥 冲突策略命中"跳过"：不会创建子任务，只有这条事件能证明队列在推进。
+      //    乐观递增文件夹的跳过计数，随后的 folder progress 事件会用后端权威值覆盖。
+      if (!event.group_id) break
+      const folderIdx = downloadItems.value.findIndex(
+          (i) => i.id === event.group_id && i.type === 'folder',
+      )
+      if (folderIdx !== -1) {
+        downloadItems.value[folderIdx].skipped_count =
+            (downloadItems.value[folderIdx].skipped_count ?? 0) + 1
+      }
+      if (folderDetailDialog.value.visible && folderDetailDialog.value.folderId === event.group_id) {
+        folderDetailDialog.value.skippedFiles += 1
+        folderDetailDialog.value.pendingFiles = Math.max(0, folderDetailDialog.value.pendingFiles - 1)
+      }
+      break
+    }
     case 'created':
       // 新任务创建，添加到列表
       // 🔥 有 group_id 的是文件夹子任务，不应出现在主列表（主列表只显示文件夹行）
@@ -1478,6 +1563,7 @@ function updateFolderDetailStats() {
       (i) => i.id === folderDetailDialog.value.folderId && i.type === 'folder'
   )
   const folderCompletedFiles = folderItem?.completed_files ?? 0
+  const folderSkippedFiles = folderItem?.skipped_count ?? 0
   const folderTotalFiles = folderItem?.total_files ?? tasks.length
 
   const downloadingFiles = tasks.filter((t) => t.status === 'downloading').length
@@ -1486,10 +1572,19 @@ function updateFolderDetailStats() {
   const pausedFiles = tasks.filter((t) => t.status === 'paused').length
   const decryptingFiles = tasks.filter((t) => t.status === 'decrypting').length
   // 注意：已完成子任务可能尚未从列表移除，要排除否则会被 completedFiles 和 tasks 同时计数
-  const activeTaskCount = tasks.filter((t) => t.status !== 'completed').length
-  const notCreatedYet = Math.max(0, folderTotalFiles - folderCompletedFiles - activeTaskCount)
+  // 跳过行是合成的展示行、不是真实任务，且其文件数已由 folderSkippedFiles 单独扣除，
+  // 若计入 activeTaskCount 会让「待处理」被重复扣减
+  const activeTaskCount = tasks.filter(
+      (t) => t.status !== 'completed' && t.status !== 'skipped',
+  ).length
+  // 跳过的文件已处理完且不会产生子任务，必须一并扣除，否则“待处理”会虚高
+  const notCreatedYet = Math.max(
+      0,
+      folderTotalFiles - folderCompletedFiles - folderSkippedFiles - activeTaskCount,
+  )
 
   folderDetailDialog.value.completedFiles = folderCompletedFiles
+  folderDetailDialog.value.skippedFiles = folderSkippedFiles
   folderDetailDialog.value.downloadingFiles = downloadingFiles
   folderDetailDialog.value.pendingFiles = pendingFiles + notCreatedYet
   folderDetailDialog.value.failedFiles = failedFiles
@@ -1536,6 +1631,12 @@ function handleFolderEvent(event: FolderEvent) {
         // 🔥 只允许递增，防止延迟到达的旧 progress 回写子任务完成时的乐观 +1
         downloadItems.value[index].completed_files = Math.max(
             downloadItems.value[index].completed_files ?? 0, event.completed_files ?? 0
+        )
+        downloadItems.value[index].skipped_count = Math.max(
+            downloadItems.value[index].skipped_count ?? 0, event.skipped_files ?? 0
+        )
+        downloadItems.value[index].skipped_size = Math.max(
+            downloadItems.value[index].skipped_size ?? 0, event.skipped_size ?? 0
         )
         downloadItems.value[index].total_files = event.total_files
         downloadItems.value[index].speed = event.speed
@@ -1729,6 +1830,11 @@ onUnmounted(() => {
 </script>
 
 <style scoped lang="scss">
+
+.skipped-hint {
+  margin-left: 4px;
+  color: var(--el-color-warning);
+}
 .downloads-container {
   width: 100%;
   height: 100%;

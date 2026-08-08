@@ -4,10 +4,10 @@ use crate::autobackup::record::BackupRecordManager;
 use crate::auth::types::Uid;
 use crate::downloader::{DownloadManager, DownloadTask, TaskStatus};
 use crate::netdisk::{ClientPool, NetdiskClient};
-use crate::server::events::{FolderEvent, TaskEvent};
+use crate::server::events::{DownloadEvent, FolderEvent, TaskEvent};
 use crate::server::websocket::WebSocketManager;
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -88,6 +88,138 @@ pub struct FolderDownloadManager {
     /// 错位。
     download_manager_pool:
         Arc<RwLock<Option<Arc<dashmap::DashMap<crate::auth::Uid, Arc<DownloadManager>>>>>>,
+    /// 🔥 文件夹快照上次落盘时间（folder_id → Instant），用于 `persist_folder_throttled` 节流
+    ///
+    /// 补任务会持续从 `pending_files` 取走文件，若不落盘，重启后队列会退回旧状态并重复
+    /// 下载（issue #141）；但每完成一个子任务就全量重写快照，大文件夹（万级 pending）
+    /// 会产生大量写放大，故按时间窗口节流。
+    last_persist_at: Arc<RwLock<HashMap<String, std::time::Instant>>>,
+    /// 🔥 全局配置（延迟注入）
+    ///
+    /// 仅用于在文件夹自身未携带冲突策略时回退到用户设置的全局默认值，
+    /// 见 `resolve_conflict_strategy`。存引用而非快照，保证设置页改动即时生效。
+    app_config: Arc<RwLock<Option<Arc<RwLock<crate::config::AppConfig>>>>>,
+}
+
+/// 🔥 文件夹快照节流落盘的最小间隔
+///
+/// 崩溃最多丢失该窗口内的补任务记录；这部分由恢复时的 `reconcile_pending_files`
+/// 对账兜底，不会造成重复下载。
+const FOLDER_PERSIST_THROTTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 🔥 一批补任务的结果，用于 `refill_tasks` 判断是否需要继续补下一批
+#[derive(Debug, Default, Clone, Copy)]
+struct RefillBatch {
+    /// 本批实际创建的子任务数（仅用于日志/调试，续批决策不看它）
+    #[allow(dead_code)]
+    created: u64,
+    /// 本批因冲突策略命中"跳过"而未建任务的文件数
+    skipped: u64,
+    /// 本批因文件夹被暂停/取消/删除而中止（此时不应继续补批）
+    aborted: bool,
+}
+
+/// 🔥 广播"因冲突策略跳过某文件"事件
+///
+/// 文件夹下载跳过一个文件时不会创建子任务，前端此前收不到任何信号 —— 用户看到的就是
+/// "详情里长时间没有任务在跑"，分不清是队列卡死还是在正常跳过（issue #141 用户反馈）。
+///
+/// 做成自由函数的理由同 `persist_folder_state`：任务完成监听器拿不到 `&self`。
+async fn publish_skipped_event(
+    ws_manager: &Arc<RwLock<Option<Arc<WebSocketManager>>>>,
+    folder_id: &str,
+    relative_path: &str,
+    owner_uid: crate::auth::Uid,
+) {
+    let ws = ws_manager.read().await;
+    if let Some(ref ws) = *ws {
+        ws.send_if_subscribed(
+            TaskEvent::Download(DownloadEvent::Skipped {
+                // 跳过不产生真实任务，用带前缀的合成 ID，与单文件跳过路径保持一致
+                task_id: format!("skipped-{}", uuid::Uuid::new_v4()),
+                filename: relative_path.to_string(),
+                reason: "文件已存在".to_string(),
+                owner_uid: Some(owner_uid.raw()),
+                group_id: Some(folder_id.to_string()),
+            }),
+            None,
+        );
+    }
+}
+
+/// 🔥 解析文件夹生效的下载冲突策略（自由函数版）
+///
+/// 优先级：文件夹自身策略（创建时确定并已持久化） > 全局默认策略 > `Overwrite`。
+///
+/// 与 `persist_folder_state` 同理做成自由函数：任务完成监听器拿不到 `&self`，而它是
+/// 下载过程中建子任务的主路径，必须和 `refill_tasks` 用同一套策略，否则用户选的
+/// "跳过"只对首批任务生效，后续文件照样覆盖。
+async fn resolve_folder_conflict_strategy(
+    folders: &Arc<RwLock<HashMap<String, FolderDownload>>>,
+    app_config: &Arc<RwLock<Option<Arc<RwLock<crate::config::AppConfig>>>>>,
+    folder_id: &str,
+) -> crate::uploader::conflict::DownloadConflictStrategy {
+    if let Some(s) = {
+        let guard = folders.read().await;
+        guard.get(folder_id).and_then(|f| f.conflict_strategy)
+    } {
+        return s;
+    }
+
+    let cfg_opt = app_config.read().await.clone();
+    if let Some(cfg) = cfg_opt {
+        return cfg.read().await.conflict_strategy.default_download_strategy;
+    }
+
+    crate::uploader::conflict::DownloadConflictStrategy::Overwrite
+}
+
+/// 🔥 持久化文件夹快照（自由函数版）
+///
+/// 做成自由函数而非只有 `&self` 方法，是因为**任务完成监听器**是 `tokio::spawn` 出去的
+/// 独立任务，只持有若干 Arc 字段的克隆、拿不到 `&self`；而它恰恰是下载过程中消费
+/// `pending_files` 的主路径（每完成一个子任务就补建一个），必须能落盘，否则 issue #141
+/// 在这条路径上原样复现。
+///
+/// `throttle = true` 时，距上次落盘不足 `FOLDER_PERSIST_THROTTLE` 直接跳过。
+async fn persist_folder_state(
+    folders: &Arc<RwLock<HashMap<String, FolderDownload>>>,
+    wal_dir: &Arc<RwLock<Option<PathBuf>>>,
+    last_persist_at: &Arc<RwLock<HashMap<String, std::time::Instant>>>,
+    folder_id: &str,
+    throttle: bool,
+) {
+    if throttle {
+        let last = last_persist_at.read().await;
+        if let Some(at) = last.get(folder_id) {
+            if at.elapsed() < FOLDER_PERSIST_THROTTLE {
+                return;
+            }
+        }
+    }
+
+    let wal_dir = match wal_dir.read().await.clone() {
+        Some(dir) => dir,
+        None => return, // WAL 目录未设置，跳过持久化
+    };
+
+    let folder = {
+        let guard = folders.read().await;
+        guard.get(folder_id).cloned()
+    };
+
+    if let Some(folder) = folder {
+        let persisted = FolderPersisted::from_folder(&folder);
+        if let Err(e) = save_folder(&wal_dir, &persisted) {
+            error!("持久化文件夹 {} 失败: {}", folder_id, e);
+        }
+    }
+
+    // 记录落盘时间，避免紧接着的节流落盘做无谓的重复写
+    last_persist_at
+        .write()
+        .await
+        .insert(folder_id.to_string(), std::time::Instant::now());
 }
 
 impl FolderDownloadManager {
@@ -107,6 +239,8 @@ impl FolderDownloadManager {
             backup_record_manager: Arc::new(RwLock::new(None)),
             client_pool: Arc::new(RwLock::new(None)),
             download_manager_pool: Arc::new(RwLock::new(None)),
+            last_persist_at: Arc::new(RwLock::new(HashMap::new())),
+            app_config: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -312,29 +446,73 @@ impl FolderDownloadManager {
         *dir = Some(wal_dir);
     }
 
+    /// 🔥 注入全局配置（用于冲突策略回退，见 `resolve_conflict_strategy`）
+    pub async fn set_app_config(&self, config: Arc<RwLock<crate::config::AppConfig>>) {
+        let mut guard = self.app_config.write().await;
+        *guard = Some(config);
+    }
+
     /// 持久化文件夹状态
     async fn persist_folder(&self, folder_id: &str) {
-        let wal_dir = {
-            let dir = self.wal_dir.read().await;
-            dir.clone()
-        };
+        persist_folder_state(
+            &self.folders,
+            &self.wal_dir,
+            &self.last_persist_at,
+            folder_id,
+            false,
+        )
+            .await;
+    }
 
-        let wal_dir = match wal_dir {
-            Some(dir) => dir,
-            None => return, // WAL 目录未设置，跳过持久化
-        };
+    /// 🔥 节流持久化文件夹状态
+    ///
+    /// 与 `persist_folder` 的区别：距上次落盘不足 `FOLDER_PERSIST_THROTTLE` 时直接跳过。
+    /// 用于补任务这类高频路径——`pending_files` 每完成一个子任务就会被取走一个，
+    /// 不落盘会导致重启后队列退回旧状态并重复下载（issue #141），但每次都全量重写
+    /// 快照在万级文件夹上写放大过大。
+    async fn persist_folder_throttled(&self, folder_id: &str) {
+        persist_folder_state(
+            &self.folders,
+            &self.wal_dir,
+            &self.last_persist_at,
+            folder_id,
+            true,
+        )
+            .await;
+    }
 
-        let folder = {
+    /// 🔥 清理文件夹的节流落盘记录（文件夹被删除/取消时调用，避免 map 无限增长）
+    async fn forget_persist_state(&self, folder_id: &str) {
+        self.last_persist_at.write().await.remove(folder_id);
+    }
+
+    /// 🔥 按存活文件夹裁剪节流落盘记录
+    ///
+    /// 批量清理（如 `clear_completed_folders`）走 `retain` 直接从 folders 移除，
+    /// 不经过单个删除入口；用存活集合兜底裁剪，避免遗漏新增的移除点造成缓慢泄漏。
+    async fn prune_persist_state(&self) {
+        let alive: HashSet<String> = {
             let folders = self.folders.read().await;
-            folders.get(folder_id).cloned()
+            folders.keys().cloned().collect()
         };
+        self.last_persist_at
+            .write()
+            .await
+            .retain(|id, _| alive.contains(id));
+    }
 
-        if let Some(folder) = folder {
-            let persisted = FolderPersisted::from_folder(&folder);
-            if let Err(e) = save_folder(&wal_dir, &persisted) {
-                error!("持久化文件夹 {} 失败: {}", folder_id, e);
-            }
-        }
+    /// 🔥 解析文件夹生效的下载冲突策略
+    ///
+    /// 优先级：文件夹自身策略（创建时由前端/配置确定，并已持久化） > 全局默认策略 > `Overwrite`。
+    ///
+    /// 中间那层是给**升级前创建的旧文件夹**兜底的：它们的持久化数据里没有
+    /// `conflict_strategy` 字段，恢复后为 `None`。此时读全局配置比硬编码 `Overwrite`
+    /// 更贴近用户意图——用户在设置页选了"跳过"，就不该因为任务是升级前建的而被覆盖。
+    async fn resolve_conflict_strategy(
+        &self,
+        folder_id: &str,
+    ) -> crate::uploader::conflict::DownloadConflictStrategy {
+        resolve_folder_conflict_strategy(&self.folders, &self.app_config, folder_id).await
     }
 
     /// 删除文件夹持久化数据
@@ -649,6 +827,15 @@ impl FolderDownloadManager {
         let mut total_created = 0usize;
 
         for (folder_id, folder_owner_uid) in folder_ids {
+            // 🔥 建任务前必须先对账。
+            //
+            //    本方法在**启动恢复阶段**运行（`AppState` 恢复流程紧接 sync 之后调用），
+            //    是恢复后第一个消费 pending_files 的入口——比 resume_folder 更早。若不对账，
+            //    快照里残留的"已经下载完成/已有子任务"的条目会在这里被建成任务：既可能重复
+            //    下载，也会让这些文件的字节同时出现在 completed_downloaded_size 和活跃任务
+            //    的 active_sum 里，被 compute_downloaded_size 的 max() 永久锁成虚高进度。
+            self.reconcile_pending_files(&folder_id).await;
+
             let download_manager = match self.download_manager_for(folder_owner_uid).await {
                 Some(dm) => dm,
                 None => {
@@ -708,13 +895,55 @@ impl FolderDownloadManager {
                 existing_count
             );
 
+            // 🔥 冲突策略：与 refill_tasks / 任务完成监听器保持一致，
+            //    否则恢复模式预建的任务会无视用户选的"跳过"直接覆盖本地已有文件（issue #141）
+            let conflict_strategy = self.resolve_conflict_strategy(&folder_id).await;
+
             // 创建暂停状态的任务
             let mut created_count = 0u64;
+            let mut skipped_count = 0u64;
+            let mut skipped_bytes = 0u64;
+            let mut skipped_list: Vec<crate::downloader::folder::SkippedFile> = Vec::new();
             for pending_file in files_to_create {
                 let local_path = local_root.join(&pending_file.relative_path);
 
+                // 🔥 应用冲突策略
+                let final_local_path = {
+                    use crate::uploader::conflict_resolver::ConflictResolver;
+                    match ConflictResolver::resolve_download_conflict(&local_path, conflict_strategy)
+                    {
+                        Ok(crate::uploader::conflict::ConflictResolution::Proceed) => local_path,
+                        Ok(crate::uploader::conflict::ConflictResolution::Skip) => {
+                            info!("跳过下载（文件已存在）: {:?}", local_path);
+                            skipped_count += 1;
+                            skipped_bytes += pending_file.size;
+                            skipped_list.push(crate::downloader::folder::SkippedFile {
+                                relative_path: pending_file.relative_path.clone(),
+                                size: pending_file.size,
+                                skipped_at: chrono::Utc::now().timestamp(),
+                            });
+                            publish_skipped_event(
+                                &self.ws_manager,
+                                &folder_id,
+                                &pending_file.relative_path,
+                                folder_owner_uid,
+                            )
+                                .await;
+                            continue;
+                        }
+                        Ok(crate::uploader::conflict::ConflictResolution::UseNewPath(new_path)) => {
+                            info!("自动重命名下载路径: {:?} -> {}", local_path, new_path);
+                            PathBuf::from(new_path)
+                        }
+                        Err(e) => {
+                            warn!("冲突解决失败: {}, 使用原路径", e);
+                            local_path
+                        }
+                    }
+                };
+
                 // 确保目录存在
-                if let Some(parent) = local_path.parent() {
+                if let Some(parent) = final_local_path.parent() {
                     if let Err(e) = tokio::fs::create_dir_all(parent).await {
                         error!("创建目录失败: {:?}, 错误: {}", parent, e);
                         continue;
@@ -724,7 +953,7 @@ impl FolderDownloadManager {
                 let mut task = DownloadTask::new_with_group(
                     pending_file.fs_id,
                     pending_file.remote_path.clone(),
-                    local_path,
+                    final_local_path,
                     pending_file.size,
                     folder_id.clone(),
                     group_root.clone(),
@@ -744,17 +973,27 @@ impl FolderDownloadManager {
                 }
             }
 
-            // 更新已创建计数
-            if created_count > 0 {
-                let mut folders = self.folders.write().await;
-                if let Some(folder) = folders.get_mut(&folder_id) {
-                    folder.created_count += created_count;
+            // 更新已创建 / 跳过计数
+            if created_count > 0 || skipped_count > 0 {
+                {
+                    let mut folders = self.folders.write().await;
+                    if let Some(folder) = folders.get_mut(&folder_id) {
+                        folder.created_count += created_count;
+                        folder.skipped_count += skipped_count;
+                        folder.skipped_size += skipped_bytes;
+                        folder.skipped_entries.append(&mut skipped_list);
+                    }
                 }
                 total_created += created_count as usize;
                 info!(
-                    "恢复模式补任务完成: 文件夹 {} 创建了 {} 个暂停任务",
-                    folder_id, created_count
+                    "恢复模式补任务完成: 文件夹 {} 创建了 {} 个暂停任务, 跳过 {} 个已存在文件",
+                    folder_id, created_count, skipped_count
                 );
+
+                // 🔥 本路径同样从 pending_files 取走了文件，必须落盘。
+                //    它在启动恢复阶段运行，若不落盘，紧接着的一次强杀会让队列退回
+                //    上次的旧状态并重复下载（issue #141）。
+                self.persist_folder(&folder_id).await;
             }
         }
 
@@ -874,6 +1113,8 @@ impl FolderDownloadManager {
         let download_manager_pool = self.download_manager_pool.clone();
         let download_manager_legacy = self.download_manager.clone();
         let ws_manager = self.ws_manager.clone();
+        let wal_dir = self.wal_dir.clone();
+        let last_persist_at = self.last_persist_at.clone();
 
         tokio::spawn(async move {
             while let Some(folder_id) = rx.recv().await {
@@ -886,16 +1127,26 @@ impl FolderDownloadManager {
                             f.total_size,
                             f.status.clone(),
                             f.completed_count,
+                            f.skipped_count,
+                            f.skipped_size,
                             f.owner_uid.raw(),
                             f.owner_uid,
                         )
                     })
                 };
-                let (total_files, total_size, status, completed_files, owner_uid_raw, owner_uid) =
-                    match folder_meta {
-                        Some(info) => info,
-                        None => continue,
-                    };
+                let (
+                    total_files,
+                    total_size,
+                    status,
+                    completed_files,
+                    skipped_files,
+                    skipped_size,
+                    owner_uid_raw,
+                    owner_uid,
+                ) = match folder_meta {
+                    Some(info) => info,
+                    None => continue,
+                };
 
                 // 路由 manager（pool 注入则严格按 owner_uid；未注入退回 legacy 单例）
                 let dm = {
@@ -957,6 +1208,8 @@ impl FolderDownloadManager {
                         downloaded_size,
                         total_size,
                         completed_files,
+                        skipped_files,
+                        skipped_size,
                         total_files,
                         speed,
                         status: format!("{:?}", status).to_lowercase(),
@@ -965,6 +1218,16 @@ impl FolderDownloadManager {
                     }),
                     None,
                 );
+
+                // 🔥 downloaded_size 只在本监听器里增长，必须在这里落盘。
+                //
+                //    补任务路径的落盘只在「从 pending_files 取走文件」时触发；一旦所有子任务
+                //    都已创建（pending 为空），就再也不会 drain、也就再也不落盘，导致
+                //    downloaded_size 在磁盘上永久停在最后一次建任务时的值 —— 强杀重启后
+                //    进度回退到那个旧值（实测连续三次重启都回到同一个字节数）。
+                //
+                //    走节流版本：本监听器由子任务进度节流器驱动，频率很高。
+                persist_folder_state(&folders, &wal_dir, &last_persist_at, &folder_id, true).await;
             }
         });
     }
@@ -984,6 +1247,8 @@ impl FolderDownloadManager {
         let wal_dir = self.wal_dir.clone();
         let ws_manager = self.ws_manager.clone();
         let cancellation_tokens = self.cancellation_tokens.clone();
+        let last_persist_at = self.last_persist_at.clone();
+        let app_config = self.app_config.clone();
 
         tokio::spawn(async move {
             while let Some((group_id, task_id, file_size, is_success)) = rx.recv().await {
@@ -1175,7 +1440,7 @@ impl FolderDownloadManager {
                     if folder.pending_files.is_empty()
                         && folder.scan_completed
                         && active_count == 0
-                        && completed_count == folder.total_files
+                        && completed_count + folder.skipped_count == folder.total_files
                     {
                         let old_status = format!("{:?}", folder.status).to_lowercase();
                         folder.mark_completed();
@@ -1244,7 +1509,8 @@ impl FolderDownloadManager {
                         && folder.scan_completed
                         && active_count == 0
                         && folder.failed_count > 0
-                        && (folder.completed_count + folder.failed_count) >= folder.total_files
+                        && (folder.completed_count + folder.skipped_count + folder.failed_count)
+                        >= folder.total_files
                     {
                         let old_status = format!("{:?}", folder.status).to_lowercase();
                         let error_msg = format!("{} 个文件下载失败", folder.failed_count);
@@ -1346,36 +1612,97 @@ impl FolderDownloadManager {
                 let (files, local_root, group_root, folder_owner_uid) = files_to_create;
                 let total_files = files.len();
                 let mut created_count = 0u64;
+                // 🔥 命中"跳过"策略而未建任务的文件数（计入完成数，理由见 refill_tasks 同名变量）
+                let mut skipped_count = 0u64;
+                let mut skipped_bytes = 0u64;
+                let mut skipped_list: Vec<crate::downloader::folder::SkippedFile> = Vec::new();
+                // 🔥 中止时尚未处理的文件，循环后归还队列（文件已 drain 出来，丢了就永久丢失）
+                let mut aborted_remainder = Vec::new();
+
+                // 🔥 冲突策略：本批次内是常量，提前解析一次。
+                //    这条路径以前**完全不做冲突判定**，导致用户选的"跳过"只对
+                //    扫描完成时 refill 的首批任务生效，之后每个补建的任务都直接覆盖
+                //    本地已存在的同名文件（issue #141）。
+                let conflict_strategy =
+                    resolve_folder_conflict_strategy(&folders, &app_config, &group_id).await;
 
                 // 创建任务
-                for file_to_create in files {
+                let mut files_iter = files.into_iter();
+                while let Some(file_to_create) = files_iter.next() {
                     // ✅ 创建任务前再次检查状态，防止竞态条件
                     // 场景：取出文件后、创建任务前，pause_folder 可能已更新状态
                     {
                         let folders_guard = folders.read().await;
-                        if let Some(folder) = folders_guard.get(&group_id) {
-                            if folder.status == FolderStatus::Paused
-                                || folder.status == FolderStatus::Cancelled
-                                || folder.status == FolderStatus::Failed
-                            {
-                                info!(
-                                    "文件夹 {} 状态已变为 {:?}，放弃创建剩余 {} 个任务",
-                                    group_id,
-                                    folder.status,
-                                    total_files - created_count as usize
-                                );
-                                break;
+                        let should_abort = match folders_guard.get(&group_id) {
+                            Some(folder) => {
+                                let aborted = folder.status == FolderStatus::Paused
+                                    || folder.status == FolderStatus::Cancelled
+                                    || folder.status == FolderStatus::Failed;
+                                if aborted {
+                                    info!(
+                                        "文件夹 {} 状态已变为 {:?}，放弃创建剩余 {} 个任务",
+                                        group_id,
+                                        folder.status,
+                                        total_files - created_count as usize
+                                    );
+                                }
+                                aborted
                             }
-                        } else {
                             // 文件夹已被删除
+                            None => true,
+                        };
+
+                        if should_abort {
+                            drop(folders_guard);
+                            aborted_remainder.push(file_to_create);
+                            aborted_remainder.extend(files_iter.by_ref());
                             break;
                         }
                     }
 
                     let local_path = local_root.join(&file_to_create.relative_path);
 
+                    // 🔥 应用冲突策略（与 refill_tasks 保持一致）
+                    let final_local_path = {
+                        use crate::uploader::conflict_resolver::ConflictResolver;
+                        match ConflictResolver::resolve_download_conflict(
+                            &local_path,
+                            conflict_strategy,
+                        ) {
+                            Ok(crate::uploader::conflict::ConflictResolution::Proceed) => local_path,
+                            Ok(crate::uploader::conflict::ConflictResolution::Skip) => {
+                                info!("跳过下载（文件已存在）: {:?}", local_path);
+                                skipped_count += 1;
+                                skipped_bytes += file_to_create.size;
+                                skipped_list.push(crate::downloader::folder::SkippedFile {
+                                    relative_path: file_to_create.relative_path.clone(),
+                                    size: file_to_create.size,
+                                    skipped_at: chrono::Utc::now().timestamp(),
+                                });
+                                publish_skipped_event(
+                                    &ws_manager,
+                                    &group_id,
+                                    &file_to_create.relative_path,
+                                    folder_owner_uid,
+                                )
+                                    .await;
+                                continue;
+                            }
+                            Ok(crate::uploader::conflict::ConflictResolution::UseNewPath(
+                                   new_path,
+                               )) => {
+                                info!("自动重命名下载路径: {:?} -> {}", local_path, new_path);
+                                PathBuf::from(new_path)
+                            }
+                            Err(e) => {
+                                warn!("冲突解决失败: {}, 使用原路径", e);
+                                local_path
+                            }
+                        }
+                    };
+
                     // 确保目录存在
-                    if let Some(parent) = local_path.parent() {
+                    if let Some(parent) = final_local_path.parent() {
                         if let Err(e) = tokio::fs::create_dir_all(parent).await {
                             error!("创建目录失败: {:?}, 错误: {}", parent, e);
                             continue;
@@ -1385,7 +1712,7 @@ impl FolderDownloadManager {
                     let mut task = DownloadTask::new_with_group(
                         file_to_create.fs_id,
                         file_to_create.remote_path.clone(),
-                        local_path,
+                        final_local_path,
                         file_to_create.size,
                         group_id.clone(),
                         group_root.clone(),
@@ -1493,16 +1820,50 @@ impl FolderDownloadManager {
                     }
                 }
 
-                // 更新已创建计数
-                if created_count > 0 {
+                // 更新已创建/跳过计数，并归还中止时未处理的文件
+                let returned_count = {
                     let mut folders_guard = folders.write().await;
-                    if let Some(folder) = folders_guard.get_mut(&group_id) {
-                        folder.created_count += created_count;
+                    match folders_guard.get_mut(&group_id) {
+                        Some(folder) => {
+                            folder.created_count += created_count;
+                            folder.skipped_count += skipped_count;
+                            folder.skipped_size += skipped_bytes;
+                            folder.skipped_entries.append(&mut skipped_list);
+
+                            let returned = aborted_remainder.len();
+                            if returned > 0 {
+                                // 放回队首，保持扫描时按相对路径排好的下载顺序
+                                aborted_remainder.append(&mut folder.pending_files);
+                                folder.pending_files = aborted_remainder;
+                            }
+                            returned
+                        }
+                        // 文件夹已被删除，归还无意义
+                        None => 0,
                     }
+                };
+
+                if created_count > 0 || skipped_count > 0 || returned_count > 0 {
                     info!(
-                        "已补充{}个任务到文件夹 {} (可用槽位: {})",
-                        created_count, group_id, available
+                        "已补充{}个任务到文件夹 {} (跳过 {}, 归还 {}, 可用槽位: {})",
+                        created_count, group_id, skipped_count, returned_count, available
                     );
+
+                    // 🔥 本路径已经从 pending_files 取走了文件，必须落盘，否则重启后队列
+                    //    退回旧状态并重复下载（issue #141）。这是下载过程中消费 pending
+                    //    的主路径——每完成一个子任务就补建一个，此前完全没有落盘。
+                    //
+                    //    归还路径无条件落盘：中止通常由 pause_folder 触发，而它在这里归还
+                    //    文件**之前**就已落过盘，那份快照里没有这批在途文件，被节流挡掉
+                    //    就等于丢失。
+                    persist_folder_state(
+                        &folders,
+                        &wal_dir,
+                        &last_persist_at,
+                        &group_id,
+                        returned_count == 0,
+                    )
+                        .await;
                 }
             }
         });
@@ -1902,6 +2263,8 @@ impl FolderDownloadManager {
             backup_record_manager: self.backup_record_manager.clone(),
             client_pool: self.client_pool.clone(),
             download_manager_pool: self.download_manager_pool.clone(),
+            last_persist_at: self.last_persist_at.clone(),
+            app_config: self.app_config.clone(),
         };
         let folder_id_clone = folder_id.clone();
 
@@ -1946,19 +2309,30 @@ impl FolderDownloadManager {
 
     /// 递归扫描文件夹并创建任务（边扫描边创建）
     async fn scan_folder_and_create_tasks(&self, folder_id: &str) -> Result<()> {
-        let (remote_root, local_root) = {
+        let (remote_root, local_root, owner_uid) = {
             let folders = self.folders.read().await;
             let folder = folders
                 .get(folder_id)
                 .ok_or_else(|| anyhow!("文件夹不存在"))?;
-            (folder.remote_root.clone(), folder.local_root.clone())
+            (
+                folder.remote_root.clone(),
+                folder.local_root.clone(),
+                folder.owner_uid,
+            )
         };
 
-        // 获取网盘客户端
-        let client = {
-            let nc = self.netdisk_client.read().await;
-            nc.clone().ok_or_else(|| anyhow!("网盘客户端未初始化"))?
-        };
+        // 🔥 按 folder.owner_uid 路由网盘客户端
+        //
+        // 不能直接读 `self.netdisk_client`：那是 legacy 全局单例，只在启动时注入一次，
+        // 携带的是**启动时**的活跃账号凭证。切换账号后它不会更新（切号只重新注入了
+        // DownloadManager 池和事件 sender），扫描就会拿旧账号的凭证去列新账号的目录，
+        // 稳定返回 `API error -9`（文件不存在），并且重试多少次都救不回来。
+        //
+        // `client_for` 优先从 per-uid 池取，池未注入时才回退到 legacy 单例。
+        let client = self
+            .client_for(owner_uid)
+            .await
+            .ok_or_else(|| anyhow!("网盘客户端未初始化（owner_uid={}）", owner_uid.raw()))?;
 
         // 创建取消令牌
         let cancel_token = CancellationToken::new();
@@ -2013,6 +2387,11 @@ impl FolderDownloadManager {
         if let Err(e) = self.rename_encrypted_folders_and_update_paths(folder_id).await {
             warn!("重命名加密文件夹失败: {}", e);
         }
+
+        // 🔥 补任务前对账：本方法也会被"重启时扫描未完成的文件夹"复用（恢复后重新扫描），
+        //    此时队列里可能混有上次运行已经下载完成的文件，直接建任务会重复下载。
+        //    全新文件夹没有任何子任务/历史记录，对账会立即返回，无额外开销。
+        self.reconcile_pending_files(folder_id).await;
 
         // 扫描完成后，立即创建前10个任务
         if let Err(e) = self.refill_tasks(folder_id, 10).await {
@@ -2293,8 +2672,10 @@ impl FolderDownloadManager {
         folders.retain(|_, folder| folder.status != FolderStatus::Completed);
 
         let removed = before_count - folders.len();
+        drop(folders);
         if removed > 0 {
             info!("从内存中清除了 {} 个已完成的文件夹", removed);
+            self.prune_persist_state().await;
         }
         removed
     }
@@ -2312,7 +2693,9 @@ impl FolderDownloadManager {
         });
 
         let removed = before_count - folders.len();
+        drop(folders);
         if removed > 0 {
+            self.prune_persist_state().await;
             info!(
                 "从内存中清除了 {} 个已完成的文件夹（owner_uid={}）",
                 removed,
@@ -2969,6 +3352,8 @@ impl FolderDownloadManager {
                 backup_record_manager: self.backup_record_manager.clone(),
                 client_pool: self.client_pool.clone(),
                 download_manager_pool: self.download_manager_pool.clone(),
+                last_persist_at: self.last_persist_at.clone(),
+                app_config: self.app_config.clone(),
             };
             let folder_id = folder_id.to_string();
 
@@ -2978,6 +3363,12 @@ impl FolderDownloadManager {
                 }
             });
         } else {
+            // 🔥 补任务之前先对账 pending_files：重启恢复后的队列可能仍包含已经转成
+            //    子任务、甚至已下载完成的文件，直接补任务会重复下载（issue #141）。
+            //    继续/恢复是本文件夹重新开始产出子任务的唯一入口，放在这里可覆盖
+            //    "重启 → 恢复为 Paused → 用户点继续" 这条链路。
+            self.reconcile_pending_files(folder_id).await;
+
             // 如果扫描已完成，补充任务到10个
             if let Err(e) = self.refill_tasks(folder_id, 10).await {
                 warn!("恢复时补充任务失败: {}", e);
@@ -3089,6 +3480,7 @@ impl FolderDownloadManager {
             info!("已从 folders HashMap 中移除已取消的文件夹: {}", folder_id);
             removed.map(|f| f.owner_uid.raw())
         };
+        self.forget_persist_state(folder_id).await;
 
         // 🔥 发布删除事件（取消视为删除）
         self.publish_event(FolderEvent::Deleted {
@@ -3142,6 +3534,7 @@ impl FolderDownloadManager {
         // 🔥 remove 时取出 owner_uid 用于事件
         let owner_uid_raw_opt: Option<u64> = folders.remove(folder_id).map(|f| f.owner_uid.raw());
         drop(folders);
+        self.forget_persist_state(folder_id).await;
 
         // 删除持久化文件
         self.delete_folder_persistence(folder_id).await;
@@ -3194,11 +3587,128 @@ impl FolderDownloadManager {
         Ok(())
     }
 
+    /// 🔥 对账 `pending_files`：剔除已经有子任务承载的文件
+    ///
+    /// **背景（issue #141）**：`pending_files` 是文件夹自己的快照，而子任务走的是
+    /// 独立的 WAL/历史库两套持久化。快照落盘是有节流和时机的，崩溃或强杀（`docker
+    /// restart` 发 SIGTERM，PID 1 无 handler → SIGKILL）时，恢复出来的队列可能仍包含
+    /// 那些**已经转成子任务、甚至已经下载完成**的文件。这些文件一旦被重新排进队列，
+    /// 补任务只剩冲突策略一道闸门，策略若是 `Overwrite` 就会把本地已下好的文件重下一遍。
+    ///
+    /// 因此在文件夹恢复运行前做一次对账，剔除两类文件：
+    /// - 已有活跃/已恢复子任务的（`DownloadManager` 内存表）——否则会出现两个任务写同一路径
+    /// - 已完成并归档到历史库的（完成后会从内存表移除，只能从历史库查）
+    ///
+    /// 同时把 `completed_count` 校正到历史库的真实完成数，否则剔除文件后
+    /// `completed_count + failed_count` 永远够不到 `total_files`，文件夹到不了终态。
+    ///
+    /// 只在恢复/继续这类低频路径调用（O(pending) 一次），不进补任务热路径。
+    async fn reconcile_pending_files(&self, folder_id: &str) {
+        let (owner_uid, pending_before) = {
+            let folders = self.folders.read().await;
+            match folders.get(folder_id) {
+                Some(f) => (f.owner_uid, f.pending_files.len()),
+                None => return,
+            }
+        };
+
+        if pending_before == 0 {
+            return;
+        }
+
+        // 1) 已有子任务承载的相对路径（活跃 + 已恢复）
+        let mut covered: HashSet<String> = HashSet::new();
+        if let Some(dm) = self.download_manager_for(owner_uid).await {
+            for task in dm.get_tasks_by_group(folder_id).await {
+                if let Some(rp) = task.relative_path {
+                    covered.insert(rp);
+                }
+            }
+        }
+
+        // 2) 已完成并归档到历史库的相对路径
+        let mut history_completed = 0usize;
+        let pm_opt = self.persistence_manager.read().await.clone();
+        if let Some(pm) = pm_opt {
+            let pm_guard = pm.lock().await;
+            if let Some(db) = pm_guard.history_db() {
+                match db.get_completed_relative_paths_by_group(folder_id) {
+                    Ok(paths) => {
+                        history_completed = paths.len();
+                        covered.extend(paths);
+                    }
+                    Err(e) => {
+                        // 查不到就退化为"只按活跃任务对账"，宁可少剔除也不误删待下载文件
+                        warn!("查询文件夹 {} 已完成子任务历史失败: {}", folder_id, e);
+                    }
+                }
+            }
+        }
+
+        if covered.is_empty() {
+            return;
+        }
+
+        // 3) 剔除 + 校正完成数
+        let (removed, pending_after, completed_count) = {
+            let mut folders = self.folders.write().await;
+            let folder = match folders.get_mut(folder_id) {
+                Some(f) => f,
+                None => return,
+            };
+
+            folder
+                .pending_files
+                .retain(|pf| !covered.contains(&pf.relative_path));
+
+            let pending_after = folder.pending_files.len();
+            let removed = pending_before.saturating_sub(pending_after);
+
+            // 历史库的完成数是权威值（已完成子任务归档后会从内存表移除）；
+            // 取 max 防止历史被清理过导致计数倒退。
+            if (history_completed as u64) > folder.completed_count {
+                folder.completed_count = history_completed as u64;
+            }
+
+            (removed, pending_after, folder.completed_count)
+        };
+
+        if removed > 0 {
+            info!(
+                "文件夹 {} pending 对账: 剔除 {} 个已有任务/已完成的文件 ({} → {}), completed_count={}",
+                folder_id, removed, pending_before, pending_after, completed_count
+            );
+            self.persist_folder(folder_id).await;
+        }
+    }
+
     /// 补充任务：保持文件夹有指定数量的活跃任务
     ///
     /// 这是核心方法：检查活跃任务数，如果不足就从 pending_files 补充
     /// 🔥 修复：在分配借调位前，收集所有子任务已占用的槽位，避免重复分配
     async fn refill_tasks(&self, folder_id: &str, target_count: usize) -> Result<()> {
+        // 🔥 循环补批：命中"跳过"的文件不会占用槽位，若只补一批就返回，整批全被跳过时
+        //    既没有子任务、也就没有完成事件来驱动下一次补任务，文件夹会卡在
+        //    downloading 且详情里一个任务都看不到（issue #141 用户反馈的"长时间看不到
+        //    任务在进行"）。这里持续补到槽位填满或 pending 取空为止。
+        //
+        //    终止性：每轮 skipped > 0 意味着至少从 pending 取走了一个文件，pending 单调
+        //    减少；取空后 batch 会走 to_create == 0 的早退，skipped 归零跳出。
+        loop {
+            let batch = self.refill_tasks_batch(folder_id, target_count).await?;
+            if batch.aborted || batch.skipped == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// 补充任务：单批次实现，返回本批的创建/跳过/中止情况供 `refill_tasks` 决定是否续批
+    async fn refill_tasks_batch(
+        &self,
+        folder_id: &str,
+        target_count: usize,
+    ) -> Result<RefillBatch> {
         // 🔥 先取 folder.owner_uid，按 uid 路由 download_manager
         let folder_owner_uid_for_routing = {
             let folders = self.folders.read().await;
@@ -3233,7 +3743,7 @@ impl FolderDownloadManager {
 
         // 如果已经足够，不需要补充
         if active_count >= target_count {
-            return Ok(());
+            return Ok(RefillBatch::default());
         }
 
         // 计算需要补充的数量
@@ -3251,12 +3761,12 @@ impl FolderDownloadManager {
                 || folder.status == FolderStatus::Cancelled
                 || folder.status == FolderStatus::Failed
             {
-                return Ok(());
+                return Ok(RefillBatch::default());
             }
 
             let to_create = needed.min(folder.pending_files.len());
             if to_create == 0 {
-                return Ok(());
+                return Ok(RefillBatch::default());
             }
 
             let files = folder.pending_files.drain(..to_create).collect::<Vec<_>>();
@@ -3264,8 +3774,12 @@ impl FolderDownloadManager {
         };
 
         if files_to_create.is_empty() {
-            return Ok(());
+            return Ok(RefillBatch::default());
         }
+
+        // 🔥 冲突策略在本批次内是常量，提前解析一次：
+        //    既避免每个文件重复取 folders 读锁，也避免在持有 folders 锁时再去读配置锁。
+        let conflict_strategy = self.resolve_conflict_strategy(folder_id).await;
 
         info!(
             "补充任务: 文件夹 {} 需要 {} 个任务 (当前活跃: {}/{})",
@@ -3277,24 +3791,44 @@ impl FolderDownloadManager {
 
         // 批量创建任务
         let mut created_count = 0u64;
-        for pending_file in files_to_create {
+        // 🔥 因冲突策略命中"跳过"而未建任务的文件数（计入完成数，见下方 Skip 分支）
+        let mut skipped_count = 0u64;
+        let mut skipped_bytes = 0u64;
+        let mut skipped_list: Vec<crate::downloader::folder::SkippedFile> = Vec::new();
+        // 🔥 中途中止（暂停/取消）时尚未处理的文件，循环结束后归还给 pending_files
+        //
+        //    文件是在循环**之前**就从 pending_files 一次性 drain 出来的，中止时若直接丢弃，
+        //    这些文件既不在队列里也没有对应任务，永久丢失 → 文件夹凑不满 total_files，
+        //    永远到不了终态。以前快照不落盘，重启还能从旧快照"救"回来；现在快照是准的，
+        //    丢失会被持久化下来，必须显式归还。
+        let mut aborted_remainder = Vec::new();
+        let mut files_iter = files_to_create.into_iter();
+        while let Some(pending_file) = files_iter.next() {
             // ✅ 创建任务前再次检查状态，防止竞态条件
             // 场景：取出文件后、创建任务前，pause_folder 可能已更新状态
             {
                 let folders_guard = self.folders.read().await;
-                if let Some(folder) = folders_guard.get(folder_id) {
-                    if folder.status == FolderStatus::Paused
-                        || folder.status == FolderStatus::Cancelled
-                        || folder.status == FolderStatus::Failed
-                    {
-                        info!(
-                            "文件夹 {} 状态已变为 {:?}，放弃创建剩余任务",
-                            folder_id, folder.status
-                        );
-                        break;
+                let should_abort = match folders_guard.get(folder_id) {
+                    Some(folder) => {
+                        let aborted = folder.status == FolderStatus::Paused
+                            || folder.status == FolderStatus::Cancelled
+                            || folder.status == FolderStatus::Failed;
+                        if aborted {
+                            info!(
+                                "文件夹 {} 状态已变为 {:?}，放弃创建剩余任务",
+                                folder_id, folder.status
+                            );
+                        }
+                        aborted
                     }
-                } else {
                     // 文件夹已被删除
+                    None => true,
+                };
+
+                if should_abort {
+                    drop(folders_guard);
+                    aborted_remainder.push(pending_file);
+                    aborted_remainder.extend(files_iter.by_ref());
                     break;
                 }
             }
@@ -3303,17 +3837,29 @@ impl FolderDownloadManager {
 
             // 🔥 应用冲突策略
             let final_local_path = {
-                let folders_guard = self.folders.read().await;
-                let strategy = folders_guard
-                    .get(folder_id)
-                    .and_then(|f| f.conflict_strategy)
-                    .unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
-
                 use crate::uploader::conflict_resolver::ConflictResolver;
-                match ConflictResolver::resolve_download_conflict(&local_path, strategy) {
+                match ConflictResolver::resolve_download_conflict(&local_path, conflict_strategy) {
                     Ok(crate::uploader::conflict::ConflictResolution::Proceed) => local_path,
                     Ok(crate::uploader::conflict::ConflictResolution::Skip) => {
                         info!("跳过下载（文件已存在）: {:?}", local_path);
+                        // 🔥 跳过的文件同样是"处理完毕"，必须计入 skipped_count。
+                        //    total_files 在扫描时已包含它们，若不计数，
+                        //    completed+skipped+failed 永远够不到 total_files，
+                        //    文件夹会卡在 downloading 永远不终态。
+                        skipped_count += 1;
+                        skipped_bytes += pending_file.size;
+                        skipped_list.push(crate::downloader::folder::SkippedFile {
+                            relative_path: pending_file.relative_path.clone(),
+                            size: pending_file.size,
+                            skipped_at: chrono::Utc::now().timestamp(),
+                        });
+                        publish_skipped_event(
+                            &self.ws_manager,
+                            folder_id,
+                            &pending_file.relative_path,
+                            folder_owner_uid,
+                        )
+                            .await;
                         continue; // 跳过此文件，继续下一个
                     }
                     Ok(crate::uploader::conflict::ConflictResolution::UseNewPath(new_path)) => {
@@ -3444,20 +3990,64 @@ impl FolderDownloadManager {
             }
         }
 
-        // 更新已创建计数
-        {
+        // 更新已创建计数 / 跳过计数，并归还中止时未处理的文件
+        let returned_count = {
             let mut folders = self.folders.write().await;
-            if let Some(folder) = folders.get_mut(folder_id) {
-                folder.created_count += created_count;
+            match folders.get_mut(folder_id) {
+                Some(folder) => {
+                    folder.created_count += created_count;
+                    folder.skipped_count += skipped_count;
+                    folder.skipped_size += skipped_bytes;
+                    folder.skipped_entries.append(&mut skipped_list);
+
+                    let returned = aborted_remainder.len();
+                    if returned > 0 {
+                        info!(
+                            "文件夹 {} 中止补任务，归还 {} 个未处理文件到队列",
+                            folder_id, returned
+                        );
+                        // 放回队首：pending_files 在扫描完成时按相对路径排过序，
+                        // 归还到队尾会打乱下载顺序
+                        aborted_remainder.append(&mut folder.pending_files);
+                        folder.pending_files = aborted_remainder;
+                    }
+                    returned
+                }
+                // 文件夹已被删除，归还无意义
+                None => 0,
             }
-        }
+        };
 
         info!(
-            "补充任务完成: 文件夹 {} 成功创建 {} 个任务",
-            folder_id, created_count
+            "补充任务完成: 文件夹 {} 成功创建 {} 个任务, 跳过 {} 个已存在文件",
+            folder_id, created_count, skipped_count
         );
 
-        Ok(())
+        // 🔥 批次内全部命中跳过时不会有子任务完成事件来驱动终态检查，
+        //    这里主动触发一次，否则文件夹会停在 downloading。
+        if created_count == 0 && skipped_count > 0 {
+            self.finalize_folder_if_done(folder_id).await;
+        }
+
+        // 🔥 补任务已经从 pending_files 取走了文件，必须落盘。
+        //    否则重启后恢复出的队列会退回到上次落盘时的旧状态，把已下好的文件重新排进
+        //    任务队列重复下载（issue #141）。
+        if returned_count > 0 {
+            // 归还路径必须无条件落盘：中止通常由 pause_folder 触发，而它在本方法归还
+            // 文件**之前**就已经落过盘了，那份快照里恰好没有这批在途文件。若这里被节流
+            // 挡掉，归还就只存在于内存，重启后这些文件仍然丢失。
+            self.persist_folder(folder_id).await;
+        } else {
+            // 常规路径走节流版本，避免大文件夹写放大；节流窗口内崩溃丢失的那部分
+            // 由恢复时的 reconcile_pending_files 对账兜底。
+            self.persist_folder_throttled(folder_id).await;
+        }
+
+        Ok(RefillBatch {
+            created: created_count,
+            skipped: skipped_count,
+            aborted: returned_count > 0,
+        })
     }
 
     /// 更新文件夹的下载进度（定期调用）
@@ -3487,10 +4077,8 @@ impl FolderDownloadManager {
 
         let tasks = download_manager.get_tasks_by_group(folder_id).await;
 
-        let (should_persist, old_status) = {
+        {
             let mut folders = self.folders.write().await;
-            let mut should_persist = false;
-            let mut old_status = String::new();
             if let Some(folder) = folders.get_mut(folder_id) {
                 // 🔥 不再从 tasks 重新计算 completed_count，因为已完成的任务会从内存移除
                 // completed_count 由 start_task_completed_listener 递增维护
@@ -3503,11 +4091,38 @@ impl FolderDownloadManager {
                     tasks.iter().map(|t| (t.id.as_str(), t.downloaded_size)),
                 );
                 folder.compute_downloaded_size(active_downloaded);
+            }
+        }
 
+        self.finalize_folder_if_done(folder_id).await;
+
+        // 补充任务：保持10个活跃任务（完成1个，进1个）
+        if let Err(e) = self.refill_tasks(folder_id, 10).await {
+            warn!("补充任务失败: {}", e);
+        }
+
+        Ok(())
+    }
+
+    /// 🔥 检查文件夹是否已全部处理完毕，是则置终态、落盘并发布事件
+    ///
+    /// 从 `update_folder_progress` 抽出，供两处复用：
+    /// - `update_folder_progress`：子任务完成事件驱动的常规路径
+    /// - `refill_tasks`：整批文件都命中冲突策略"跳过"时，不会有任何子任务完成事件来
+    ///   驱动终态检查，需要主动调用，否则文件夹卡在 downloading（issue #141 连带问题）
+    ///
+    /// 注意：本方法**不能**调用 `refill_tasks`，否则与 `refill_tasks` 形成异步递归。
+    async fn finalize_folder_if_done(&self, folder_id: &str) {
+        let (should_persist, old_status) = {
+            let mut folders = self.folders.write().await;
+            let mut should_persist = false;
+            let mut old_status = String::new();
+            if let Some(folder) = folders.get_mut(folder_id) {
                 // 检查是否全部完成（成功 + 失败 >= 总数）
                 if folder.scan_completed
                     && folder.pending_files.is_empty()
-                    && (folder.completed_count + folder.failed_count) >= folder.total_files
+                    && (folder.completed_count + folder.skipped_count + folder.failed_count)
+                    >= folder.total_files
                     && folder.status != FolderStatus::Completed
                     && folder.status != FolderStatus::Failed
                     && folder.status != FolderStatus::Cancelled
@@ -3529,70 +4144,65 @@ impl FolderDownloadManager {
             (should_persist, old_status)
         };
 
+        if !should_persist {
+            return;
+        }
+
         // 终态时更新持久化文件
-        if should_persist {
-            self.persist_folder(folder_id).await;
+        self.persist_folder(folder_id).await;
 
-            // 🔥 清理取消令牌，避免内存泄漏
-            self.cancellation_tokens.write().await.remove(folder_id);
+        // 🔥 清理取消令牌，避免内存泄漏
+        self.cancellation_tokens.write().await.remove(folder_id);
 
-            // 🔥 读取实际的新状态
-            // 🔥 同时取出 owner_uid 用于事件
-            let (new_status, owner_uid_raw_opt) = {
+        // 🔥 读取实际的新状态
+        // 🔥 同时取出 owner_uid 用于事件
+        let (new_status, owner_uid_raw_opt) = {
+            let folders = self.folders.read().await;
+            match folders.get(folder_id) {
+                Some(f) => (
+                    format!("{:?}", f.status).to_lowercase(),
+                    Some(f.owner_uid.raw()),
+                ),
+                None => (String::new(), None),
+            }
+        };
+
+        // 🔥 发布状态变更事件
+        if !old_status.is_empty() {
+            self.publish_event(FolderEvent::StatusChanged {
+                folder_id: folder_id.to_string(),
+                old_status,
+                new_status: new_status.clone(),
+
+                owner_uid: owner_uid_raw_opt,
+            })
+                .await;
+        }
+
+        // 🔥 根据实际状态发布对应事件
+        if new_status == "completed" {
+            self.publish_event(FolderEvent::Completed {
+                folder_id: folder_id.to_string(),
+                completed_at: chrono::Utc::now().timestamp_millis(),
+
+                owner_uid: owner_uid_raw_opt,
+            })
+                .await;
+        } else if new_status == "failed" {
+            let error_msg = {
                 let folders = self.folders.read().await;
-                match folders.get(folder_id) {
-                    Some(f) => (
-                        format!("{:?}", f.status).to_lowercase(),
-                        Some(f.owner_uid.raw()),
-                    ),
-                    None => (String::new(), None),
-                }
+                folders.get(folder_id)
+                    .and_then(|f| f.error.clone())
+                    .unwrap_or_default()
             };
+            self.publish_event(FolderEvent::Failed {
+                folder_id: folder_id.to_string(),
+                error: error_msg,
 
-            // 🔥 发布状态变更事件
-            if !old_status.is_empty() {
-                self.publish_event(FolderEvent::StatusChanged {
-                    folder_id: folder_id.to_string(),
-                    old_status,
-                    new_status: new_status.clone(),
-
-                    owner_uid: owner_uid_raw_opt,
-                })
-                    .await;
-            }
-
-            // 🔥 根据实际状态发布对应事件
-            if new_status == "completed" {
-                self.publish_event(FolderEvent::Completed {
-                    folder_id: folder_id.to_string(),
-                    completed_at: chrono::Utc::now().timestamp_millis(),
-
-                    owner_uid: owner_uid_raw_opt,
-                })
-                    .await;
-            } else if new_status == "failed" {
-                let error_msg = {
-                    let folders = self.folders.read().await;
-                    folders.get(folder_id)
-                        .and_then(|f| f.error.clone())
-                        .unwrap_or_default()
-                };
-                self.publish_event(FolderEvent::Failed {
-                    folder_id: folder_id.to_string(),
-                    error: error_msg,
-
-                    owner_uid: owner_uid_raw_opt,
-                })
-                    .await;
-            }
+                owner_uid: owner_uid_raw_opt,
+            })
+                .await;
         }
-
-        // 补充任务：保持10个活跃任务（完成1个，进1个）
-        if let Err(e) = self.refill_tasks(folder_id, 10).await {
-            warn!("补充任务失败: {}", e);
-        }
-
-        Ok(())
     }
 
     /// 🔥 触发借调位回收（按 owner_uid 严格过滤候选）

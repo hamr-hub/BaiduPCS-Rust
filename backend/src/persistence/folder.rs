@@ -10,7 +10,7 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::downloader::folder::{FolderDownload, FolderStatus, PendingFile};
+use crate::downloader::folder::{FolderDownload, FolderStatus, PendingFile, SkippedFile};
 
 /// 文件夹持久化状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +71,29 @@ pub struct FolderPersisted {
     /// 🔥 不可恢复失败原因（恢复链路）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+
+    /// 🔥 因冲突策略跳过的文件数（与 completed_count 一同参与终态判定）
+    #[serde(default)]
+    pub skipped_count: u64,
+
+    /// 🔥 因冲突策略跳过的文件字节数（前端据此让"全部跳过"的文件夹显示 100% 而不是 0%）
+    #[serde(default)]
+    pub skipped_size: u64,
+
+    /// 🔥 被跳过文件的明细清单（详情列表以「跳过」状态展示）
+    #[serde(default)]
+    pub skipped_entries: Vec<SkippedFile>,
+
+    /// 🔥 下载冲突策略
+    ///
+    /// 必须持久化：补任务（`refill_tasks`）是在**下载过程中**分批把 `pending_files`
+    /// 转成子任务的，每次转换都要用本策略判定"本地已存在同名文件"该跳过还是覆盖。
+    /// 重启后剩余 pending 文件仍会走这条路径，策略丢失会让用户选的"跳过"退化成
+    /// `Overwrite`，把已下好的文件重下一遍（issue #141）。
+    ///
+    /// 旧持久化数据无此字段，`serde(default)` 得到 `None`，由调用方回退到默认策略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
 }
 
 impl FolderPersisted {
@@ -101,6 +124,10 @@ impl FolderPersisted {
                 if raw == 0 { None } else { Some(raw) }
             },
             failure_reason: folder.failure_reason.clone(),
+            conflict_strategy: folder.conflict_strategy,
+            skipped_count: folder.skipped_count,
+            skipped_size: folder.skipped_size,
+            skipped_entries: folder.skipped_entries.clone(),
         }
     }
 
@@ -138,7 +165,10 @@ impl FolderPersisted {
             fixed_slot_subtask: None,
             encrypted_folder_mappings: std::collections::HashMap::new(),
             counted_task_ids: std::collections::HashSet::new(),
-            conflict_strategy: None,
+            conflict_strategy: self.conflict_strategy,
+            skipped_count: self.skipped_count,
+            skipped_size: self.skipped_size,
+            skipped_entries: self.skipped_entries.clone(),
             completed_downloaded_size: 0,
             failed_count: 0,
             failed_task_ids: std::collections::HashSet::new(),
@@ -528,6 +558,46 @@ mod tests {
         assert_eq!(restored.id, folder.id);
         assert_eq!(restored.name, folder.name);
         assert_eq!(restored.status, folder.status);
+    }
+
+    /// issue #141：冲突策略必须跨持久化往返保留
+    ///
+    /// 丢失后补任务会退化成 `Overwrite`，把本地已下好的文件重下一遍。
+    #[test]
+    fn test_conflict_strategy_survives_roundtrip() {
+        use crate::uploader::conflict::DownloadConflictStrategy;
+
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path();
+
+        let mut folder = FolderDownload::new("/电影".to_string(), PathBuf::from("/local/电影"));
+        folder.conflict_strategy = Some(DownloadConflictStrategy::Skip);
+
+        save_folder(wal_dir, &FolderPersisted::from_folder(&folder)).unwrap();
+
+        let loaded = load_folder(wal_dir, &folder.id).unwrap().unwrap();
+        assert_eq!(
+            loaded.to_folder().conflict_strategy,
+            Some(DownloadConflictStrategy::Skip),
+            "冲突策略必须在保存/加载后保留"
+        );
+    }
+
+    /// 升级兼容：旧持久化数据没有 conflict_strategy 字段，应反序列化为 None
+    /// （由 `resolve_conflict_strategy` 回退到全局默认策略），而不是解析失败。
+    #[test]
+    fn test_legacy_snapshot_without_conflict_strategy() {
+        let legacy = r#"{
+            "id": "f1", "name": "电影", "remote_root": "/电影",
+            "local_root": "/local/电影", "status": "paused",
+            "total_files": 3, "total_size": 100, "created_count": 1,
+            "completed_count": 0, "downloaded_size": 0, "scan_completed": true,
+            "pending_files": [], "created_at": 0
+        }"#;
+
+        let parsed: FolderPersisted =
+            serde_json::from_str(legacy).expect("旧快照应能继续解析");
+        assert_eq!(parsed.conflict_strategy, None);
     }
 
     #[test]

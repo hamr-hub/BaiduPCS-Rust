@@ -133,6 +133,12 @@ pub struct DownloadManager {
     task_slot_pool: Arc<TaskSlotPool>,
     /// 🔥 文件夹下载管理器引用（可选，用于回收借调槽位）
     folder_manager: Arc<RwLock<Option<Arc<FolderDownloadManager>>>>,
+
+    /// 🔥 全局配置（延迟注入）
+    ///
+    /// 仅用于在调用方未显式指定冲突策略时回退到用户在设置页配置的默认下载策略。
+    /// 存引用而非快照，保证设置改动即时生效。
+    app_config: Arc<RwLock<Option<Arc<RwLock<crate::config::AppConfig>>>>>,
     /// 🔥 加密快照管理器（用于查询加密文件映射，获取原始文件名）
     snapshot_manager: Arc<RwLock<Option<Arc<crate::encryption::snapshot::SnapshotManager>>>>,
     /// 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
@@ -281,6 +287,7 @@ impl DownloadManager {
                 pool
             },
             folder_manager: Arc::new(RwLock::new(None)),
+            app_config: Arc::new(RwLock::new(None)),
             snapshot_manager: Arc::new(RwLock::new(None)),
             encryption_config_store: Arc::new(RwLock::new(None)),
             max_retries,
@@ -573,7 +580,7 @@ impl DownloadManager {
         // task / 持久化 / Created event 全部用 effective_uid，根除事后 override 竞态。
         let effective_uid = owner_uid_override.unwrap_or(self.owner_uid);
         // 获取默认策略（如果未指定）
-        let strategy = conflict_strategy.unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
+        let strategy = self.resolve_conflict_strategy(conflict_strategy).await;
 
         // 解决冲突
         use crate::uploader::conflict_resolver::ConflictResolver;
@@ -5664,10 +5671,10 @@ impl DownloadManager {
         owner_uid: crate::auth::Uid,
     ) -> Result<String> {
         use crate::uploader::conflict_resolver::ConflictResolver;
-        use crate::uploader::conflict::{ConflictResolution, DownloadConflictStrategy};
+        use crate::uploader::conflict::ConflictResolution;
 
         // 获取默认策略（如果未指定，使用 Overwrite 默认值）
-        let strategy = conflict_strategy.unwrap_or(DownloadConflictStrategy::Overwrite);
+        let strategy = self.resolve_conflict_strategy(conflict_strategy).await;
 
         // 解决下载冲突
         let resolution = ConflictResolver::resolve_download_conflict(&local_path, strategy)?;
@@ -7067,6 +7074,35 @@ impl DownloadManager {
     pub async fn set_folder_manager(&self, folder_manager: Arc<FolderDownloadManager>) {
         *self.folder_manager.write().await = Some(folder_manager);
     }
+
+    /// 🔥 注入全局配置（用于冲突策略回退，见 `resolve_conflict_strategy`）
+    pub async fn set_app_config(&self, config: Arc<RwLock<crate::config::AppConfig>>) {
+        *self.app_config.write().await = Some(config);
+    }
+
+    /// 🔥 解析生效的下载冲突策略
+    ///
+    /// 优先级：调用方显式指定 > 设置页的全局默认 > `Overwrite`。
+    ///
+    /// 中间那层是必需的：HTTP handler 会自己读配置后传进来，但**内部发起的下载**
+    /// （离线下载完成后转本地下载、转存完成后自动下载）一直传 `None`，此前会被
+    /// 硬编码兜底成 `Overwrite` —— 用户在设置页选了「跳过」，这两条路径却照样覆盖
+    /// 本地已有文件，表现为"跳过时灵时不灵"。
+    async fn resolve_conflict_strategy(
+        &self,
+        explicit: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+    ) -> crate::uploader::conflict::DownloadConflictStrategy {
+        if let Some(s) = explicit {
+            return s;
+        }
+
+        let cfg_opt = self.app_config.read().await.clone();
+        if let Some(cfg) = cfg_opt {
+            return cfg.read().await.conflict_strategy.default_download_strategy;
+        }
+
+        crate::uploader::conflict::DownloadConflictStrategy::Overwrite
+    }
 }
 
 impl Drop for DownloadManager {
@@ -7083,7 +7119,7 @@ mod tests {
     use crate::auth::UserAuth;
     use tempfile::TempDir;
 
-    fn create_mock_user_auth() -> UserAuth {
+    pub(super) fn create_mock_user_auth() -> UserAuth {
         UserAuth {
             uid: 123456789,
             username: "test_user".to_string(),
@@ -7433,6 +7469,69 @@ mod tests {
         assert_eq!(
             manager.lookup_aggregate_outcome("does_not_exist").await,
             DownloadAggregateOutcome::NotFound,
+        );
+    }
+}
+
+#[cfg(test)]
+mod conflict_strategy_tests {
+    use super::*;
+    use crate::uploader::conflict::DownloadConflictStrategy;
+    use tempfile::TempDir;
+
+    async fn make_manager(temp: &TempDir) -> DownloadManager {
+        let user_auth = super::tests::create_mock_user_auth();
+        DownloadManager::new(user_auth, temp.path().to_path_buf())
+            .await
+            .unwrap()
+    }
+
+    /// 未注入配置时退回 Overwrite（保持旧行为，不至于 panic 或改变语义）
+    #[tokio::test]
+    async fn test_resolve_falls_back_to_overwrite_without_config() {
+        let temp = TempDir::new().unwrap();
+        let mgr = make_manager(&temp).await;
+
+        assert_eq!(
+            mgr.resolve_conflict_strategy(None).await,
+            DownloadConflictStrategy::Overwrite
+        );
+    }
+
+    /// 调用方显式指定时，无条件优先于全局默认
+    #[tokio::test]
+    async fn test_explicit_strategy_wins_over_global_default() {
+        let temp = TempDir::new().unwrap();
+        let mgr = make_manager(&temp).await;
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.conflict_strategy.default_download_strategy = DownloadConflictStrategy::Skip;
+        mgr.set_app_config(Arc::new(RwLock::new(cfg))).await;
+
+        assert_eq!(
+            mgr.resolve_conflict_strategy(Some(DownloadConflictStrategy::AutoRename))
+                .await,
+            DownloadConflictStrategy::AutoRename
+        );
+    }
+
+    /// 调用方传 None 时必须读设置页的全局默认，而不是硬编码 Overwrite。
+    ///
+    /// 回归点：离线下载完成后转本地下载、转存完成后自动下载这两条内部路径一直传 None，
+    /// 此前被硬编码兜底成 Overwrite，用户在设置页选的「跳过」对它们完全不生效。
+    #[tokio::test]
+    async fn test_none_falls_back_to_global_default_not_overwrite() {
+        let temp = TempDir::new().unwrap();
+        let mgr = make_manager(&temp).await;
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.conflict_strategy.default_download_strategy = DownloadConflictStrategy::Skip;
+        mgr.set_app_config(Arc::new(RwLock::new(cfg))).await;
+
+        assert_eq!(
+            mgr.resolve_conflict_strategy(None).await,
+            DownloadConflictStrategy::Skip,
+            "内部调用方传 None 时应跟随设置页默认策略"
         );
     }
 }

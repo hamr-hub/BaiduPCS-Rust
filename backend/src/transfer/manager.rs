@@ -120,6 +120,13 @@ pub struct PreviewShareResult {
     pub bdstoken: String,
     /// 分享根的绝对路径（来自 share/list?root=1 响应的 title 字段）
     pub share_root_path: Option<String>,
+    /// 分享体系类型（前端需原样回传，子目录导航要据此分流）
+    pub kind: crate::transfer::ShareKind,
+    /// 提取码校验换来的凭据
+    ///
+    /// 个人版是 randsk（已同时写进 Cookie，回传只是为了统一）；
+    /// 企业版是 spwd，**后续每个请求都必须显式带上**，不回传就没法翻子目录。
+    pub token: Option<String>,
 }
 
 /// handle_transfer_error 的返回值，区分恢复成功、友好失败、无法识别三种场景
@@ -277,43 +284,35 @@ impl TransferManager {
     ) -> Result<PreviewShareResult> {
         info!("预览分享链接: url={}", share_url);
 
-        // 1. 解析分享链接
-        let share_link = self.client.read().unwrap().parse_share_link(share_url)?;
+        // 1. 解析分享链接（个人版 / 企业版由 netdisk::share 自动判定）
+        let mut share_link = self.client.read().unwrap().parse_share_link(share_url)?;
 
         // 合并密码：请求中的密码 > 链接中的密码
         let password = password.or(share_link.password.clone());
+        share_link.password = password.clone();
 
         // 🔥 从共享引用快照当前客户端
         let client = self.client.read().unwrap().clone();
 
         // 2. 访问分享页面，获取分享信息
-        let share_info = client
-            .access_share_page(&share_link.short_key, &password, true)
-            .await?;
+        let share_info = client.access_share_page_for(&share_link, true).await?;
 
         // 3. 如果有密码，验证密码
-        if let Some(ref pwd) = password {
-            let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
-            client
-                .verify_share_password(
-                    &share_info.shareid,
-                    &share_info.share_uk,
-                    &share_info.bdstoken,
-                    pwd,
-                    &referer,
-                )
-                .await?;
-            info!("预览: 提取码验证成功");
-        }
+        //
+        // 拿到的凭据个人版是 randsk（同时已写进 Cookie），企业版是 spwd（必须
+        // 显式带进后续每个请求）。所以这里不能像以前那样丢弃返回值。
+        let token = match password {
+            Some(ref pwd) => {
+                let t = client.verify_share_password_for(&share_info, pwd).await?;
+                info!("预览: 提取码验证成功");
+                Some(t)
+            }
+            None => None,
+        };
 
         // 4. 获取文件列表（根目录，由前端传入分页参数）
         let list_result = client
-            .list_share_files(
-                &share_link.short_key,
-                &share_info.bdstoken,
-                page,
-                num,
-            )
+            .list_share_files_for(&share_info, page, num, token.as_deref())
             .await?;
 
         // 用根目录响应中的 uk/shareid 补充（access_share_page 可能提取失败）
@@ -331,11 +330,13 @@ impl TransferManager {
         info!("预览: 获取到 {} 个文件, uk={}, shareid={}", list_result.files.len(), uk, shareid);
         Ok(PreviewShareResult {
             files: list_result.files,
-            short_key: share_link.short_key,
+            short_key: share_info.short_key.clone(),
             shareid,
             uk,
             bdstoken: share_info.bdstoken,
             share_root_path: list_result.share_root_path,
+            kind: share_info.kind,
+            token,
         })
     }
 
@@ -343,6 +344,10 @@ impl TransferManager {
     ///
     /// 用于文件夹导航：前端点击文件夹后，调用此方法获取子目录内容。
     /// 需要传入首次预览时获取的 share_info，避免重复访问分享页面。
+    ///
+    /// `kind` / `token` 由前端从首次预览的结果原样回传：企业版的 spwd
+    /// 不像个人版 randsk 那样存在 Cookie 里，不带上就取不到子目录。
+    #[allow(clippy::too_many_arguments)]
     pub async fn preview_share_dir(
         &self,
         short_key: &str,
@@ -352,12 +357,27 @@ impl TransferManager {
         dir: &str,
         page: u32,
         num: u32,
+        kind: crate::transfer::ShareKind,
+        token: Option<&str>,
     ) -> Result<Vec<SharedFileInfo>> {
-        info!("浏览分享子目录: short_key={}, dir={}, page={}, num={}", short_key, dir, page, num);
+        info!(
+            "浏览分享子目录: kind={:?}, short_key={}, dir={}, page={}, num={}",
+            kind, short_key, dir, page, num
+        );
+
+        // 从前端回传的散字段还原分享上下文，避免重新访问分享页
+        let share_info = crate::transfer::SharePageInfo {
+            shareid: shareid.to_string(),
+            uk: uk.to_string(),
+            share_uk: uk.to_string(),
+            bdstoken: bdstoken.to_string(),
+            kind,
+            short_key: short_key.to_string(),
+        };
 
         let client = self.client.read().unwrap().clone();
         let file_list = client
-            .list_share_files_in_dir(short_key, shareid, uk, bdstoken, dir, page, num)
+            .list_share_files_in_dir_for(&share_info, dir, page, num, token)
             .await?;
 
         info!("子目录: 获取到 {} 个文件, dir={}", file_list.len(), dir);
@@ -396,6 +416,7 @@ impl TransferManager {
             short_key: share_link.short_key,
             raw_url: share_link.raw_url,
             password: password.clone(), // 密码已提取
+            kind: share_link.kind,
         };
 
         // 2. 处理分享直下模式
@@ -454,35 +475,28 @@ impl TransferManager {
         //    其它调用方仍走 access_share_page 解析。
         let client = self.client.read().unwrap().clone();
         let share_info_result = match request.prefetched_share.clone() {
-            Some(info) => {
+            Some(mut info) => {
                 info!(
                     "复用已捕获分享上下文，跳过 access_share_page: shareid={}",
                     info.shareid
                 );
+                // 兼容老数据：`kind`/`short_key` 是后加的字段，重启后从库里读回来的
+                // 快照没有它们（serde default 会给出 Personal + 空串）。空的 short_key
+                // 会让个人版列表接口的 shorturl 变成空，这里用刚解析出的链接补齐。
+                if info.short_key.is_empty() {
+                    info.short_key = share_link.short_key.clone();
+                    info.kind = share_link.kind;
+                }
                 Ok(info)
             }
-            None => {
-                client
-                    .access_share_page(&share_link.short_key, &share_link.password, true)
-                    .await
-            }
+            None => client.access_share_page_for(&share_link, true).await,
         };
 
         match share_info_result {
             Ok(info) => {
                 // 如果有密码，先验证密码
                 if let Some(ref pwd) = password {
-                    let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
-                    match client
-                        .verify_share_password(
-                            &info.shareid,
-                            &info.share_uk,
-                            &info.bdstoken,
-                            pwd,
-                            &referer,
-                        )
-                        .await
-                    {
+                    match client.verify_share_password_for(&info, pwd).await {
                         Ok(verified_randsk) => {
                             info!("提取码验证成功");
                             task.randsk = Some(verified_randsk);
@@ -672,7 +686,9 @@ impl TransferManager {
                 .await;
 
             if let Err(e) = result {
-                let error_msg = e.to_string();
+                // `{:#}` 展开完整 anyhow 链：这个串会直接写进任务状态给用户看，
+                // 只取最外层 context 的话网络类失败全都长一个样。
+                let error_msg = format!("{:#}", e);
                 error!("转存任务执行失败: task_id={}, error={}", task_id, error_msg);
 
                 // 更新任务状态为失败
@@ -807,13 +823,7 @@ impl TransferManager {
         ) = if has_selected_fs_ids {
             // 用户已选择文件，只拉第一页用于展示文件名
             let result = client
-                .list_share_files_with_randsk(
-                    &share_link.short_key,
-                    &share_info.bdstoken,
-                    1,
-                    100,
-                    randsk.as_deref(),
-                )
+                .list_share_files_for(&share_info, 1, 100, randsk.as_deref())
                 .await?;
             (result.files, result.share_root_path, result.uk, result.shareid)
         } else {
@@ -826,13 +836,7 @@ impl TransferManager {
             let mut page: u32 = 1;
             loop {
                 let result = client
-                    .list_share_files_with_randsk(
-                        &share_link.short_key,
-                        &share_info.bdstoken,
-                        page,
-                        page_size,
-                        randsk.as_deref(),
-                    )
+                    .list_share_files_for(&share_info, page, page_size, randsk.as_deref())
                     .await?;
                 let batch_len = result.files.len();
                 if page == 1 {
@@ -1057,7 +1061,8 @@ impl TransferManager {
             t.total_count = fs_ids.len();
         }
 
-        let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
+        // Referer 现在由各体系的 provider 按自己的分享页地址拼（个人版 /s/xxx、
+        // 企业版 /apaas/share?surl=xxx），这里不再需要手工构造。
 
         // ========== 转存请求摘要日志 ==========
         {
@@ -1238,13 +1243,10 @@ impl TransferManager {
 
                 // 转存该组
                 let result = client
-                    .transfer_share_files_with_randsk(
-                        &share_info.shareid,
-                        &share_info.share_uk,
-                        &share_info.bdstoken,
+                    .transfer_share_files_for(
+                        &share_info,
                         &group_fs_ids,
                         &group_target_dir,
-                        &referer,
                         Some(task_id),
                         randsk.as_deref(),
                     )
@@ -1260,13 +1262,10 @@ impl TransferManager {
                                 warn!("重试时创建目录失败: {}", e);
                             }
                             client
-                                .transfer_share_files_with_randsk(
-                                    &share_info.shareid,
-                                    &share_info.share_uk,
-                                    &share_info.bdstoken,
+                                .transfer_share_files_for(
+                                    &share_info,
                                     &group_fs_ids,
                                     &group_target_dir,
-                                    &referer,
                                     Some(task_id),
                                     randsk.as_deref(),
                                 )
@@ -1312,13 +1311,10 @@ impl TransferManager {
                     );
                     tokio::time::sleep(backoff).await;
                     result = client
-                        .transfer_share_files_with_randsk(
-                            &share_info.shareid,
-                            &share_info.share_uk,
-                            &share_info.bdstoken,
+                        .transfer_share_files_for(
+                            &share_info,
                             &group_fs_ids,
                             &group_target_dir,
-                            &referer,
                             Some(task_id),
                             randsk.as_deref(),
                         )
@@ -1345,10 +1341,11 @@ impl TransferManager {
 
                             let dir_ctx = ShareDirCtx {
                                 client: &client,
-                                short_key: &share_link.short_key,
+                                short_key: &share_info.short_key,
                                 shareid: &list_shareid,
                                 uk: &list_uk,
                                 bdstoken: &share_info.bdstoken,
+                                kind: share_info.kind,
                                 randsk: randsk.as_deref(),
                                 rate_limiter: Arc::clone(&scan_rate_limiter),
                                 cache: Arc::clone(&dir_children_cache),
@@ -1358,7 +1355,6 @@ impl TransferManager {
                                 &share_info,
                                 group_files.clone(),
                                 &group_target_dir,
-                                &referer,
                                 task_id,
                                 randsk.as_deref(),
                             )
@@ -1657,7 +1653,10 @@ impl TransferManager {
                 }
             }
             Err(e) => {
-                let raw_err_msg = e.to_string();
+                // `{:#}` 展开完整 anyhow 链。下面 handle_transfer_error 是按
+                // `task_errno=` 子串抽错误码的，链变长不影响抽取；而识别不出错误码时
+                // 会原样透出这个串，此时多出来的底层原因（超时/连接重置）正是排障要的。
+                let raw_err_msg = format!("{:#}", e);
 
                 // 🔥 尝试友好错误处理（区分 task_errno 场景）
                 let handled = Self::handle_transfer_error(&task, &client, &raw_err_msg).await;
@@ -5220,12 +5219,17 @@ fn split_groups_by_file_limit(
 }
 
 /// 列子目录时用的分享上下文（超限下钻专用）。
+///
+/// `shareid`/`uk` 刻意与 `SharePageInfo` 分开存：这里要用的是**根目录响应**
+/// 里的权威值，access_share_page 拿到的那份经常缺 uk。
 struct ShareDirCtx<'a> {
     client: &'a NetdiskClient,
     short_key: &'a str,
     shareid: &'a str,
     uk: &'a str,
     bdstoken: &'a str,
+    /// 分享体系类型，决定列目录走哪套接口
+    kind: crate::transfer::ShareKind,
     randsk: Option<&'a str>,
     rate_limiter: Arc<crate::share_sync::rate_limit::QuotaLimiter>,
     /// 目录 → 直接子项。同一个任务内多个批次下钻到同一目录时直接复用，不重复请求。
@@ -5255,13 +5259,18 @@ impl ShareDirCtx<'_> {
             let batch = loop {
                 // 与转存提交共用同一个令牌桶，避免列目录突发撞百度风控 errno=132
                 self.rate_limiter.acquire().await;
+                let dir_share_info = crate::transfer::SharePageInfo {
+                    shareid: self.shareid.to_string(),
+                    uk: self.uk.to_string(),
+                    share_uk: self.uk.to_string(),
+                    bdstoken: self.bdstoken.to_string(),
+                    kind: self.kind,
+                    short_key: self.short_key.to_string(),
+                };
                 match self
                     .client
-                    .list_share_files_in_dir_with_randsk(
-                        self.short_key,
-                        self.shareid,
-                        self.uk,
-                        self.bdstoken,
+                    .list_share_files_in_dir_for(
+                        &dir_share_info,
                         dir,
                         page,
                         PAGE_SIZE,
@@ -5317,7 +5326,6 @@ async fn split_over_limit_batch(
     share_info: &SharePageInfo,
     items: Vec<SharedFileInfo>,
     target_dir: &str,
-    referer: &str,
     internal_task_id: &str,
     randsk: Option<&str>,
 ) -> Result<(TransferResult, usize)> {
@@ -5356,7 +5364,6 @@ async fn split_over_limit_batch(
             share_info,
             &fs_ids,
             &dir,
-            referer,
             internal_task_id,
             randsk,
         )
@@ -5385,7 +5392,6 @@ async fn split_over_limit_batch(
                 share_info,
                 &fs_ids,
                 &dir,
-                referer,
                 internal_task_id,
                 randsk,
             )
@@ -5515,18 +5521,14 @@ async fn client_transfer(
     share_info: &SharePageInfo,
     fs_ids: &[u64],
     target_dir: &str,
-    referer: &str,
     internal_task_id: &str,
     randsk: Option<&str>,
 ) -> Result<TransferResult> {
     client
-        .transfer_share_files_with_randsk(
-            &share_info.shareid,
-            &share_info.share_uk,
-            &share_info.bdstoken,
+        .transfer_share_files_for(
+            share_info,
             fs_ids,
             target_dir,
-            referer,
             Some(internal_task_id),
             randsk,
         )
@@ -5625,7 +5627,11 @@ fn merge_batch_results(
                 failed_batches.push((batch_index, group_id, r.error.unwrap_or_default()));
             }
             Err(e) => {
-                failed_batches.push((batch_index, group_id, e.to_string()));
+                // 用 `{:#}` 展开完整 anyhow 链。`{}`（即 to_string）只取最外层
+                // context，网络类失败就只剩一句「转存请求失败」，看不出是超时、
+                // 连接重置还是代理不通——排障只能去翻日志。
+                // share_sync 那边早就是这么做的（见 snapshot.rs 的同款注释）。
+                failed_batches.push((batch_index, group_id, format!("{:#}", e)));
             }
         }
     }
@@ -6428,6 +6434,64 @@ mod tests {
         assert!(!is_file_limit_exceeded("同名文件已存在: a.mp4"));
         assert!(!is_file_limit_exceeded("转存失败: {\"errno\":2}"));
         assert!(!is_file_limit_exceeded(""));
+    }
+
+    /// 企业版转存错误必须落进本模块这三个分类器，否则自适应分批对企业版失效。
+    ///
+    /// 这三个判定全是**字符串关键字匹配**，`netdisk::share::apaas` 那边一旦
+    /// 改了文案就会静默失联：超限不再下钻拆批而是整批失败、抖动不再退避重试、
+    /// 空间不足不再早停（dfe1a0b 那次 347 连败就是这么来的）。
+    /// 这里把跨模块契约钉死。
+    #[test]
+    fn apaas_transfer_errors_match_batch_classifiers() {
+        use crate::netdisk::share::apaas::describe_transfer_errno;
+
+        // 空间不足 → 早停，且不能被误判成「文件数超限」而去无限拆分
+        for errno in [-10, -32, 31112] {
+            let msg = describe_transfer_errno(errno, "空间不足，转存失败");
+            assert!(is_quota_exceeded(&msg), "errno={} 应判为空间不足: {}", errno, msg);
+            assert!(
+                !is_file_limit_exceeded(&msg),
+                "errno={} 不该判为文件数超限: {}",
+                errno,
+                msg
+            );
+        }
+
+        // 文件数超限 → 触发下钻拆批，且不能被误判成空间不足而早停
+        for errno in [-33, 120, 130, 31075, 31174, 31175] {
+            let msg = describe_transfer_errno(errno, "");
+            assert!(
+                is_file_limit_exceeded(&msg),
+                "errno={} 应判为文件数超限: {}",
+                errno,
+                msg
+            );
+            assert!(
+                !is_quota_exceeded(&msg),
+                "errno={} 不该判为空间不足: {}",
+                errno,
+                msg
+            );
+        }
+
+        // 临时错误 → 退避重试
+        for errno in [4, -31, 31069, 111, 31171] {
+            let msg = describe_transfer_errno(errno, "");
+            assert!(
+                is_transient_transfer_error(&msg),
+                "errno={} 应判为临时错误: {}",
+                errno,
+                msg
+            );
+            assert!(!is_file_limit_exceeded(&msg) && !is_quota_exceeded(&msg));
+        }
+
+        // 同名冲突：三类都不是，直接失败该批
+        let dup = describe_transfer_errno(-30, "");
+        assert!(!is_transient_transfer_error(&dup));
+        assert!(!is_file_limit_exceeded(&dup));
+        assert!(!is_quota_exceeded(&dup));
     }
 
     /// 默认上限 500，env 可覆盖为正整数；非法值回落默认。

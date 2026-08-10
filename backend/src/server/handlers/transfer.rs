@@ -458,6 +458,16 @@ pub struct PreviewShareInfo {
     pub shareid: String,
     pub uk: String,
     pub bdstoken: String,
+    /// 分享体系类型：`personal` / `apaas`
+    ///
+    /// 前端只需原样缓存并在子目录导航时回传，不必理解含义。
+    pub kind: crate::transfer::ShareKind,
+    /// 提取码凭据
+    ///
+    /// 企业版（apaas）的 spwd 不在 Cookie 里，翻子目录必须回传；
+    /// 个人版为 randsk，回传只是为了两边一致。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// POST /api/v1/transfers/preview
@@ -494,6 +504,8 @@ pub async fn preview_share_files(
                     shareid: result.shareid,
                     uk: result.uk,
                     bdstoken: result.bdstoken,
+                    kind: result.kind,
+                    token: result.token,
                 }),
             }))
         }
@@ -536,6 +548,14 @@ pub struct PreviewShareDirRequest {
     pub page: Option<u32>,
     /// 每页数量（默认 100）
     pub num: Option<u32>,
+    /// 分享体系类型，由前端从预览结果原样回传
+    ///
+    /// 缺省为个人版：老前端不带这个字段时行为与改动前完全一致。
+    #[serde(default)]
+    pub kind: crate::transfer::ShareKind,
+    /// 提取码凭据，由前端从预览结果原样回传（企业版必需）
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 /// POST /api/v1/transfers/preview/dir
@@ -560,7 +580,17 @@ pub async fn preview_share_dir(
     let num = req.num.unwrap_or(100);
 
     match transfer_manager
-        .preview_share_dir(&req.short_key, &req.shareid, &req.uk, &req.bdstoken, &req.dir, page, num)
+        .preview_share_dir(
+            &req.short_key,
+            &req.shareid,
+            &req.uk,
+            &req.bdstoken,
+            &req.dir,
+            page,
+            num,
+            req.kind,
+            req.token.as_deref(),
+        )
         .await
     {
         Ok(files) => {

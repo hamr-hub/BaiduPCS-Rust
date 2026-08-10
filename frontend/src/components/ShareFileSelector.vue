@@ -309,9 +309,16 @@ function handleItemClick(file: SharedFileInfo) {
 }
 
 // 构建子目录的 dir 参数
-// 根目录进入子目录时需要拼接 /sharelink{uk}-{shareid}/{文件夹名}
-// 子目录返回的 path 已经是 sharelink 格式，可以直接用
+//
+// 个人版：根目录进入子目录时需要拼接 /sharelink{uk}-{shareid}/{文件夹名}，
+//        子目录返回的 path 已经是 sharelink 格式，可以直接用。
+// 企业版：接口只认列表里原样的 path，带上 sharelink 前缀会被判成
+//        「目录不在分享范围内」（errno=13042）。
 function buildShareDir(folder: SharedFileInfo): string {
+  // 企业版不做任何拼接，直接用服务端给的 path
+  if (props.shareInfo?.kind === 'apaas') {
+    return folder.path
+  }
   // 如果 path 已经是 sharelink 格式，直接用
   if (folder.path.startsWith('/sharelink')) {
     return folder.path
@@ -337,6 +344,9 @@ async function navigateIntoDir(folder: SharedFileInfo) {
       shareid: props.shareInfo.shareid,
       uk: props.shareInfo.uk,
       bdstoken: props.shareInfo.bdstoken,
+      // 企业版分享必须回传 kind/token，否则后端按个人版接口去列目录会失败
+      kind: props.shareInfo.kind,
+      token: props.shareInfo.token,
       dir,
       page: 1,
       num: PAGE_SIZE,
@@ -397,6 +407,9 @@ function navigateToLevel(index: number) {
       shareid: props.shareInfo.shareid,
       uk: props.shareInfo.uk,
       bdstoken: props.shareInfo.bdstoken,
+      // 企业版分享必须回传 kind/token，否则后端按个人版接口去列目录会失败
+      kind: props.shareInfo.kind,
+      token: props.shareInfo.token,
       dir: target.dir,
       page: 1,
       num: PAGE_SIZE,
@@ -433,6 +446,9 @@ async function loadMore() {
         shareid: props.shareInfo.shareid,
         uk: props.shareInfo.uk,
         bdstoken: props.shareInfo.bdstoken,
+        // 企业版分享必须回传 kind/token，否则后端按个人版接口去列目录会失败
+        kind: props.shareInfo.kind,
+        token: props.shareInfo.token,
         dir: currentDir,
         page: nextPage,
         num: PAGE_SIZE,

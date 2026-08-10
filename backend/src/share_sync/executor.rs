@@ -2673,6 +2673,7 @@ mod tests {
             uk: "456".into(),
             share_uk: "456".into(),
             bdstoken: "tok".into(),
+            kind: crate::transfer::ShareKind::Personal,
             password: None,
             randsk: None,
         }

@@ -147,7 +147,13 @@ pub struct CapturedShare {
     /// 留存它,拆批转存时各批可复用而不必每批重新 access_share_page。
     pub share_uk: String,
     pub bdstoken: String,
+    /// 分享体系类型（个人版 / 企业版）
+    ///
+    /// 拆批转存时要据此还原出正确的分享 URL 和接口分流；
+    /// 默认个人版，与历史行为一致。
+    pub kind: crate::transfer::ShareKind,
     pub password: Option<String>,
+    /// 提取码凭据：个人版 randsk，企业版 spwd
     pub randsk: Option<String>,
 }
 
@@ -248,6 +254,8 @@ pub struct SnapshotCollector<'a> {
     uk: String,
     share_uk: String,
     bdstoken: String,
+    /// 分享体系类型（个人版 / 企业版），决定列目录走哪套接口
+    kind: crate::transfer::ShareKind,
     password: Option<String>,
     randsk: Option<String>,
     include_paths: BTreeSet<String>,
@@ -269,6 +277,18 @@ pub struct SnapshotCollector<'a> {
 }
 
 impl<'a> SnapshotCollector<'a> {
+    /// 把散落的分享字段收成 `SharePageInfo`，交给按体系分流的客户端方法
+    fn share_info(&self) -> crate::transfer::SharePageInfo {
+        crate::transfer::SharePageInfo {
+            shareid: self.shareid.clone(),
+            uk: self.uk.clone(),
+            share_uk: self.share_uk.clone(),
+            bdstoken: self.bdstoken.clone(),
+            kind: self.kind,
+            short_key: self.short_key.clone(),
+        }
+    }
+
     /// 从 URL + 密码构造一个 collector（先访问分享页取 bdstoken）
     pub async fn from_url(
         client: &'a NetdiskClient,
@@ -278,15 +298,16 @@ impl<'a> SnapshotCollector<'a> {
         exclude_patterns: Vec<String>,
         rate_limiter: Arc<QuotaLimiter>,
     ) -> Result<Self, ShareSyncError> {
-        let share_link = client
+        let mut share_link = client
             .parse_share_link(share_url)
             // 用 `{:#}` 保留完整 anyhow 错误链（含底层超时/百度 errno+errmsg），
             // 否则 `to_string()` 只取最外层 context，排障时看不到百度到底返回了什么。
             .map_err(|e| ShareSyncError::ShareLinkError(format!("{:#}", e)))?;
         let effective_pwd = password.or(share_link.password.clone());
+        share_link.password = effective_pwd.clone();
 
         let page = client
-            .access_share_page(&share_link.short_key, &effective_pwd, true)
+            .access_share_page_for(&share_link, true)
             .await
             // 用 `{:#}` 保留完整 anyhow 错误链（含底层超时/百度 errno+errmsg），
             // 否则 `to_string()` 只取最外层 context，排障时看不到百度到底返回了什么。
@@ -304,17 +325,7 @@ impl<'a> SnapshotCollector<'a> {
         let mut randsk = None;
         if let Some(ref pwd) = effective_pwd {
             if !pwd.is_empty() {
-                let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
-                match client
-                    .verify_share_password(
-                        &page.shareid,
-                        &page.share_uk,
-                        &page.bdstoken,
-                        pwd,
-                        &referer,
-                    )
-                    .await
-                {
+                match client.verify_share_password_for(&page, pwd).await {
                     Ok(sekey) => randsk = Some(sekey),
                     Err(e) => {
                         return Err(ShareSyncError::ShareLinkError(format!(
@@ -334,11 +345,12 @@ impl<'a> SnapshotCollector<'a> {
         let exclude_set = compile_exclude_patterns(&exclude_patterns);
         Ok(Self {
             client,
-            short_key: share_link.short_key,
+            short_key: page.short_key,
             shareid: page.shareid,
             uk: page.uk,
             share_uk: page.share_uk,
             bdstoken: page.bdstoken,
+            kind: page.kind,
             password: effective_pwd,
             randsk,
             include_paths,
@@ -377,9 +389,8 @@ impl<'a> SnapshotCollector<'a> {
                 self.rate_limiter.acquire().await;
                 let r = self
                     .client
-                    .list_share_files_with_randsk(
-                        &self.short_key,
-                        &self.bdstoken,
+                    .list_share_files_for(
+                        &self.share_info(),
                         1,
                         page_size,
                         self.randsk.as_deref(),
@@ -593,6 +604,7 @@ impl<'a> SnapshotCollector<'a> {
             uk: root_uk,
             share_uk: self.share_uk.clone(),
             bdstoken: self.bdstoken.clone(),
+            kind: self.kind,
             password: self.password.clone(),
             randsk: self.randsk.clone(),
         };
@@ -631,13 +643,16 @@ impl<'a> SnapshotCollector<'a> {
         let mut attempt: u32 = 0;
         loop {
             self.rate_limiter.acquire().await;
+            // 子目录用**根目录响应**里的 shareid/uk（比分享页解析出的更权威）
+            let dir_share_info = crate::transfer::SharePageInfo {
+                shareid: root_shareid.to_string(),
+                uk: root_uk.to_string(),
+                ..self.share_info()
+            };
             let result = self
                 .client
-                .list_share_files_in_dir_with_randsk(
-                    &self.short_key,
-                    root_shareid,
-                    root_uk,
-                    &self.bdstoken,
+                .list_share_files_in_dir_for(
+                    &dir_share_info,
                     dir,
                     page,
                     page_size,

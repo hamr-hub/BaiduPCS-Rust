@@ -3135,13 +3135,30 @@ fn prefetched_share_for_captured(
         uk: captured.uk.clone(),
         share_uk: captured.share_uk.clone(),
         bdstoken: captured.bdstoken.clone(),
+        kind: captured.kind,
+        short_key: captured.short_key.clone(),
     }
 }
 
+/// 从已捕获的分享上下文还原分享 URL
+///
+/// 两套体系的 URL 形态不同，企业版套用个人版的 `/s/{short_key}` 会拼出
+/// 一个不存在的链接（`short_key` 是不带 `1` 前缀的 surl）。
 fn share_url_for_captured(captured: &CapturedShare) -> String {
+    let base = match captured.kind {
+        crate::transfer::ShareKind::Apaas => {
+            format!("https://pan.baidu.com/apaas/share?surl={}", captured.short_key)
+        }
+        crate::transfer::ShareKind::Personal => {
+            format!("https://pan.baidu.com/s/{}", captured.short_key)
+        }
+    };
     match captured.password.as_deref().filter(|p| !p.is_empty()) {
-        Some(pwd) => format!("https://pan.baidu.com/s/{}?pwd={}", captured.short_key, pwd),
-        None => format!("https://pan.baidu.com/s/{}", captured.short_key),
+        Some(pwd) => {
+            let sep = if base.contains('?') { '&' } else { '?' };
+            format!("{}{}pwd={}", base, sep, pwd)
+        }
+        None => base,
     }
 }
 
@@ -3599,6 +3616,7 @@ mod tests {
             uk: "uk-1".into(),
             share_uk: "share-uk-2".into(),
             bdstoken: "tok".into(),
+            kind: crate::transfer::ShareKind::Personal,
             password: Some("pwd".into()),
             randsk: Some("rsk".into()),
         };

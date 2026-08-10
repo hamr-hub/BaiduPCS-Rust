@@ -355,6 +355,33 @@ mod tests {
             assert!(!e.is_link_invalid(), "{msg} 不应计入链接失效自动暂停");
         }
 
+        // 企业版（apaas）走同一套关键字：它的错误上下文把「企业版」放在**后缀**
+        // （"访问分享页面失败（企业版）"），正是为了让这里的子串匹配依然命中。
+        // 若哪天改成中缀（"访问企业版分享页面失败"），一次网络抖动就会被判成
+        // 链接确定性失效、把订阅自动暂停——这个测试就是拦这个的。
+        for msg in [
+            "访问分享页面失败（企业版）",
+            "访问分享页面失败（企业版）：读取响应失败",
+            "验证提取码请求失败（企业版）",
+            "获取分享文件列表失败（企业版）",
+            "获取分享文件列表失败（企业版）：读取响应失败",
+        ] {
+            let e = ShareSyncError::ShareLinkError(msg.to_string());
+            assert_eq!(
+                e.category(),
+                ErrorCategory::Transient,
+                "{msg} 应判为 Transient"
+            );
+            assert!(!e.is_link_invalid(), "{msg} 不应计入链接失效自动暂停");
+        }
+
+        // 企业版**服务端 errno** 级失败是确定性的，不能混进 Transient
+        // （否则 13042「目录不在分享内」会被无限重试）。
+        let e = ShareSyncError::ShareLinkError(
+            "获取企业版分享文件列表失败: errno=13042，请求的目录不在分享范围内".into(),
+        );
+        assert_ne!(e.category(), ErrorCategory::Transient);
+
         // 真·链接失效（errno 级专属文案）仍应触发暂停。
         let e = ShareSyncError::ShareLinkError("分享资源不存在或已失效".into());
         assert!(e.is_link_invalid());
@@ -552,5 +579,48 @@ mod tests {
 
         let e = ShareSyncError::TransferError("网盘 API 异常".into());
         assert!(!e.is_bisect_trigger());
+    }
+
+    /// 企业版转存错误必须落进本模块的分类器，否则分享同步对企业版行为全错：
+    /// 超限不二分、空间不足不早停、同名冲突被当成真失败。
+    ///
+    /// 与 `transfer::manager` 那份契约测试是两套独立的关键字表，都要覆盖。
+    #[test]
+    fn apaas_transfer_errors_match_sync_categories() {
+        use crate::netdisk::share::apaas::describe_transfer_errno;
+
+        // 空间不足 → Quota（触发二分 + 早停语义）
+        for errno in [-10, -32, 31112] {
+            let e = ShareSyncError::TransferError(describe_transfer_errno(errno, ""));
+            assert_eq!(e.category(), ErrorCategory::Quota, "errno={errno}");
+        }
+
+        // 文件数超限 → DirTransferAmbiguous（触发二分拆子树）
+        for errno in [-33, 120, 130, 31075, 31174, 31175] {
+            let e = ShareSyncError::TransferError(describe_transfer_errno(errno, ""));
+            assert_eq!(
+                e.category(),
+                ErrorCategory::DirTransferAmbiguous,
+                "errno={errno}"
+            );
+            assert!(e.is_bisect_trigger(), "errno={errno} 应触发二分");
+        }
+
+        // 临时错误 → Transient（重试同一组）
+        for errno in [4, -31, 31069, 111, 31171] {
+            let e = ShareSyncError::TransferError(describe_transfer_errno(errno, ""));
+            assert_eq!(e.category(), ErrorCategory::Transient, "errno={errno}");
+            assert!(e.should_retry(), "errno={errno} 应可重试");
+        }
+
+        // 同名冲突 → 视为「网盘里已有」，不是失败
+        for errno in [-8, -30, 31061] {
+            let e = ShareSyncError::TransferError(describe_transfer_errno(errno, ""));
+            assert!(
+                e.is_already_exists(),
+                "errno={errno} 应识别为已存在: {e}"
+            );
+            assert!(!e.is_bisect_trigger(), "errno={errno} 不该触发二分");
+        }
     }
 }

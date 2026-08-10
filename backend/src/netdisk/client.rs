@@ -2100,78 +2100,161 @@ impl NetdiskClient {
     // 分享链接转存相关 API
     // =====================================================
 
-    /// 解析分享链接，提取 short_key
+    /// 分享类请求的统一发送入口
     ///
-    /// 支持格式：
-    /// - https://pan.baidu.com/s/1abcDEFg
-    /// - https://pan.baidu.com/s/1abcDEFg?pwd=xxxx
-    /// - https://pan.baidu.com/share/init?surl=abcDEFg
+    /// 供 [`crate::netdisk::share`] 下两个 provider（个人版 / 企业版）复用，
+    /// 把三件与业务无关的公共事收敛在一处：
     ///
-    /// # 返回
-    /// ShareLink 结构体，包含 short_key 和可能的密码
-    pub fn parse_share_link(&self, url: &str) -> Result<crate::transfer::ShareLink> {
-        use regex::Regex;
+    /// 1. **可选的凭据 Cookie 覆盖**：个人版需要把 `randsk` 顶进 Cookie 头。
+    ///    覆盖时走临时客户端，避免污染共享 Cookie Jar（多账号并发下会串号）。
+    /// 2. **代理成败计数**：代理回退管理器靠它判定链路健康。
+    /// 3. **响应文本读取**。
+    pub(crate) async fn send_share_request(
+        &self,
+        req: crate::netdisk::share::ShareHttpRequest<'_>,
+    ) -> Result<String> {
+        let use_temp_client = req.cookie_randsk.is_some_and(|s| !s.is_empty());
 
-        let url = url.trim();
+        // 覆盖 randsk 时必须用临时客户端：主客户端共享 Cookie Jar，
+        // 直接改会影响同账号的其它并发请求。
+        let cookie_header = if use_temp_client {
+            Some(
+                self.collect_all_baidu_cookies_with_randsk(req.cookie_randsk.unwrap())
+                    .await?,
+            )
+        } else {
+            None
+        };
 
-        // 检查是否为百度网盘链接
-        if !url.contains("pan.baidu.com") && !url.contains("baidu.com/s/") {
-            anyhow::bail!("无效的分享链接：不是百度网盘链接");
+        let temp_client;
+        let http = if use_temp_client {
+            temp_client = self.build_temp_client_with_proxy()?;
+            &temp_client
+        } else {
+            &self.client
+        };
+
+        let mut builder = match &req.form {
+            Some(_) => http.post(&req.url),
+            None => http.get(&req.url),
+        };
+
+        builder = builder
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", &req.referer);
+
+        if let Some(cookie) = cookie_header {
+            builder = builder.header("Cookie", cookie);
         }
 
-        let mut short_key: Option<String> = None;
-        let mut password: Option<String> = None;
-
-        // 尝试匹配 /s/{key} 格式
-        // 例如: https://pan.baidu.com/s/1abcDEFg
-        let re_s = Regex::new(r"/s/([a-zA-Z0-9_-]+)")?;
-        if let Some(caps) = re_s.captures(url) {
-            if let Some(key) = caps.get(1) {
-                short_key = Some(key.as_str().to_string());
-            }
+        if let Some(form) = &req.form {
+            builder = builder
+                .header(
+                    "Content-Type",
+                    "application/x-www-form-urlencoded; charset=UTF-8",
+                )
+                .form(form);
         }
 
-        // 尝试匹配 /share/init?surl={key} 格式
-        // 例如: https://pan.baidu.com/share/init?surl=abcDEFg
-        if short_key.is_none() {
-            let re_surl = Regex::new(r"[?&]surl=([a-zA-Z0-9_-]+)")?;
-            if let Some(caps) = re_surl.captures(url) {
-                if let Some(key) = caps.get(1) {
-                    // surl 格式需要加 "1" 前缀
-                    short_key = Some(format!("1{}", key.as_str()));
-                }
+        let response = match builder.send().await {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
             }
-        }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context(req.error_context);
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
 
-        // 提取密码
-        // 格式: ?pwd=xxxx 或 &pwd=xxxx
-        let re_pwd = Regex::new(r"[?&]pwd=([a-zA-Z0-9]{4})")?;
-        if let Some(caps) = re_pwd.captures(url) {
-            if let Some(pwd) = caps.get(1) {
-                password = Some(pwd.as_str().to_string());
-            }
-        }
-
-        match short_key {
-            Some(key) => {
-                info!(
-                    "解析分享链接成功: short_key={}, has_password={}",
-                    key,
-                    password.is_some()
-                );
-                Ok(crate::transfer::ShareLink {
-                    short_key: key,
-                    raw_url: url.to_string(),
-                    password,
-                })
-            }
-            None => {
-                anyhow::bail!("无法从链接中提取分享 ID")
-            }
-        }
+        response
+            .text()
+            .await
+            .with_context(|| format!("{}：读取响应失败", req.error_context))
     }
 
-    /// 访问分享页面，获取分享信息
+    /// 解析分享链接，自动判定个人版 / 企业版
+    ///
+    /// 支持格式：
+    /// - 个人版 `https://pan.baidu.com/s/1abcDEFg[?pwd=xxxx]`
+    /// - 个人版 `https://pan.baidu.com/share/init?surl=abcDEFg`
+    /// - 企业版 `https://pan.baidu.com/apaas/share?surl=abcDEFg&pwd=xxxx`
+    ///
+    /// 具体规则见 [`crate::netdisk::share`]。
+    pub fn parse_share_link(&self, url: &str) -> Result<crate::transfer::ShareLink> {
+        crate::netdisk::share::parse_share_link(url)
+    }
+
+    /// 访问分享页面，获取分享信息（按体系分流）
+    pub async fn access_share_page_for(
+        &self,
+        link: &crate::transfer::ShareLink,
+        first: bool,
+    ) -> Result<crate::transfer::SharePageInfo> {
+        crate::netdisk::share::provider_for(link.kind)
+            .access_page(self, link, first)
+            .await
+    }
+
+    /// 校验提取码（按体系分流）
+    ///
+    /// 返回后续请求要携带的凭据：个人版是 `randsk`，企业版是 `spwd`。
+    /// 两者在上层统一走 `TransferTask::randsk` 通道。
+    pub async fn verify_share_password_for(
+        &self,
+        info: &crate::transfer::SharePageInfo,
+        password: &str,
+    ) -> Result<String> {
+        crate::netdisk::share::provider_for(info.kind)
+            .verify_password(self, info, password)
+            .await
+    }
+
+    /// 列出分享根目录（按体系分流）
+    pub async fn list_share_files_for(
+        &self,
+        info: &crate::transfer::SharePageInfo,
+        page: u32,
+        num: u32,
+        token: Option<&str>,
+    ) -> Result<crate::transfer::ShareFileListResult> {
+        crate::netdisk::share::provider_for(info.kind)
+            .list_root(self, info, page, num, token)
+            .await
+    }
+
+    /// 列出分享子目录（按体系分流）
+    pub async fn list_share_files_in_dir_for(
+        &self,
+        info: &crate::transfer::SharePageInfo,
+        dir: &str,
+        page: u32,
+        num: u32,
+        token: Option<&str>,
+    ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
+        crate::netdisk::share::provider_for(info.kind)
+            .list_dir(self, info, dir, page, num, token)
+            .await
+    }
+
+    /// 转存分享文件到自己网盘（按体系分流）
+    pub async fn transfer_share_files_for(
+        &self,
+        info: &crate::transfer::SharePageInfo,
+        fs_ids: &[u64],
+        target_path: &str,
+        internal_task_id: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<crate::transfer::TransferResult> {
+        crate::netdisk::share::provider_for(info.kind)
+            .transfer(self, info, fs_ids, target_path, internal_task_id, token)
+            .await
+    }
+
+    /// 访问个人版分享页面，获取分享信息
+    ///
+    /// 企业版走 [`crate::netdisk::share::apaas`]，不要直接调这个。
     ///
     /// # 参数
     /// * `short_key` - 分享短链 ID（如 "1abcDEFg"）
@@ -2179,7 +2262,7 @@ impl NetdiskClient {
     ///
     /// # 返回
     /// SharePageInfo 或错误（需要密码/分享失效/页面不存在）
-    pub async fn access_share_page(
+    pub(crate) async fn access_share_page_personal(
         &self,
         short_key: &str,
         password: &Option<String>,
@@ -2228,6 +2311,22 @@ impl NetdiskClient {
         if body.contains("error-404") {
             anyhow::bail!("分享不存在");
         }
+        // 百度的分享错误页**仍然会嵌一组无关的 shareid/share_uk**，光靠上面两个
+        // 标记挡不住：下面的宽松正则会把那组假 shareid 当成解析成功，最终在
+        // /share/verify 上以 errno=-12 收场，报错完全指错方向（issue #139）。
+        // `share_page_type":"error"` 是错误页的稳定标记，在这里就要拦掉。
+        if body.contains(r#""share_page_type":"error""#) {
+            let errno = regex::Regex::new(r#""errno"\s*:\s*(-?\d+)"#)
+                .ok()
+                .and_then(|re| {
+                    re.captures(&body)
+                        .and_then(|c| c.get(1))
+                        .map(|m| m.as_str().to_string())
+                })
+                .unwrap_or_default();
+            warn!("分享页面返回错误页: errno={}", errno);
+            anyhow::bail!("分享链接不存在或已失效");
+        }
 
         // 检测是否需要密码
         // 如果页面包含密码输入框或验证逻辑，说明需要密码
@@ -2271,6 +2370,8 @@ impl NetdiskClient {
                         uk,
                         share_uk,
                         bdstoken,
+                        kind: crate::transfer::ShareKind::Personal,
+                        short_key: short_key.to_string(),
                     });
                 }
             }
@@ -2330,10 +2431,14 @@ impl NetdiskClient {
             uk,
             share_uk,
             bdstoken,
+            kind: crate::transfer::ShareKind::Personal,
+            short_key: short_key.to_string(),
         })
     }
 
-    /// 校验提取码
+    /// 校验个人版提取码
+    ///
+    /// 企业版走 [`crate::netdisk::share::apaas`]，不要直接调这个。
     ///
     /// # 参数
     /// * `shareid` - 分享 ID
@@ -2344,7 +2449,7 @@ impl NetdiskClient {
     ///
     /// # 返回
     /// 成功返回 randsk，失败返回错误
-    pub async fn verify_share_password(
+    pub(crate) async fn verify_share_password_personal(
         &self,
         shareid: &str,
         share_uk: &str,
@@ -2433,18 +2538,12 @@ impl NetdiskClient {
     ///
     /// # 返回
     /// ShareFileListResult（包含文件列表 + uk + shareid）
-    pub async fn list_share_files(
-        &self,
-        short_key: &str,
-        bdstoken: &str,
-        page: u32,
-        num: u32,
-    ) -> Result<crate::transfer::ShareFileListResult> {
-        self.list_share_files_with_randsk(short_key, bdstoken, page, num, None)
-            .await
-    }
-
-    pub async fn list_share_files_with_randsk(
+    /// 列出个人版分享的根目录
+    ///
+    /// 企业版走 [`crate::netdisk::share::apaas`]，不要直接调这个。
+    ///
+    /// 官方根目录请求使用 shorturl + root=1，不传 dir。
+    pub(crate) async fn list_share_files_personal(
         &self,
         short_key: &str,
         bdstoken: &str,
@@ -2469,29 +2568,15 @@ impl NetdiskClient {
             shorturl, page, num, BAIDU_APP_ID, bdstoken
         );
 
-        let referer = format!("https://pan.baidu.com/s/{}", short_key);
-
-        let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
-            let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
-            let client = self.build_temp_client_with_proxy()?;
-            client
-                .get(&url)
-                .header("User-Agent", &self.web_user_agent)
-                .header("Referer", &referer)
-                .header("Cookie", cookie_header)
-                .send()
-                .await
-        } else {
-            self.client
-                .get(&url)
-                .header("User-Agent", &self.web_user_agent)
-                .header("Referer", &referer)
-                .send()
-                .await
-        }
-            .context("获取分享文件列表失败")?;
-
-        let response_text = response.text().await.context("读取文件列表响应失败")?;
+        let response_text = self
+            .send_share_request(crate::netdisk::share::ShareHttpRequest {
+                url,
+                referer: format!("https://pan.baidu.com/s/{}", short_key),
+                form: None,
+                cookie_randsk: randsk,
+                error_context: "获取分享文件列表失败",
+            })
+            .await?;
         info!("文件列表响应: {}", response_text);
 
         let json: Value = serde_json::from_str(&response_text).context("解析文件列表响应失败")?;
@@ -2537,48 +2622,7 @@ impl NetdiskClient {
         );
 
         let list = json["list"].as_array().context("文件列表格式错误")?;
-
-        let mut files = Vec::new();
-        for item in list {
-            let fs_id = if let Some(id_str) = item["fs_id"].as_str() {
-                id_str.parse::<u64>().unwrap_or(0)
-            } else {
-                item["fs_id"].as_u64().unwrap_or(0)
-            };
-
-            let is_dir = if let Some(n) = item["isdir"].as_i64() {
-                n == 1
-            } else if let Some(s) = item["isdir"].as_str() {
-                s == "1"
-            } else {
-                false
-            };
-            let path = item["path"].as_str().unwrap_or_default().to_string();
-            let size = if let Some(n) = item["size"].as_u64() {
-                n
-            } else if let Some(s) = item["size"].as_str() {
-                s.parse::<u64>().unwrap_or(0)
-            } else {
-                0
-            };
-            let name = item["server_filename"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-
-            info!(
-                "解析文件: fs_id={}, name={}, is_dir={}",
-                fs_id, name, is_dir
-            );
-
-            files.push(crate::transfer::SharedFileInfo {
-                fs_id,
-                is_dir,
-                path,
-                size,
-                name,
-            });
-        }
+        let files = crate::netdisk::share::common::parse_shared_files(list);
 
         Ok(crate::transfer::ShareFileListResult {
             files,
@@ -2588,26 +2632,12 @@ impl NetdiskClient {
         })
     }
 
-    /// 列出分享中指定目录下的文件（用于文件夹导航，与官方接口对齐）
+    /// 列出个人版分享中指定目录下的文件（用于文件夹导航，与官方接口对齐）
+    ///
+    /// 企业版走 [`crate::netdisk::share::apaas`]，不要直接调这个。
     ///
     /// 官方子目录请求使用 uk + shareid + dir，不传 shorturl/root
-    pub async fn list_share_files_in_dir(
-        &self,
-        short_key: &str,
-        shareid: &str,
-        uk: &str,
-        bdstoken: &str,
-        dir: &str,
-        page: u32,
-        num: u32,
-    ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
-        self.list_share_files_in_dir_with_randsk(
-            short_key, shareid, uk, bdstoken, dir, page, num, None,
-        )
-            .await
-    }
-
-    pub async fn list_share_files_in_dir_with_randsk(
+    pub(crate) async fn list_share_files_in_dir_personal(
         &self,
         short_key: &str,
         shareid: &str,
@@ -2630,29 +2660,15 @@ impl NetdiskClient {
             uk, shareid, page, num, encoded_dir, BAIDU_APP_ID, bdstoken
         );
 
-        let referer = format!("https://pan.baidu.com/s/{}", short_key);
-
-        let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
-            let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
-            let client = self.build_temp_client_with_proxy()?;
-            client
-                .get(&url)
-                .header("User-Agent", &self.web_user_agent)
-                .header("Referer", &referer)
-                .header("Cookie", cookie_header)
-                .send()
-                .await
-        } else {
-            self.client
-                .get(&url)
-                .header("User-Agent", &self.web_user_agent)
-                .header("Referer", &referer)
-                .send()
-                .await
-        }
-            .context("获取分享子目录文件列表失败")?;
-
-        let response_text = response.text().await.context("读取子目录文件列表响应失败")?;
+        let response_text = self
+            .send_share_request(crate::netdisk::share::ShareHttpRequest {
+                url,
+                referer: format!("https://pan.baidu.com/s/{}", short_key),
+                form: None,
+                cookie_randsk: randsk,
+                error_context: "获取分享子目录文件列表失败",
+            })
+            .await?;
         debug!("子目录文件列表响应: {}", response_text);
 
         let json: Value = serde_json::from_str(&response_text).context("解析子目录文件列表响应失败")?;
@@ -2667,43 +2683,7 @@ impl NetdiskClient {
         }
 
         let list = json["list"].as_array().context("子目录文件列表格式错误")?;
-
-        let mut files = Vec::new();
-        for item in list {
-            let fs_id = if let Some(id_str) = item["fs_id"].as_str() {
-                id_str.parse::<u64>().unwrap_or(0)
-            } else {
-                item["fs_id"].as_u64().unwrap_or(0)
-            };
-
-            let is_dir = if let Some(n) = item["isdir"].as_i64() {
-                n == 1
-            } else if let Some(s) = item["isdir"].as_str() {
-                s == "1"
-            } else {
-                false
-            };
-            let path = item["path"].as_str().unwrap_or_default().to_string();
-            let size = if let Some(n) = item["size"].as_u64() {
-                n
-            } else if let Some(s) = item["size"].as_str() {
-                s.parse::<u64>().unwrap_or(0)
-            } else {
-                0
-            };
-            let name = item["server_filename"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-
-            files.push(crate::transfer::SharedFileInfo {
-                fs_id,
-                is_dir,
-                path,
-                size,
-                name,
-            });
-        }
+        let files = crate::netdisk::share::common::parse_shared_files(list);
 
         info!("子目录文件列表: {} 个文件, dir={}", files.len(), dir);
         Ok(files)
@@ -2722,30 +2702,10 @@ impl NetdiskClient {
     ///
     /// # 返回
     /// 转存结果
-    pub async fn transfer_share_files(
-        &self,
-        shareid: &str,
-        share_uk: &str,
-        bdstoken: &str,
-        fs_ids: &[u64],
-        target_path: &str,
-        referer: &str,
-        internal_task_id: Option<&str>,
-    ) -> Result<crate::transfer::TransferResult> {
-        self.transfer_share_files_with_randsk(
-            shareid,
-            share_uk,
-            bdstoken,
-            fs_ids,
-            target_path,
-            referer,
-            internal_task_id,
-            None,
-        )
-            .await
-    }
-
-    pub async fn transfer_share_files_with_randsk(
+    /// 执行个人版转存
+    ///
+    /// 企业版走 [`crate::netdisk::share::apaas`]，不要直接调这个。
+    pub(crate) async fn transfer_share_files_personal(
         &self,
         shareid: &str,
         share_uk: &str,
@@ -2773,42 +2733,18 @@ impl NetdiskClient {
                 .join(",")
         );
 
-        let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
-            let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
-            let client = self.build_temp_client_with_proxy()?;
-            client
-                .post(&url)
-                .header("User-Agent", &self.web_user_agent)
-                .header("Referer", referer)
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .header("Cookie", cookie_header)
-                .form(&[("fsidlist", fsidlist.as_str()), ("path", target_path)])
-                .send()
-                .await
-        } else {
-            self.client
-                .post(&url)
-                .header("User-Agent", &self.web_user_agent)
-                .header("Referer", referer)
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .form(&[("fsidlist", fsidlist.as_str()), ("path", target_path)])
-                .send()
-                .await
-        };
-
-        let response = match response {
-            Ok(resp) => {
-                self.record_proxy_success();
-                resp
-            }
-            Err(e) => {
-                let err = anyhow::Error::from(e).context("转存请求失败");
-                self.record_proxy_failure(&err);
-                return Err(err);
-            }
-        };
-
-        let response_text = response.text().await.context("读取转存响应失败")?;
+        let response_text = self
+            .send_share_request(crate::netdisk::share::ShareHttpRequest {
+                url,
+                referer: referer.to_string(),
+                form: Some(vec![
+                    ("fsidlist", fsidlist),
+                    ("path", target_path.to_string()),
+                ]),
+                cookie_randsk: randsk,
+                error_context: "转存请求失败",
+            })
+            .await?;
         info!("转存响应: {}", response_text);
 
         let json: Value = serde_json::from_str(&response_text).context("解析转存响应失败")?;
@@ -2818,16 +2754,7 @@ impl NetdiskClient {
         if errno == 0 {
             // 🔥 检查是否为异步转存任务
             let task_id_value = &json["task_id"];
-            let is_async_task = if task_id_value.is_string() {
-                // task_id 是字符串且非空且不是 "0"
-                let task_id_str = task_id_value.as_str().unwrap_or("");
-                !task_id_str.is_empty() && task_id_str != "0"
-            } else if task_id_value.is_u64() || task_id_value.is_i64() {
-                // task_id 是数字且非0
-                task_id_value.as_u64().unwrap_or(0) != 0
-            } else {
-                false
-            };
+            let is_async_task = crate::netdisk::share::common::is_async_task_id(task_id_value);
 
             // 检查是否有 extra 字段
             let has_extra = json["extra"]["list"].is_array();
@@ -2835,11 +2762,8 @@ impl NetdiskClient {
             if is_async_task && !has_extra {
                 // 🔥 异步转存模式：task_id 非0 且没有 extra 字段
                 // 生成 task_id 字符串（拥有所有权，避免临时引用问题）
-                let task_id_string = if task_id_value.is_string() {
-                    task_id_value.as_str().unwrap_or("unknown").to_string()
-                } else {
-                    task_id_value.to_string()
-                };
+                let task_id_string =
+                    crate::netdisk::share::common::task_id_string(task_id_value);
 
                 let show_msg = json["show_msg"].as_str().unwrap_or("");
                 info!(
@@ -2857,24 +2781,10 @@ impl NetdiskClient {
             }
 
             // 🔥 同步转存模式：提取 extra.list
-            let extra_list = json["extra"]["list"].as_array();
-            let mut transferred_paths = Vec::new();
-            let mut transferred_fs_ids = Vec::new();
-            let mut from_paths = Vec::new();
-
-            if let Some(list) = extra_list {
-                for item in list {
-                    if let Some(path) = item["to"].as_str() {
-                        transferred_paths.push(path.to_string());
-                    }
-                    if let Some(from) = item["from"].as_str() {
-                        from_paths.push(from.to_string());
-                    }
-                    if let Some(fsid) = item["to_fs_id"].as_u64() {
-                        transferred_fs_ids.push(fsid);
-                    }
-                }
-            }
+            let (transferred_paths, from_paths, transferred_fs_ids) = json["extra"]["list"]
+                .as_array()
+                .map(|l| crate::netdisk::share::common::collect_transfer_entries(l))
+                .unwrap_or_default();
 
             Ok(crate::transfer::TransferResult {
                 success: true,
@@ -3039,7 +2949,7 @@ impl NetdiskClient {
     /// # 返回
     ///
     /// 成功时返回 `TransferResult`，包含转存的文件路径和 fs_id 列表
-    pub async fn query_transfer_task(
+    pub(crate) async fn query_transfer_task(
         &self,
         task_id: &str,
         shareid: &str,
@@ -3048,28 +2958,13 @@ impl NetdiskClient {
         referer: &str,
         internal_task_id: Option<&str>,
     ) -> Result<crate::transfer::TransferResult> {
-        use rand::Rng;
-
-        let mut attempt = 0;
+        let mut attempt = 0u32;
 
         loop {
             attempt += 1;
 
-            // 计算延迟时间（阶梯式策略 + 随机抖动）
-            let delay_ms = if attempt == 1 {
-                0 // 第 1 次：立即
-            } else {
-                let (base_ms, jitter_ms) = match attempt {
-                    2..=5 => (1000, 200),   // 第 2-5 次：1秒 ± 200ms
-                    6..=10 => (2000, 400),  // 第 6-10 次：2秒 ± 400ms
-                    _ => (5000, 1000),      // 第 11+ 次：5秒 ± 1000ms
-                };
-
-                // 生成随机抖动
-                let mut rng = rand::thread_rng();
-                let jitter = rng.gen_range(-jitter_ms..=jitter_ms);
-                (base_ms + jitter).max(0) as u64
-            };
+            // 阶梯式延迟 + 随机抖动，与企业版共用同一套节奏
+            let delay_ms = crate::netdisk::share::common::poll_delay_ms(attempt);
 
             // 等待延迟
             if delay_ms > 0 {
@@ -3158,29 +3053,13 @@ impl NetdiskClient {
                         );
 
                     let list = json["list"].as_array();
-                    let mut transferred_paths = Vec::new();
-                    let mut transferred_fs_ids = Vec::new();
-                    let mut from_paths = Vec::new();
+                    let (transferred_paths, from_paths, transferred_fs_ids) = list
+                        .map(|l| crate::netdisk::share::common::collect_transfer_entries(l))
+                        .unwrap_or_default();
 
-                    if let Some(list) = list {
-                        for item in list {
-                            if let Some(path) = item["to"].as_str() {
-                                transferred_paths.push(path.to_string());
-                            }
-                            if let Some(from) = item["from"].as_str() {
-                                from_paths.push(from.to_string());
-                            }
-                            if let Some(fsid) = item["to_fs_id"].as_u64() {
-                                transferred_fs_ids.push(fsid);
-                            }
-                        }
-
-                        info!(
-                                "异步转存成功: {} 个文件 (使用 list.length)",
-                                list.len()
-                            );
-                    } else {
-                        warn!("任务查询响应中没有 list 字段");
+                    match list {
+                        Some(l) => info!("异步转存成功: {} 个文件 (使用 list.length)", l.len()),
+                        None => warn!("任务查询响应中没有 list 字段"),
                     }
 
                     return Ok(crate::transfer::TransferResult {

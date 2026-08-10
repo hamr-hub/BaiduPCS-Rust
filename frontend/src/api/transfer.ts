@@ -121,12 +121,26 @@ export interface PreviewShareRequest {
   num?: number
 }
 
+/// 分享体系类型：个人版 / 企业版（apaas）
+///
+/// 两套体系的接口完全不同，后端据此分流。前端只需原样缓存并回传。
+export type ShareKind = 'personal' | 'apaas'
+
 /// 分享信息（用于目录导航）
 export interface PreviewShareInfo {
   short_key: string
   shareid: string
   uk: string
   bdstoken: string
+  /** 分享体系类型，子目录导航时需原样回传 */
+  kind: ShareKind
+  /**
+   * 提取码凭据。
+   *
+   * 企业版的 spwd 不在 Cookie 里，翻子目录必须回传，否则拿不到内容；
+   * 个人版为 randsk，回传只是为了两边一致。
+   */
+  token?: string
 }
 
 /// 预览分享文件响应
@@ -146,6 +160,10 @@ export interface PreviewShareDirRequest {
   page?: number
   /** 每页数量（默认 100） */
   num?: number
+  /** 分享体系类型，从预览结果原样回传（省略时后端按个人版处理） */
+  kind?: ShareKind
+  /** 提取码凭据，从预览结果原样回传（企业版必需） */
+  token?: string
 }
 
 /// 创建转存任务响应

@@ -11,7 +11,7 @@ use crate::task_slot_pool::{TaskSlotPool, TaskPriority};
 use crate::persistence::{
     DownloadRecoveryInfo, PersistenceManager, TaskMetadata,
 };
-use crate::server::events::{DownloadEvent, TaskEvent};
+use crate::server::events::{DownloadEvent, ProgressThrottler, TaskEvent};
 use crate::server::websocket::WebSocketManager;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1840,6 +1840,7 @@ impl DownloadManager {
                         max_concurrent_chunks,
                         persistence_manager: persistence_manager.clone(),
                         ws_manager: ws_manager.clone(),
+                        progress_throttler: Arc::new(ProgressThrottler::default()),
                         folder_progress_tx: folder_progress_tx.clone(),
                         backup_notification_tx: backup_notification_tx.clone(),
                         // 🔥 任务位借调机制字段
@@ -2703,6 +2704,9 @@ impl DownloadManager {
                                                 persistence_manager: persistence_manager_clone
                                                     .clone(),
                                                 ws_manager: ws_manager.clone(),
+                                                progress_throttler: Arc::new(
+                                                    ProgressThrottler::default(),
+                                                ),
                                                 folder_progress_tx: folder_progress_tx.clone(),
                                                 backup_notification_tx: backup_notification_tx.clone(),
                                                 // 🔥 任务位借调机制字段
@@ -3481,6 +3485,9 @@ impl DownloadManager {
                                                 persistence_manager: persistence_manager_clone
                                                     .clone(),
                                                 ws_manager: ws_manager.clone(),
+                                                progress_throttler: Arc::new(
+                                                    ProgressThrottler::default(),
+                                                ),
                                                 folder_progress_tx: folder_progress_tx.clone(),
                                                 backup_notification_tx: backup_notification_tx.clone(),
                                                 // 🔥 任务位借调机制字段

@@ -1362,10 +1362,6 @@ function handleDownloadEvent(event: DownloadEvent) {
     case 'progress':
       // 更新进度
       if (index !== -1) {
-        const currentStatus = downloadItems.value[index].status
-        if (currentStatus && ['pending', 'paused', 'decrypting', 'completed', 'failed'].includes(currentStatus)) {
-          break
-        }
         downloadItems.value[index].downloaded_size = event.downloaded_size
         downloadItems.value[index].total_size = event.total_size
         downloadItems.value[index].speed = event.speed
@@ -1388,18 +1384,13 @@ function handleDownloadEvent(event: DownloadEvent) {
         )
         const isFolderPaused = folderItem?.status === 'paused'
 
-        const detailTask = folderDetailDialog.value.tasks.find(t => t.id === taskId)
-        const isTerminalOrPaused = detailTask &&
-            ['pending', 'paused', 'decrypting', 'completed', 'failed'].includes(detailTask.status)
-        if (!isTerminalOrPaused) {
-          updateFolderDetailTask(taskId, {
-            downloaded_size: event.downloaded_size,
-            total_size: event.total_size,
-            speed: event.speed,
-            // 🔥 如果文件夹是暂停状态，子任务也应该保持暂停
-            status: isFolderPaused ? 'paused' as TaskStatus : 'downloading' as TaskStatus,
-          }, true)
-        }
+        updateFolderDetailTask(taskId, {
+          downloaded_size: event.downloaded_size,
+          total_size: event.total_size,
+          speed: event.speed,
+          // 🔥 如果文件夹是暂停状态，子任务也设为暂停；否则设为 downloading
+          status: isFolderPaused ? 'paused' as TaskStatus : 'downloading' as TaskStatus,
+        }, true)
       }
       break
 
@@ -1518,13 +1509,13 @@ function handleDownloadEvent(event: DownloadEvent) {
     case 'resumed':
       // 任务恢复
       if (index !== -1) {
-        // 恢复阶段先等待调度器确认，避免沿用暂停前的速度窗口。
-        downloadItems.value[index].status = 'pending'
-        downloadItems.value[index].speed = 0
+        // 🔥 设为 downloading 而不是 pending，这样 UI 会显示速度和剩余时间
+        // 后续的 progress 事件会更新实际的速度值
+        downloadItems.value[index].status = 'downloading'
         mainListWsTime.set(taskId, Date.now())
       }
       // 🔥 更新文件夹详情弹窗中的子任务恢复状态
-      updateFolderDetailTask(taskId, {status: 'pending' as TaskStatus, speed: 0}, true)
+      updateFolderDetailTask(taskId, {status: 'downloading' as TaskStatus}, true)
       break
 
     case 'deleted':

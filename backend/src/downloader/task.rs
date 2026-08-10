@@ -116,6 +116,14 @@ pub struct DownloadTask {
     #[serde(skip)]
     pub start_retry_count: u32,
 
+    /// 🔥 auto_requeue 退回次数（用于限制"下载阶段反复失败"的无限重排）
+    ///
+    /// `auto_requeue` 此前没有任何次数上限：一个持续失败的文件（例如 CDN 对该文件
+    /// 返回 403）会「失败 → 退回队尾 → 冷却 60s → 再失败」无限循环，一直烧槽位、
+    /// 刷日志，而且因为任务从不进入 `Failed`，所属文件夹永远到不了终态。
+    #[serde(skip)]
+    pub requeue_count: u32,
+
     // === 🔥 解密相关字段 ===
     /// 是否为加密文件（通过文件名或内容检测）
     #[serde(default)]
@@ -258,6 +266,7 @@ impl DownloadTask {
             is_backup: false,
             backup_config_id: None,
             start_retry_count: 0,
+            requeue_count: 0,
             // 解密字段初始化
             is_encrypted: false,
             decrypt_progress: 0.0,
@@ -405,6 +414,11 @@ impl DownloadTask {
     /// 标记为暂停
     pub fn mark_paused(&mut self) {
         self.status = TaskStatus::Paused;
+        // 🔥 暂停即不再产生流量，瞬时速度必须归零。
+        //
+        // 上层按子任务速度求和聚合文件夹 / 分享同步的整体速度；若这里不清零，
+        // 暂停任务会一直保留暂停那一刻的瞬时值并被累加进去，表现为
+        // 「只有一个任务在跑，界面却显示好几 MB/s」。
         self.speed = 0;
     }
 }
@@ -412,6 +426,29 @@ impl DownloadTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 暂停必须把瞬时速度归零。
+    ///
+    /// 上层（文件夹进度、分享同步子任务进度）是按子任务 `speed` 求和得到整体速度的。
+    /// 不清零的话，暂停/排队中的任务会一直贡献暂停那一刻的旧值 —— 实测出现过
+    /// 「只有 1 个任务在跑（78 KB/s），界面显示 4.39 MB/s」。
+    #[test]
+    fn test_mark_paused_clears_speed() {
+        let mut task = DownloadTask::new(
+            1,
+            "/a.bin".into(),
+            std::path::PathBuf::from("./a.bin"),
+            1024,
+            Uid::default(),
+        );
+        task.status = TaskStatus::Downloading;
+        task.speed = 4_600_000;
+
+        task.mark_paused();
+
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(task.speed, 0, "暂停后不得残留速度，否则会被上层累加");
+    }
 
     #[test]
     fn test_task_creation() {

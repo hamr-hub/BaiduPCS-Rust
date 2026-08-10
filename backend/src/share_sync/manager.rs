@@ -107,8 +107,10 @@ impl ShareSyncManager {
             .ok()
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(true);
-        // 被中断、待自动重跑的订阅 id(去重)。在订阅恢复后才知道哪些 enabled。
-        let mut interrupted_sub_ids: Vec<String> = Vec::new();
+        // 被中断的 run：订阅 id -> 该订阅名下所有被收编的 run_id。
+        // 需要 run_id 而不只是订阅 id —— 重跑之前要按 run 清掉候选快照，
+        // 否则那些永远不会被提升的候选会一直留在库里。
+        let mut interrupted_runs: BTreeMap<String, Vec<String>> = BTreeMap::new();
         if stale_fixup_enabled {
             match persistence.mark_running_runs_interrupted() {
                 Ok(interrupted) if !interrupted.is_empty() => {
@@ -117,9 +119,10 @@ impl ShareSyncManager {
                         interrupted.len()
                     );
                     for rec in &interrupted {
-                        if !interrupted_sub_ids.contains(&rec.subscription_id) {
-                            interrupted_sub_ids.push(rec.subscription_id.clone());
-                        }
+                        interrupted_runs
+                            .entry(rec.subscription_id.clone())
+                            .or_default()
+                            .push(rec.run_id.clone());
                     }
                 }
                 Ok(_) => {}
@@ -215,10 +218,10 @@ impl ShareSyncManager {
         // 的——已禁用的订阅不该被启动悄悄唤醒。后台 spawn,best-effort:账号尚未就绪时
         // execute_one 在创建 run 前就报错(不留失败记录),退避重试若干次;始终不行则交给
         // 调度器在下个轮询周期补上,不阻塞启动。
-        if resume_on_startup && !interrupted_sub_ids.is_empty() {
-            let resume_ids: Vec<String> = interrupted_sub_ids
+        if resume_on_startup && !interrupted_runs.is_empty() {
+            let resume_targets: Vec<(String, Vec<String>)> = interrupted_runs
                 .into_iter()
-                .filter(|id| {
+                .filter(|(id, _)| {
                     manager
                         .subscriptions
                         .get(id)
@@ -226,10 +229,10 @@ impl ShareSyncManager {
                         .unwrap_or(false)
                 })
                 .collect();
-            if !resume_ids.is_empty() {
+            if !resume_targets.is_empty() {
                 let mgr = Arc::clone(&manager);
                 tokio::spawn(async move {
-                    mgr.resume_interrupted_runs(resume_ids).await;
+                    mgr.resume_interrupted_runs(resume_targets).await;
                 });
             }
         }
@@ -237,16 +240,363 @@ impl ShareSyncManager {
         Ok(manager)
     }
 
+    /// 判断某条被中断的 run 能否「接着跑」而不是推倒重来。
+    ///
+    /// 三个条件缺一不可：
+    /// 1. **候选快照还在** —— 没有它就无法在收尾时推进基线，续跑的活儿等于白干
+    ///    （下一轮 diff 照样重做），不如直接重跑；
+    /// 2. **run_items 里记着 transfer_task_id** —— 这是找回"上一轮在做什么"的唯一线索；
+    /// 3. **那些转存任务已被恢复且仍是 `Downloading`** —— 说明源（网盘临时目录）还在、
+    ///    下载监控 watcher 也已由 `TransferManager::restore_task` 重建。若它已是终态
+    ///    或压根没恢复出来，说明这轮的活已经没法继续，只能重跑。
+    ///
+    /// 返回可续跑的转存任务 id 列表（去重）。任一条件不满足返回 `None`。
+    async fn probe_resumable_run(
+        &self,
+        sub_id: &str,
+        run_id: &str,
+        owner_uid: u64,
+    ) -> Option<Vec<String>> {
+        // 1) 候选快照
+        match self.persistence.snapshot_for_run(run_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                debug!("run {} 无候选快照，无法续跑（将清理后重跑）", run_id);
+                return None;
+            }
+            Err(e) => {
+                warn!("读取 run {} 的候选快照失败，按不可续跑处理: {}", run_id, e);
+                return None;
+            }
+        }
+
+        // 2) run_items 里的 transfer_task_id
+        let items = match self.persistence.list_run_items(run_id) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("读取 run {} 的 items 失败，按不可续跑处理: {}", run_id, e);
+                return None;
+            }
+        };
+        let mut task_ids: Vec<String> = items
+            .iter()
+            .filter(|it| !is_terminal_run_item_status(&it.status))
+            .filter_map(|it| it.transfer_task_id.clone())
+            .collect();
+        task_ids.sort();
+        task_ids.dedup();
+        if task_ids.is_empty() {
+            debug!("run {} 没有未完成且带转存任务的 item，无需续跑", run_id);
+            return None;
+        }
+
+        // 3) 该订阅还有**没下完的下载**（文件夹段 / 单文件段）
+        //
+        // 注意这里看的是**下载**，不是转存任务。
+        //
+        // 转存任务一旦启动了自动下载就会被落盘成 completed 并移入历史库
+        // （见 `transfer/manager.rs` 的「转存任务已标记完成（自动下载已启动）」），
+        // 所以重启后 `restore_task` 根本不会把它恢复成活跃任务 —— 拿它当判据，
+        // 分享直下这条路永远判不出"可续跑"。真正还在跑的活儿在文件夹下载 /
+        // 下载子任务上，而它们是会被恢复的（恢复成暂停态）。
+        //
+        // `collect_share_sync_subtasks` 按 backup_config_id 查，同时覆盖两段，
+        // 与前端「进行中子任务」用的是同一份数据。
+        let tm = self.resolver.transfer_manager(owner_uid).await?;
+        let unfinished = collect_share_sync_subtasks(&tm, sub_id, owner_uid)
+            .await
+            .into_iter()
+            .filter(|s| s.kind == "download" && !is_terminal_subtask_status(&s.status))
+            .count();
+        if unfinished == 0 {
+            debug!(
+                "run {} 所属订阅没有未完成的下载，无需续跑（将清理后重跑）",
+                run_id
+            );
+            return None;
+        }
+        debug!(
+            "run {} 可续跑：订阅 {} 还有 {} 个未完成的下载子任务",
+            run_id, sub_id, unfinished
+        );
+        Some(task_ids)
+    }
+
+    /// 接管一条可续跑的 run：唤醒残留下载 → 等转存任务跑完 → 给 run 收尾。
+    ///
+    /// 这是「重启续跑」的核心，替代原来的"推倒重来"：不再重新抓取/转存，而是让上一轮
+    /// 已经转存好、正在下载的那批活儿接着做完，最后正常收尾并推进基线。
+    ///
+    /// 为什么需要它：`wait_transfer_task` 跑在 `execute_one` 的调用栈里，进程一重启
+    /// 那个 future 就没了。转存任务本身会被 `TransferManager::restore_task` 恢复、
+    /// 下载监控 watcher 也会重建，但**没有任何东西在等它、给 run 收尾** ——
+    /// 于是 run 永远停在 Interrupted、基线永远不推进、下一轮全部重做。
+    ///
+    /// 期间占住该订阅的 in-flight 标记，避免调度器起一轮竞争的 run。
+    async fn resume_run_in_place(
+        self: Arc<Self>,
+        sub_id: String,
+        run_id: String,
+        owner_uid: u64,
+        transfer_task_ids: Vec<String>,
+    ) {
+        const POLL_INTERVAL_SECS: u64 = 2;
+        // 唤醒残留下载的节流，与 wait_transfer_task 里的 paused-resume 同口径
+        const RESUME_INTERVAL_SECS: u64 = 10;
+
+        if self.running.insert(sub_id.clone(), ()).is_some() {
+            debug!("续跑接管: 订阅 {} 已有 run 在执行，放弃接管", sub_id);
+            return;
+        }
+        struct RunGuard<'g> {
+            running: &'g DashMap<String, ()>,
+            id: String,
+        }
+        impl Drop for RunGuard<'_> {
+            fn drop(&mut self) {
+                self.running.remove(&self.id);
+            }
+        }
+        let _guard = RunGuard {
+            running: &self.running,
+            id: sub_id.clone(),
+        };
+
+        let Some(tm) = self.resolver.transfer_manager(owner_uid).await else {
+            warn!("续跑接管: 订阅 {} 的转存管理器不可用，放弃接管", sub_id);
+            return;
+        };
+
+        info!(
+            "share_sync 续跑接管: 订阅 {} run={} 接管 {} 个转存任务，不再重跑",
+            sub_id,
+            run_id,
+            transfer_task_ids.len()
+        );
+        // 🔥 接管即把 run 标回 `running`。
+        //
+        // `mark_running_runs_interrupted()` 只收编 `status = 'running'` 的 run。
+        // 若接管后把状态留在 `interrupted`，进程再被杀一次，下次启动就找不到这条
+        // run —— 不收编、不续跑，这批活儿直接变孤儿（实测踩到过：接管跑到一半被杀，
+        // 重启后一条续跑日志都没有，前端全是暂停）。
+        if let Err(e) = self.persistence.mark_run_running(&run_id) {
+            warn!("续跑接管: 标记 run 为运行中失败 run_id={}, error={}", run_id, e);
+        }
+        let _ = self
+            .persistence
+            .update_run_phase(&run_id, RUN_PHASE_EXECUTING);
+
+        // 🔥 续跑期间同样要开进度广播器（每秒推一帧 `item_progress`）。
+        //
+        // 正常 run 在 `execute_one_with_run_id` 里 spawn 了同一个广播器；接管路径漏掉
+        // 的话，前端在整个续跑期间收不到任何推送，界面停在接管那一刻不动，
+        // 只能靠切页面触发 REST 兜底拉取 —— 表现就是"速度不动，切菜单回来才刷新"。
+        let progress_handle = {
+            let publisher = Arc::clone(&self.publisher);
+            let transfer = Arc::clone(&tm);
+            let rid = run_id.clone();
+            let sid = sub_id.clone();
+            tokio::spawn(async move {
+                broadcast_subtask_progress(publisher, transfer, rid, sid, owner_uid).await;
+            })
+        };
+        // 无论从哪条分支退出（跑完 / 硬上限）都要停掉广播器，避免留下永不退出的后台任务。
+        struct ProgressGuard(tokio::task::JoinHandle<()>);
+        impl Drop for ProgressGuard {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _progress_guard = ProgressGuard(progress_handle);
+
+        // 兜底上限：waiter 期间占着该订阅的 in-flight 标记，调度器无法再起新一轮。
+        // 万一转存任务因为某种原因永远不到终态，没有上限就意味着这个订阅**永久停摆**。
+        // 复用与正常 run 相同的硬上限（默认 7 天，`BAIDUPCS_SHARE_SYNC_TASK_HARD_TIMEOUT_SECS`）。
+        let started_at = tokio::time::Instant::now();
+        let hard_timeout = share_sync_task_hard_timeout();
+
+        let mut last_resume_at: Option<tokio::time::Instant> = None;
+        loop {
+            if let Some(cap) = hard_timeout {
+                if started_at.elapsed() >= cap {
+                    warn!(
+                        "share_sync 续跑接管: 订阅 {} run={} 超过硬上限 {}s 仍未结束，放弃接管并按失败收尾",
+                        sub_id,
+                        run_id,
+                        cap.as_secs()
+                    );
+                    break;
+                }
+            }
+            // 唤醒残留下载：重启后它们都是暂停态，没人拉起就永远不动。
+            // 与 wait_transfer_task 同款闸门：槽位满时不硬唤醒（否则只是把自己挪到队尾）。
+            let now = tokio::time::Instant::now();
+            let resume_due = last_resume_at
+                .map(|last| now.duration_since(last) >= Duration::from_secs(RESUME_INTERVAL_SECS))
+                .unwrap_or(true);
+            if resume_due {
+                last_resume_at = Some(now);
+                let has_slot = match tm.download_manager_handle().await {
+                    Some(dm) => dm.task_slot_pool().available_slots().await > 0,
+                    None => true,
+                };
+                if has_slot {
+                    let paused: Vec<ShareSyncSubtask> =
+                        collect_share_sync_subtasks(&tm, &sub_id, owner_uid)
+                            .await
+                            .into_iter()
+                            .filter(|s| s.status == "paused")
+                            .collect();
+                    if !paused.is_empty() {
+                        let n =
+                            restart_stalled_share_sync_downloads(&tm, &paused, Duration::ZERO).await;
+                        if n > 0 {
+                            info!(
+                                "share_sync 续跑接管: 订阅 {} 唤醒了 {} 个残留下载",
+                                sub_id, n
+                            );
+                        }
+                    }
+                }
+            }
+
+            // 这批下载都跑完了吗？
+            //
+            // 等的是**下载**而不是转存任务：转存任务启动自动下载后就被落盘成
+            // completed 并移入历史，重启后压根不会被恢复（见 `probe_resumable_run`
+            // 的说明）。真正承载进度的是文件夹下载 / 下载子任务。
+            let unfinished = collect_share_sync_subtasks(&tm, &sub_id, owner_uid)
+                .await
+                .into_iter()
+                .filter(|s| s.kind == "download" && !is_terminal_subtask_status(&s.status))
+                .count();
+            if unfinished == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        }
+
+        self.finalize_resumed_run(&sub_id, &run_id, owner_uid, &tm)
+            .await;
+    }
+
+    /// 给续跑完成的 run 收尾：补齐 item 状态 → 汇总 run 状态 → 落库 → 推进/清理基线。
+    async fn finalize_resumed_run(
+        &self,
+        sub_id: &str,
+        run_id: &str,
+        owner_uid: u64,
+        tm: &TransferManager,
+    ) {
+        use crate::share_sync::types::{DiffSummary, RunItemStatus, RunStatus};
+
+        // 1) 看这批下载有没有失败的 —— 判据与等待条件同源（都看下载，不看转存任务）。
+        //
+        // 收尾粒度是「整批」而不是逐个 item：run_item 记的是转存任务 id，而一个转存
+        // 任务往往对应一整个文件夹下载，没法反查到单个文件的成败。这与现有语义一致
+        // ——`should_advance_snapshot_baseline` 本来就是全或无。
+        let download_failed = collect_share_sync_subtasks(tm, sub_id, owner_uid)
+            .await
+            .into_iter()
+            .filter(|s| s.kind == "download")
+            .any(|s| matches!(s.status.as_str(), "failed" | "cancelled" | "downloadfailed"));
+
+        let items = self.persistence.list_run_items(run_id).unwrap_or_default();
+        let mut failed = 0usize;
+        let mut completed = 0usize;
+        let mut skipped = 0usize;
+        for it in &items {
+            if is_terminal_run_item_status(&it.status) {
+                match it.status.as_str() {
+                    "failed" => failed += 1,
+                    "skipped" => skipped += 1,
+                    _ => completed += 1,
+                }
+                continue;
+            }
+            // 还挂着的 item：按整批下载的结果统一判定
+            let (status, err) = if download_failed {
+                (
+                    RunItemStatus::Failed,
+                    Some("重启续跑：本批下载存在失败项".to_string()),
+                )
+            } else {
+                (RunItemStatus::Completed, None)
+            };
+            match status {
+                RunItemStatus::Completed => completed += 1,
+                _ => failed += 1,
+            }
+            let _ = self
+                .persistence
+                .update_run_item_status(it.id, status, err.as_deref());
+        }
+
+        // 2) 汇总 run 状态
+        let status = if failed > 0 {
+            RunStatus::CompletedWithErrors
+        } else {
+            RunStatus::Completed
+        };
+        let summary = DiffSummary {
+            total: items.len(),
+            failed,
+            skipped,
+            ..Default::default()
+        };
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = self
+            .persistence
+            .finish_run(run_id, now, status, &summary, None)
+        {
+            warn!("续跑收尾: finish_run 失败 run_id={}, error={}", run_id, e);
+        }
+
+        // 3) 推进或清理候选快照 —— 判据与正常收尾完全一致
+        if should_advance_snapshot_baseline(status) {
+            match self.persistence.promote_snapshot(run_id) {
+                Ok(true) => info!(
+                    "share_sync 续跑收尾: 订阅 {} run={} 干净完成，已推进快照基线",
+                    sub_id, run_id
+                ),
+                Ok(false) => warn!("续跑收尾: 找不到候选快照，未推进基线 run_id={}", run_id),
+                Err(e) => warn!("续跑收尾: 提升候选快照失败 run_id={}, error={}", run_id, e),
+            }
+        } else {
+            warn!(
+                "share_sync 续跑收尾: 订阅 {} run={} 有 {} 项失败，不推进基线，下一轮会重试",
+                sub_id, run_id, failed
+            );
+            if let Err(e) = self.persistence.delete_snapshot_for_run(run_id) {
+                warn!("续跑收尾: 清理候选快照失败 run_id={}, error={}", run_id, e);
+            }
+        }
+
+        // 4) 广播，让前端把这条 run 从「运行中」收掉
+        self.publisher.publish(ShareSyncEvent::RunCompleted {
+            run_id: run_id.into(),
+            subscription_id: sub_id.into(),
+            added: completed,
+            modified: 0,
+            removed: 0,
+            failed,
+            owner_uid,
+            duration_ms: None,
+            n_bisects: None,
+            max_bisect_depth: None,
+        });
+    }
+
     /// 启动期对被中断的订阅自动重跑一次。best-effort:先**轮询等账号登录态就绪**
     /// 再触发,避免账号没恢复时 execute_one 反复在「抓取阶段」失败、刷出一堆失败 run。
     /// 等到就绪(或超时)后只触发一次;触发不成则交给轮询调度兜底。供 `new` 后台调用。
-    async fn resume_interrupted_runs(self: Arc<Self>, sub_ids: Vec<String>) {
+    async fn resume_interrupted_runs(self: Arc<Self>, targets: Vec<(String, Vec<String>)>) {
         // 给账号登录态恢复留点时间(进程刚起,resolver 可能还没就绪)。
         const RESUME_INITIAL_DELAY_SECS: u64 = 5;
         const READY_MAX_ATTEMPTS: u32 = 12;
         const READY_RETRY_DELAY_SECS: u64 = 10;
         tokio::time::sleep(std::time::Duration::from_secs(RESUME_INITIAL_DELAY_SECS)).await;
-        for id in sub_ids {
+        for (id, interrupted_run_ids) in targets {
             let owner_uid = match self.get_subscription(&id) {
                 Some(s) => s.owner_uid,
                 None => continue, // 订阅启动后被删,跳过
@@ -269,6 +619,60 @@ impl ShareSyncManager {
                 );
                 continue;
             }
+            // 🔥 重跑之前先清掉上一轮的残留（否则每中断一次就叠一批孤儿）。
+            //
+            // 需要清的东西：
+            //   - 内部转存任务 + 其衍生下载任务（`delete_tasks_for_backup_config` 连带处理）
+            //   - tree 模式产生的文件夹下载（同上，按 backup_config_id 归属）
+            //   - 被中断那几轮的候选快照（它们永远不会被提升了）
+            //
+            // 为什么此刻清是安全的：本轮还没建任何新任务，而上一轮的残留在重启后
+            // 都是暂停态、没有任何 run 在驱动它们。唯一的例外是调度器抢先触发了新
+            // 一轮 —— 那种情况下 `running` 里已有在飞的 run，跳过清理与重跑，交给它。
+            if self.running.contains_key(&id) {
+                debug!(
+                    "share_sync 启动续跑: 订阅 {} 已有 run 在执行（调度器抢先），跳过清理与重跑",
+                    id
+                );
+                continue;
+            }
+
+            // 🔥 先看能不能「接着跑」——能续就不推倒重来（判据见 `probe_resumable_run`）。
+            // 只接管一条：同一订阅同一时刻只允许一个 run 在飞。
+            let mut taken_over = false;
+            for run_id in &interrupted_run_ids {
+                if let Some(task_ids) = self.probe_resumable_run(&id, run_id, owner_uid).await {
+                    let mgr = Arc::clone(&self);
+                    let sub = id.clone();
+                    let rid = run_id.clone();
+                    tokio::spawn(async move {
+                        mgr.resume_run_in_place(sub, rid, owner_uid, task_ids).await;
+                    });
+                    taken_over = true;
+                    break;
+                }
+            }
+            if taken_over {
+                // 已被接管：残留正是要接着做的活，绝不能清；也不重跑。
+                continue;
+            }
+
+            for run_id in &interrupted_run_ids {
+                if let Err(e) = self.persistence.delete_snapshot_for_run(run_id) {
+                    warn!("清理中断 run 的候选快照失败: run_id={}, error={}", run_id, e);
+                }
+            }
+            let cfg_id = share_sync_backup_config_id(&id);
+            if let Some(transfer) = self.resolver.transfer_manager(owner_uid).await {
+                let (mem, hist) = transfer.delete_tasks_for_backup_config(&cfg_id).await;
+                if mem > 0 || hist > 0 {
+                    info!(
+                        "share_sync 启动续跑: 订阅 {} 已清理上一轮残留（转存内存={}, 历史={}，连带下载/文件夹子任务）",
+                        id, mem, hist
+                    );
+                }
+            }
+
             match self.execute_one(&id).await {
                 Ok(_) => info!("share_sync 启动续跑: 订阅 {} 已重新同步", id),
                 // 调度器抢先触发了 —— 正常,无需重复。
@@ -943,6 +1347,26 @@ impl ShareSyncManager {
         //    未落地的新版本标记成已同步，后续轮询 diff 变空而不再重试。
         let mut curr_snapshot = curr_snapshot;
         curr_snapshot.subscription_id = id.into();
+
+        // 抓取已完成，先把这份快照作为**候选**落库（`run_id = 本轮 run`）。
+        //
+        // 它此刻还不是基线 —— `latest_snapshot` 过滤 `run_id IS NULL`，看不到它。
+        // 落库的唯一目的是：进程若在执行期间重启，仍能拿回"这一轮抓到了什么"，
+        // 从而给被中断的 run 收尾并推进基线（续跑）。否则这份快照只存在于内存，
+        // 重启即丢，被中断的 run 永远无法完成，基线永远不推进。
+        //
+        // 写失败只告警：后续 `promote_snapshot` 会因为找不到候选而返回 false，
+        // 退化成"不推进基线"，下一轮 diff 重做本次内容 —— 与改动前的失败语义一致。
+        if let Err(e) = self
+            .persistence
+            .save_candidate_snapshot(&curr_snapshot, &run_id)
+        {
+            warn!(
+                "落候选快照失败（本轮结束后将无法推进基线，下次同步会重试本次 diff）: run_id={}, error={}",
+                run_id, e
+            );
+        }
+
         let prev = self.persistence.latest_snapshot(id).ok().flatten();
 
         // 3) diff
@@ -1033,14 +1457,27 @@ impl ShareSyncManager {
         // 才推进快照基线。否则被跳过、尚未真正落地的项会被写入新基线，导致下一次
         // diff 不再包含它们 —— 即使后来腾出空间也不会补传。
         if should_advance_snapshot_baseline(outcome.status) && !outcome.resource_skipped {
-            if let Err(e) = self.persistence.save_snapshot(&curr_snapshot) {
-                warn!("save_snapshot 失败，下一次同步会重试本次 diff: {}", e);
+            // 把抓取阶段落的候选快照提升为基线（单事务：删旧基线 + 候选转正）。
+            match self.persistence.promote_snapshot(&outcome.run_id) {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    "run 成功但找不到候选快照（落库时可能失败过），未推进基线，下一次同步会重试本次 diff: run_id={}",
+                    outcome.run_id
+                ),
+                Err(e) => warn!(
+                    "提升候选快照为基线失败，下一次同步会重试本次 diff: run_id={}, error={}",
+                    outcome.run_id, e
+                ),
             }
         } else {
             warn!(
                 "share-sync: run 未完全成功或有资源类跳过，不推进快照基线，下一次将重试 diff: run_id={}, status={:?}, failed={}, resource_skipped={}",
                 outcome.run_id, outcome.status, outcome.diff_summary.failed, outcome.resource_skipped
             );
+            // 候选已无用（这轮不会再被续跑：run 已到终态），清掉防止累积。
+            if let Err(e) = self.persistence.delete_snapshot_for_run(&outcome.run_id) {
+                warn!("清理候选快照失败: run_id={}, error={}", outcome.run_id, e);
+            }
         }
 
         // 5) 广播
@@ -1105,6 +1542,11 @@ impl ShareSyncManager {
             &DiffSummary::default(),
             Some(err),
         );
+        // run 已落到终态 Failed，不会再被续跑；若抓取阶段已落过候选快照，
+        // 此刻它已无用，清掉防止候选在库里累积。
+        if let Err(e) = self.persistence.delete_snapshot_for_run(run_id) {
+            warn!("清理候选快照失败: run_id={}, error={}", run_id, e);
+        }
         self.publisher.publish(ShareSyncEvent::RunFailed {
             run_id: run_id.into(),
             subscription_id: sub_id.into(),
@@ -1320,6 +1762,89 @@ fn basename_of(path: &str) -> String {
         .to_string()
 }
 
+/// 一组下载任务是否「没有一个真的在跑，却有在等待队列里」。
+///
+/// 这是 [`ProductionHooks::is_waiting_for_download_slot`] 的判定核心，抽成纯函数
+/// 便于单测（那个方法本身要拿 DownloadManager，测不动）。
+///
+/// 注意不能复用 [`TaskStatus::is_active_download_status`]：它把 `Pending` 也算作
+/// 「活跃」（那是速度聚合的口径），拿它判断会永远得出「有任务在跑」。
+fn no_progress_but_queued<'a>(
+    statuses: impl Iterator<Item = &'a crate::downloader::TaskStatus>,
+) -> bool {
+    use crate::downloader::TaskStatus;
+
+    let mut any_running = false;
+    let mut any_pending = false;
+    for status in statuses {
+        match status {
+            TaskStatus::Downloading | TaskStatus::Decrypting => any_running = true,
+            TaskStatus::Pending => any_pending = true,
+            _ => {}
+        }
+    }
+    any_pending && !any_running
+}
+
+/// run_item 是否已到终态（不会再变）。
+///
+/// 对应 [`RunItemStatus`] 里的 `Completed` / `Failed` / `Skipped`；
+/// `Pending` / `Transferring` / `Downloading` / `Deleting` 都还在途中。
+fn is_terminal_run_item_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "skipped")
+}
+
+/// 文件夹是否「还有活没做完，但一个都没在跑」。
+///
+/// 与 [`no_progress_but_queued`] 的差别：**这里把 `Paused` 也算作待办**。
+///
+/// 原因：重启恢复出来的文件夹子任务是以 `Paused` 创建的
+/// （日志「恢复模式补任务完成: 文件夹 X 创建了 N 个暂停任务」），
+/// 之后进入等待队列时状态也不变（`add_to_waiting_queue_*` 只入队、不改状态）。
+/// 若只认 `Pending`，重启后所有在等槽位的文件夹都会一直显示「下载中」。
+///
+/// 「用户显式暂停」的歧义在调用方消解：[`folder_subtask_status`] 只在
+/// `FolderStatus::Downloading` 时才改写状态，而用户暂停的文件夹自身是
+/// `FolderStatus::Paused`，不会走到这里。
+fn folder_has_queued_work<'a>(
+    statuses: impl Iterator<Item = &'a crate::downloader::TaskStatus>,
+) -> bool {
+    use crate::downloader::TaskStatus;
+
+    let mut any_running = false;
+    let mut any_unfinished = false;
+    for status in statuses {
+        match status {
+            TaskStatus::Downloading | TaskStatus::Decrypting => any_running = true,
+            TaskStatus::Pending | TaskStatus::Paused => any_unfinished = true,
+            _ => {}
+        }
+    }
+    any_unfinished && !any_running
+}
+
+/// 文件夹下载在子任务列表里上报的状态。
+///
+/// `waiting_for_slot`（子任务全在等待队列、没有一个在跑，见 [`no_progress_but_queued`]）
+/// 时把 `Downloading` 改报成 `"pending"`，与单文件段（`TaskStatus::Pending` →
+/// 前端「等待中」）口径一致。1 个任务槽时抢不到槽位的文件夹就处于这个状态。
+///
+/// **只改写 `Downloading` 这一档**，其余状态一律照实上报：
+/// - `Scanning`：还在列目录，是真的在干活，不该说成「等待中」
+/// - `Failed` / `Cancelled`：终态。改写成 `pending` 会让它从终态变成非终态，
+///   REST `subtasks()` 的终态过滤失效，失败的文件夹会永远挂在「等待中」不消失
+/// - `Paused`：用户显式暂停，不是在等槽位
+/// - `Completed`：同理，终态
+fn folder_subtask_status(
+    folder_status: crate::downloader::FolderStatus,
+    waiting_for_slot: bool,
+) -> String {
+    if waiting_for_slot && folder_status == crate::downloader::FolderStatus::Downloading {
+        return "pending".to_string();
+    }
+    format!("{:?}", folder_status).to_lowercase()
+}
+
 /// 收集某个订阅当前的子任务进度（下载段 + 内部转存段），按 `backup_config_id` 归属。
 ///
 /// REST 轮询接口与「每个 run 的进度广播器」共用此函数，保证两条链路形状一致。
@@ -1394,26 +1919,40 @@ pub async fn collect_share_sync_subtasks(
     // 也不走 is_backup 的 get_tasks_by_backup_config,因此在此按文件夹级聚合进度。
     if let Some(fdm) = transfer.folder_download_manager_handle().await {
         for f in fdm.get_folders_by_backup_config(&cfg).await {
-            // 文件夹本身不持有速度，按其活跃子文件任务(group_id==folder.id)的
-            // 瞬时速度求和聚合，口径与文件夹进度广播器(folder_manager)一致。
-            // 必须用 is_active_download_status 而非单匹配 Downloading：
-            // folder group 子任务会在 Downloading ↔ Decrypting ↔ Pending 之间切换，
-            // 仅 Downloading 会漏掉解密中/等待中的子任务的速度贡献 → 前端恒为 0。
-            let speed: u64 = if let Some(dm) = dm_handle.as_ref() {
-                dm.get_tasks_by_group(&f.id)
-                    .await
+            // 文件夹本身不持有速度，按其子文件任务(group_id==folder.id)的瞬时速度求和。
+            //
+            // **只统计 `Downloading`**，与 `folder_manager` / `folder_download` handler
+            // 两处的口径一致（那边注释也是「速度只统计仍在下载中的子任务」）。
+            //
+            // 这里原本用 `is_active_download_status()`，它包含 `Pending` —— 而任务被
+            // 暂停/入队时并不会把 `speed` 字段清零（只有 `auto_requeue_task` 那条错误
+            // 路径清），于是排队中任务保留着上一次的速度值，全被加进总和：
+            // 1 个任务实际只跑 78 KB/s，界面却显示 4.39 MB/s。
+            // 排队中的任务本来就没有速度贡献，按 0 计才是对的。
+            //
+            // 顺带用同一次查询判断「整个文件夹卡在排队等槽位」（见 `folder_subtask_status`）：
+            // 只有 1 个任务槽时，抢不到槽位的文件夹 fixed_slot_id=None、子任务全部
+            // 停在 Pending，但 FolderStatus 仍是 Downloading（它没有 Pending 这一档），
+            // 照原样上报会让前端显示「下载中」而实际一个字节没动。
+            let (speed, waiting_for_slot) = if let Some(dm) = dm_handle.as_ref() {
+                let children = dm.get_tasks_by_group(&f.id).await;
+                let speed = children
                     .iter()
-                    .filter(|t| t.status.is_active_download_status())
+                    .filter(|t| t.status == crate::downloader::TaskStatus::Downloading)
                     .map(|t| t.speed)
-                    .sum()
+                    .sum();
+                (
+                    speed,
+                    folder_has_queued_work(children.iter().map(|t| &t.status)),
+                )
             } else {
-                0
+                (0, false)
             };
             out.push(ShareSyncSubtask {
                 task_id: format!("folder:{}", f.id),
                 name: f.name.clone(),
                 kind: "download".to_string(),
-                status: format!("{:?}", f.status).to_lowercase(),
+                status: folder_subtask_status(f.status.clone(), waiting_for_slot),
                 downloaded: f.downloaded_size,
                 total: f.total_size,
                 progress: f.progress(),
@@ -1456,7 +1995,15 @@ fn restartable_share_sync_download(
     }
 
     if let Some(folder_id) = subtask.task_id.strip_prefix("folder:") {
-        return matches!(subtask.status.as_str(), "scanning" | "downloading" | "paused")
+        // "pending" = 子任务全在等待队列（见 `folder_subtask_status`）。必须留在
+        // 可重启集合里：这个状态既可能是「在排队等槽位」，也可能是「有空槽却卡住」。
+        // 前者由 wait_transfer_task 的 `is_waiting_for_download_slot` 分支把 idle
+        // 清零，stall 重试根本不会触发；只有后者才会走到这里被 pause+resume 踢一下。
+        // 若把 pending 排除掉，真卡死的文件夹就再也没人救，只能干等到 idle 超时失败。
+        return matches!(
+            subtask.status.as_str(),
+            "scanning" | "downloading" | "paused" | "pending"
+        )
             .then(|| RestartableShareSyncDownload::Folder(folder_id.to_string()));
     }
 
@@ -1683,6 +2230,13 @@ fn env_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok())
 }
 
+/// 空转多久后才去探测「是不是在排队等槽位」。
+///
+/// `is_waiting_for_download_slot()` 要遍历下载任务表，1 秒一次的轮询里每轮都查
+/// 太浪费；正常有进展时 idle 根本涨不到这个值，只有真的停住了才需要区分
+/// 「排队等槽」和「卡死」。
+const QUEUE_WAIT_PROBE_AFTER: Duration = Duration::from_secs(30);
+
 fn share_sync_task_idle_timeout(default: Duration) -> Duration {
     env_duration_secs("BAIDUPCS_SHARE_SYNC_TASK_IDLE_TIMEOUT_SECS").unwrap_or(default)
 }
@@ -1731,9 +2285,14 @@ async fn emit_subtask_progress(
     run_id: &str,
     subscription_id: &str,
     owner_uid: u64,
+    reported_terminal: &mut std::collections::HashSet<String>,
 ) {
     let subs = collect_share_sync_subtasks(transfer, subscription_id, owner_uid).await;
     for s in subs {
+        // 终态只推一次（见 `broadcast_subtask_progress` 的说明）
+        if is_terminal_subtask_status(&s.status) && !reported_terminal.insert(s.task_id.clone()) {
+            continue;
+        }
         publisher.publish(ShareSyncEvent::ItemProgress {
             run_id: run_id.to_string(),
             subscription_id: subscription_id.to_string(),
@@ -1760,9 +2319,24 @@ async fn broadcast_subtask_progress(
     owner_uid: u64,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    // 已经推过终态的子任务：终态只推**一次**，之后不再重复。
+    //
+    // 前端 `upsertSubtask` 收到终态的处理是「从进行中列表移除」，所以终态必须推一次
+    // （否则跑完的子任务会一直挂在界面上）；但重复推就变成每秒「收到 → 移除」，
+    // 白占带宽，日志也被刷满。REST 的 `subtasks()` 本来就只返回非终态，这里对齐它的
+    // 语义：进行中的持续推，终态推一次即止。
+    let mut reported_terminal: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         ticker.tick().await;
-        emit_subtask_progress(&publisher, &transfer, &run_id, &subscription_id, owner_uid).await;
+        emit_subtask_progress(
+            &publisher,
+            &transfer,
+            &run_id,
+            &subscription_id,
+            owner_uid,
+            &mut reported_terminal,
+        )
+            .await;
     }
 }
 
@@ -1775,7 +2349,17 @@ async fn broadcast_subtask_progress_once(
     owner_uid: u64,
 ) {
     if let Some(tm) = transfer {
-        emit_subtask_progress(&publisher, &tm, &run_id, &subscription_id, owner_uid).await;
+        // run 结束后的最终帧：用空集合，保证终态一定会被推出去（前端据此移除）
+        let mut reported_terminal = std::collections::HashSet::new();
+        emit_subtask_progress(
+            &publisher,
+            &tm,
+            &run_id,
+            &subscription_id,
+            owner_uid,
+            &mut reported_terminal,
+        )
+            .await;
     }
 }
 
@@ -1799,6 +2383,66 @@ impl ProductionHooks {
     /// 永不与自动备份的 UUID 配置 id 冲突，故 `is_backup=true` 复用不会挂到自动备份。
     fn share_sync_backup_config_id(&self) -> String {
         share_sync_backup_config_id(&self.subscription_id)
+    }
+
+    /// 当前账号的下载槽位池是否还有空位。
+    ///
+    /// 拿不到下载管理器时返回 `true`（不阻断），维持旧行为。
+    async fn has_free_download_slot(&self) -> bool {
+        let tm = self.transfer_manager();
+        match tm.download_manager_handle().await {
+            Some(dm) => dm.task_slot_pool().available_slots().await > 0,
+            None => true,
+        }
+    }
+
+    /// 本订阅是否正卡在「等下载槽位」上。
+    ///
+    /// 三个条件同时成立才算：
+    /// 1. 槽位池当前没有空位；
+    /// 2. 本订阅**没有任何**下载子任务真的在跑（Downloading / Decrypting）；
+    /// 3. 本订阅有下载子任务在等待队列里（`Pending`）。
+    ///
+    /// 条件 2、3 的判定抽在 [`no_progress_but_queued`] 里（纯函数，便于单测）。
+    ///
+    /// 条件 2 不能省：槽位可能正被**本订阅自己**占着（pool=1 时文件 1 在下载、
+    /// 文件 2..N 排队）。此时若只看「池满 + 有 Pending」就判定在排队，会把
+    /// idle 一直清零 —— 万一那个在下载的其实卡死在 0 字节，stall 重试和 idle
+    /// 超时就都失效了，run 会一直挂到 7 天硬超时，比改动前更糟。有任务真的在跑
+    /// 时就该老老实实走原来的停滞检测。
+    ///
+    /// 满足时的处理：
+    /// - 不触发 stall 重试（重试也抢不到槽，只会把自己挪到队尾、打乱 FIFO）
+    /// - 不计入 idle 超时（否则非会员 1 槽位场景下，排在后面的同步会在
+    ///   30 分钟后被误判为「等待任务完成超时」而整个 run 失败）
+    async fn is_waiting_for_download_slot(&self) -> bool {
+        let tm = self.transfer_manager();
+        let Some(dm) = tm.download_manager_handle().await else {
+            return false;
+        };
+        // 有空位就不是「等槽位」——此时不动仍属于需要关注的停滞
+        if dm.task_slot_pool().available_slots().await > 0 {
+            return false;
+        }
+
+        let cfg = self.share_sync_backup_config_id();
+        // 单文件下载段：is_backup && backup_config_id == cfg
+        let mut statuses: Vec<crate::downloader::TaskStatus> = dm
+            .get_tasks_by_backup_config(&cfg)
+            .await
+            .iter()
+            .map(|t| t.status.clone())
+            .collect();
+
+        // 文件夹下载段：子任务带 group_id、is_backup=false，不会出现在上面按
+        // backup_config 的查询里（见 `DownloadTask::new_with_group`），要单独取
+        if let Some(fdm) = tm.folder_download_manager_handle().await {
+            for f in fdm.get_folders_by_backup_config(&cfg).await {
+                statuses.extend(dm.get_tasks_by_group(&f.id).await.iter().map(|t| t.status.clone()));
+            }
+        }
+
+        no_progress_but_queued(statuses.iter())
     }
 }
 
@@ -2051,6 +2695,10 @@ impl ExecutorHooks for ProductionHooks {
         let mut last_activity_at = started_at;
         let mut last_stall_retry_at: Option<tokio::time::Instant> = None;
         let mut last_paused_resume_at: Option<tokio::time::Instant> = None;
+        // 上次「是否在排队等槽位」探测的时刻。探测要遍历下载任务表，必须节流：
+        // 探测返回 false（真卡住、有空槽）时 idle 不会被清零，若不记时刻就会每秒
+        // 全表扫一次、一路扫到 idle 超时（30 分钟 ≈ 1800 次），纯属浪费。
+        let mut last_slot_probe_at: Option<tokio::time::Instant> = None;
         let mut stall_retry_attempts = 0u32;
         let mut last_signature: Option<TaskActivitySignature> = None;
         loop {
@@ -2096,8 +2744,27 @@ impl ExecutorHooks for ProductionHooks {
                     && last_paused_resume_at
                     .map(|last| now.duration_since(last) >= Duration::from_secs(10))
                     .unwrap_or(true);
+                // 🔥 槽位满时不要强行 resume：resume 拿不到槽位只会让任务立刻回到
+                // 等待队列尾部（add_to_waiting_queue_*），状态在 paused/pending 之间
+                // 来回抖，还会把自己排到队尾、打乱 FIFO 顺序。等真有空位了再唤醒，
+                // 期间由等待队列按顺序拉起即可。
+                //
+                // 注意这里只是跳过本轮 resume，不能 `continue`——否则下面的
+                // 硬超时 / idle 超时永远不会被求值，任务会无限期挂着。
+                let slot_available_for_resume =
+                    paused_resume_due && self.has_free_download_slot().await;
                 if paused_resume_due {
+                    // 无论本轮是否真的 resume，都走同一个 10s 节流窗口
                     last_paused_resume_at = Some(now);
+                }
+                if paused_resume_due && !slot_available_for_resume {
+                    debug!(
+                        "share-sync: 槽位已满，本轮不自动 resume paused 子任务: task_id={}, paused={}",
+                        task_id,
+                        paused_subtasks.len()
+                    );
+                }
+                if slot_available_for_resume {
                     let restarted =
                         restart_stalled_share_sync_downloads(&tm, &paused_subtasks, Duration::ZERO)
                             .await;
@@ -2134,7 +2801,40 @@ impl ExecutorHooks for ProductionHooks {
                 }
             }
 
-            let idle_for = now.duration_since(last_activity_at);
+            let mut idle_for = now.duration_since(last_activity_at);
+
+            // 🔥 排队等下载槽位不算「无进展」。
+            //
+            // 非会员 max_concurrent_tasks=1 时，同时创建的多个同步里只有一个能拿到
+            // 槽位，其余的下载子任务停在 Pending 排队 —— 这期间 activity signature
+            // 不变，idle 会一路涨到 30 分钟的 idle_timeout，把本来只是「在排队」的
+            // 同步判成「等待任务完成超时」失败。而 stall 重试也救不了它：
+            // `restartable_share_sync_download` 压根不认 pending，排队中的任务不在
+            // 可重启集合里；就算重启了也抢不到槽位，只是把自己挪到队尾而已。
+            //
+            // 因此确认「确实在排队等槽」时把活跃时间往前推，让 idle 从真正开始跑的
+            // 那一刻起算。整体仍受 hard_timeout（默认 7 天）兜底，不会真的无限等。
+            //
+            // 探测本身按 QUEUE_WAIT_PROBE_AFTER 节流（见 `last_slot_probe_at`）：
+            // 它要遍历下载任务表，而 idle 一旦越过阈值就会每轮都满足条件。
+            let probe_due = require_download_completion
+                && idle_for >= QUEUE_WAIT_PROBE_AFTER
+                && last_slot_probe_at
+                .map(|last| now.duration_since(last) >= QUEUE_WAIT_PROBE_AFTER)
+                .unwrap_or(true);
+            if probe_due {
+                last_slot_probe_at = Some(now);
+                if self.is_waiting_for_download_slot().await {
+                    debug!(
+                        "share-sync: 下载子任务在排队等槽位，不计入 idle 超时: task_id={}, idle_secs={}",
+                        task_id,
+                        idle_for.as_secs()
+                    );
+                    last_activity_at = now;
+                    idle_for = Duration::ZERO;
+                }
+            }
+
             if require_download_completion {
                 if let Some(retry_after) = stall_retry_after {
                     let retry_due = idle_for >= retry_after
@@ -2435,13 +3135,30 @@ fn prefetched_share_for_captured(
         uk: captured.uk.clone(),
         share_uk: captured.share_uk.clone(),
         bdstoken: captured.bdstoken.clone(),
+        kind: captured.kind,
+        short_key: captured.short_key.clone(),
     }
 }
 
+/// 从已捕获的分享上下文还原分享 URL
+///
+/// 两套体系的 URL 形态不同，企业版套用个人版的 `/s/{short_key}` 会拼出
+/// 一个不存在的链接（`short_key` 是不带 `1` 前缀的 surl）。
 fn share_url_for_captured(captured: &CapturedShare) -> String {
+    let base = match captured.kind {
+        crate::transfer::ShareKind::Apaas => {
+            format!("https://pan.baidu.com/apaas/share?surl={}", captured.short_key)
+        }
+        crate::transfer::ShareKind::Personal => {
+            format!("https://pan.baidu.com/s/{}", captured.short_key)
+        }
+    };
     match captured.password.as_deref().filter(|p| !p.is_empty()) {
-        Some(pwd) => format!("https://pan.baidu.com/s/{}?pwd={}", captured.short_key, pwd),
-        None => format!("https://pan.baidu.com/s/{}", captured.short_key),
+        Some(pwd) => {
+            let sep = if base.contains('?') { '&' } else { '?' };
+            format!("{}{}pwd={}", base, sep, pwd)
+        }
+        None => base,
     }
 }
 
@@ -2644,6 +3361,241 @@ mod tests {
     use crate::share_sync::resolver::StaticAccountResolver;
     use tempfile::tempdir;
 
+    fn subtask(status: &str) -> ShareSyncSubtask {
+        ShareSyncSubtask {
+            task_id: "dl-1".into(),
+            name: "a.bin".into(),
+            kind: "download".into(),
+            status: status.into(),
+            downloaded: 0,
+            total: 1024,
+            progress: 0.0,
+            speed: 0,
+            eta_seconds: None,
+            owner_uid: 1,
+        }
+    }
+
+    /// 续跑的判据/等待/收尾统一看**下载子任务**，所以子任务终态判定是这条链的地基。
+    ///
+    /// 判错的后果：
+    /// - 未完成被当成终态 → 续跑提前收尾，可能把没下完的当成功而推进基线（永久漏同步）
+    /// - 终态被当成未完成 → 续跑永远等不到头，占着订阅的 in-flight 标记直到硬上限
+    #[test]
+    fn test_subtask_terminal_status_drives_resume() {
+        // 终态：续跑不再等它们
+        for s in [
+            "completed",
+            "success",
+            "failed",
+            "cancelled",
+            "transferfailed",
+            "downloadfailed",
+        ] {
+            assert!(is_terminal_subtask_status(s), "{} 应是终态", s);
+        }
+        // 非终态：续跑要继续等
+        for s in ["pending", "downloading", "paused", "scanning", "transferring"] {
+            assert!(!is_terminal_subtask_status(s), "{} 不是终态，续跑要继续等", s);
+        }
+    }
+
+    /// run_item 终态判定 —— 续跑判据和收尾都依赖它。
+    ///
+    /// 判错的后果是双向的：
+    /// - 把未完成误判成终态 → 收尾时当成"已完成"，可能推进基线 → **永久漏同步**
+    /// - 把终态误判成未完成 → 续跑时白等一个不会再变的 item
+    #[test]
+    fn test_is_terminal_run_item_status() {
+        for s in ["completed", "failed", "skipped"] {
+            assert!(is_terminal_run_item_status(s), "{} 应是终态", s);
+        }
+        for s in ["pending", "transferring", "downloading", "deleting"] {
+            assert!(!is_terminal_run_item_status(s), "{} 不是终态", s);
+        }
+    }
+
+    /// 续跑收尾对基线的处理，必须与正常收尾**同一判据**。
+    ///
+    /// 这是整个续跑机制唯一可能造成数据问题的地方：只要有一项失败，
+    /// 就绝不能提升候选快照，否则那些没落地的文件会被当作"已同步"而永久漏掉。
+    #[test]
+    fn test_resumed_finalize_uses_same_baseline_rule() {
+        use crate::share_sync::types::RunStatus;
+
+        // 全部完成 → 可推进
+        assert!(should_advance_snapshot_baseline(RunStatus::Completed));
+        // 有失败 → 不可推进（续跑收尾在 failed > 0 时给出的正是这个状态）
+        assert!(!should_advance_snapshot_baseline(
+            RunStatus::CompletedWithErrors
+        ));
+    }
+
+    /// 文件夹层的「有活没做完但没人在跑」——必须把 `Paused` 也算进去。
+    ///
+    /// 回归实测：重启恢复的文件夹子任务是以 `Paused` 创建的，入等待队列后状态不变。
+    /// 只认 `Pending` 的话，重启后 N 个等槽位的文件夹在前端会全部显示「下载中」，
+    /// 而实际只有一个在动 —— 正是 issue #138 报告者描述的观感。
+    #[test]
+    fn test_folder_has_queued_work_counts_paused() {
+        use crate::downloader::TaskStatus;
+
+        assert!(
+            folder_has_queued_work([TaskStatus::Paused, TaskStatus::Paused].iter()),
+            "重启恢复出来的暂停子任务也是「待办」"
+        );
+        assert!(
+            folder_has_queued_work([TaskStatus::Pending, TaskStatus::Paused].iter()),
+            "Pending 与 Paused 混合同样算待办"
+        );
+        assert!(
+            !folder_has_queued_work([TaskStatus::Paused, TaskStatus::Downloading].iter()),
+            "有子任务在跑就不是「等待中」"
+        );
+        assert!(
+            !folder_has_queued_work([TaskStatus::Completed, TaskStatus::Failed].iter()),
+            "没有待办 → 不是在等槽位"
+        );
+        assert!(!folder_has_queued_work(std::iter::empty()));
+    }
+
+    /// 「在等槽位」= 没有一个真的在跑、却有在等待队列里。
+    ///
+    /// 关键是不能用 `is_active_download_status()` 判「在跑」—— 它把 Pending 也算活跃，
+    /// 那样 `[Pending, Pending]` 会被判成「有任务在跑」，这个判定就永远不成立。
+    #[test]
+    fn test_no_progress_but_queued() {
+        use crate::downloader::TaskStatus;
+
+        assert!(
+            no_progress_but_queued([TaskStatus::Pending, TaskStatus::Pending].iter()),
+            "全在等待队列 → 在等槽位"
+        );
+        assert!(
+            !no_progress_but_queued([TaskStatus::Pending, TaskStatus::Decrypting].iter()),
+            "解密中也算在动"
+        );
+        assert!(
+            !no_progress_but_queued([TaskStatus::Completed, TaskStatus::Failed].iter()),
+            "没有排队中的任务 → 不是在等槽位"
+        );
+        assert!(
+            no_progress_but_queued([TaskStatus::Completed, TaskStatus::Pending].iter()),
+            "跑完的不算在跑，剩下的还在排队 → 是在等槽位"
+        );
+        assert!(
+            !no_progress_but_queued(std::iter::empty()),
+            "还没建出任务 → 不该误报"
+        );
+    }
+
+    /// 钉死 `is_waiting_for_download_slot` 依赖的关键性质：
+    /// **只要有一个在跑就不算「在等槽位」**。
+    ///
+    /// 场景：pool=1，本订阅的文件 1 正在下载（占着唯一的槽）、文件 2..N 排队。
+    /// 池子确实是满的、也确实有 Pending，但这不是「在排队等别人让位」，而是自己
+    /// 在跑。若这里判成 true，wait 循环会把 idle 一直清零 —— 万一文件 1 其实卡死
+    /// 在 0 字节，stall 重试和 idle 超时就双双失效，run 挂到 7 天硬超时才结束，
+    /// 比不做这个改动更糟。
+    #[test]
+    fn test_waiting_requires_nothing_actually_running() {
+        use crate::downloader::TaskStatus;
+
+        assert!(
+            !no_progress_but_queued(
+                [
+                    TaskStatus::Downloading,
+                    TaskStatus::Pending,
+                    TaskStatus::Pending,
+                ]
+                    .iter()
+            ),
+            "槽位被自己占着在下载 → 不是「等槽位」，必须继续走停滞检测"
+        );
+    }
+
+    /// 文件夹排队等槽位时改报 pending —— 但**只在 Downloading 这一档**改写。
+    ///
+    /// 三条回归线，都是审查中实际踩到过的坑：
+    /// 1. Failed / Cancelled 若被改写成 pending，就从终态变成非终态，
+    ///    REST `subtasks()` 的终态过滤失效，失败的文件夹永远挂在「等待中」不消失
+    /// 2. Scanning 还在列目录、是真的在干活，说成「等待中」与前端 TRANSFER_ACTIVE
+    ///    的口径矛盾
+    /// 3. Paused 是用户显式暂停，不是在等槽位
+    #[test]
+    fn test_folder_subtask_status_only_rewrites_downloading() {
+        use crate::downloader::FolderStatus;
+
+        assert_eq!(
+            folder_subtask_status(FolderStatus::Downloading, true),
+            "pending",
+            "下载中 + 子任务全排队 → 改报「等待中」"
+        );
+        assert_eq!(
+            folder_subtask_status(FolderStatus::Downloading, false),
+            "downloading",
+            "有子任务在跑 → 照实上报"
+        );
+
+        for terminal in [FolderStatus::Failed, FolderStatus::Cancelled, FolderStatus::Completed] {
+            let s = folder_subtask_status(terminal.clone(), true);
+            assert!(
+                is_terminal_subtask_status(&s),
+                "终态 {:?} 不得被改写成非终态（会绕过 subtasks() 的终态过滤）, 实际={}",
+                terminal,
+                s
+            );
+        }
+        assert_eq!(
+            folder_subtask_status(FolderStatus::Scanning, true),
+            "scanning",
+            "扫描中是真的在干活，不该说成等待中"
+        );
+        assert_eq!(
+            folder_subtask_status(FolderStatus::Paused, true),
+            "paused",
+            "用户显式暂停 ≠ 在等槽位"
+        );
+    }
+
+    /// 改报 pending 后，文件夹仍必须留在 stall 重试的可重启集合里 ——
+    /// 否则「有空槽却卡住」的文件夹再也没人救，只能干等到 idle 超时失败。
+    #[test]
+    fn test_pending_folder_stays_restartable() {
+        let mut folder = subtask("pending");
+        folder.task_id = "folder:abc".into();
+        assert!(
+            restartable_share_sync_download(&folder).is_some(),
+            "pending 的文件夹必须可被 stall 重试踢一下"
+        );
+    }
+
+    /// 回归：排队等槽位的下载子任务是 `Pending`，而 stall 重试只认
+    /// downloading/paused —— 也就是说「排队」这件事 stall 重试**救不了**。
+    ///
+    /// 这正是 idle 超时必须对「排队等槽」单独豁免的原因（见 wait_transfer_task
+    /// 里的 `is_waiting_for_download_slot` 分支）：否则非会员 1 槽位场景下，
+    /// 排在后面的同步会一路空转到 30 分钟 idle_timeout 被判失败。
+    #[test]
+    fn test_pending_download_subtask_is_not_restartable() {
+        assert!(
+            restartable_share_sync_download(&subtask("pending")).is_none(),
+            "pending（排队等槽位）不是可重启的停滞任务"
+        );
+        assert!(
+            restartable_share_sync_download(&subtask("downloading")).is_some(),
+            "downloading 才是 stall 重试的目标"
+        );
+        assert!(
+            restartable_share_sync_download(&subtask("paused")).is_some(),
+            "paused 可被重启（但槽位满时由调用方跳过）"
+        );
+        assert!(
+            restartable_share_sync_download(&subtask("completed")).is_none(),
+            "终态不该被重启"
+        );
+    }
+
     fn sub(name: &str) -> ShareSubscription {
         ShareSubscription::new(
             name.into(),
@@ -2664,6 +3616,7 @@ mod tests {
             uk: "uk-1".into(),
             share_uk: "share-uk-2".into(),
             bdstoken: "tok".into(),
+            kind: crate::transfer::ShareKind::Personal,
             password: Some("pwd".into()),
             randsk: Some("rsk".into()),
         };

@@ -644,6 +644,12 @@ impl AppState {
             let wal_dir = pm_arc.lock().await.wal_dir().clone();
             self.folder_download_manager.set_wal_dir(wal_dir.clone()).await;
 
+            // 🔥 注入全局配置：文件夹自身未携带冲突策略时（升级前创建的旧任务）
+            // 回退到用户在设置页配置的默认下载策略，而不是硬编码 Overwrite
+            self.folder_download_manager
+                .set_app_config(Arc::clone(&self.config))
+                .await;
+
             // 注入 ClientPool，支持按 folder.owner_uid 路由
             self.folder_download_manager
                 .set_client_pool(Arc::clone(&self.client_pool))
@@ -2358,6 +2364,9 @@ impl AppState {
         // 2) 给 DownloadManager 注入 folder_manager / snapshot / encryption_config_store
         dm.set_folder_manager(Arc::clone(&self.folder_download_manager))
             .await;
+        // 🔥 注入全局配置：调用方未显式指定冲突策略时（离线下载转本地下载、转存后
+        //    自动下载都传 None），回退到设置页配置的默认下载策略而非硬编码 Overwrite
+        dm.set_app_config(Arc::clone(&self.config)).await;
         dm.set_snapshot_manager(Arc::clone(&self.snapshot_manager))
             .await;
         if let Some(ecs) = self.encryption_config_store.read().await.as_ref().cloned() {

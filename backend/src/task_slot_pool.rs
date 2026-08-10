@@ -1018,18 +1018,27 @@ mod tests {
         pool.allocate_fixed_slot("fresh", false).await.unwrap();
         pool.allocate_fixed_slot("stale", false).await.unwrap();
 
+        // 🔥 必须用 checked_sub：`Instant` 的原点是开机时刻（Windows 上尤其明显），
+        //    开机不足 31 分钟时 `Instant::now() - 31min` 会直接 panic
+        //    （overflow when subtracting duration from instant），
+        //    让这个测试在刚重启的机器上必然失败。这里拿不到足够久的过去时间点就跳过，
+        //    而不是崩掉。注意生产代码只用 `elapsed()`，不存在同样的下溢风险。
+        let now = Instant::now();
+        let (Some(fresh_at), Some(stale_at)) = (
+            now.checked_sub(Duration::from_secs(20 * 60)),
+            now.checked_sub(Duration::from_secs(31 * 60)),
+        ) else {
+            eprintln!(
+                "跳过 test_cleanup_stale_slots_uses_30min_threshold：\
+                 进程/系统启动时间不足 31 分钟，无法构造足够久的过去 Instant"
+            );
+            return;
+        };
+
         // fresh: 20 分钟前更新(< 30min 阈值)→ 不该被回收(旧的 5min 阈值下会被误杀)
-        pool.set_slot_last_updated(
-            "fresh",
-            Instant::now() - Duration::from_secs(20 * 60),
-        )
-            .await;
+        pool.set_slot_last_updated("fresh", fresh_at).await;
         // stale: 31 分钟前更新(> 30min 阈值)→ 应被回收
-        pool.set_slot_last_updated(
-            "stale",
-            Instant::now() - Duration::from_secs(31 * 60),
-        )
-            .await;
+        pool.set_slot_last_updated("stale", stale_at).await;
 
         let released = pool.cleanup_stale_slots().await;
         assert_eq!(released, vec!["stale".to_string()], "只应回收真正停滞的槽位");

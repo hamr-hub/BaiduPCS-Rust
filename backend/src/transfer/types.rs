@@ -25,18 +25,47 @@ pub const ERROR_TASK_NOT_FOUND: i32 = 2008;
 /// 清理临时目录失败（分享直下专用）
 pub const ERROR_CLEANUP_FAILED: i32 = 2009;
 
+/// 分享体系类型
+///
+/// 百度网盘存在两套互不兼容的分享体系，短链前缀规则、鉴权令牌、
+/// 列目录/转存接口全部不同，需要在解析链接时就区分开。
+/// 详见 `netdisk::share` 模块。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareKind {
+    /// 个人版：`https://pan.baidu.com/s/1xxxx`
+    #[default]
+    Personal,
+    /// 企业版（apaas）：`https://pan.baidu.com/apaas/share?surl=xxxx`
+    Apaas,
+}
+
 /// 分享链接解析结果
 #[derive(Debug, Clone)]
 pub struct ShareLink {
-    /// surl 或短链 ID（如 "1abcDEFg"）
+    /// 短链 ID
+    ///
+    /// - 个人版：带 `1` 前缀的短链（如 `"1abcDEFg"`）
+    /// - 企业版：原始 `surl`，**不加前缀**（如 `"abcDEFg"`）
     pub short_key: String,
     /// 原始分享链接
     pub raw_url: String,
     /// 从链接中提取的密码（如有）
     pub password: Option<String>,
+    /// 分享体系类型（决定后续走哪套接口）
+    pub kind: ShareKind,
 }
 
 /// 分享页面信息（从页面 JS 提取）
+///
+/// 两套体系共用此结构，字段语义按 `kind` 区分：
+///
+/// | 字段 | 个人版 | 企业版 |
+/// |---|---|---|
+/// | `shareid` | `shareid` | `link_info.share_id` |
+/// | `share_uk` | `share_uk` | `link_info.share_uk` |
+/// | `bdstoken` | CSRF 令牌 | 恒为空（接口不需要） |
+/// | `short_key` | `1xxxx` | `surl`（企业版接口的 `short_url` 参数） |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharePageInfo {
     /// 分享 ID
@@ -45,8 +74,19 @@ pub struct SharePageInfo {
     pub uk: String,
     /// 分享 UK（可能与 uk 不同）
     pub share_uk: String,
-    /// CSRF 令牌
+    /// CSRF 令牌（企业版恒为空）
     pub bdstoken: String,
+    /// 分享体系类型
+    ///
+    /// `serde(default)`：老任务持久化的 JSON 里没有这个字段，
+    /// 反序列化时退化为 `Personal`，与历史行为一致。
+    #[serde(default)]
+    pub kind: ShareKind,
+    /// 短链 ID（与 `ShareLink::short_key` 同源，用于拼 Referer / 企业版 `short_url`）
+    ///
+    /// `serde(default)`：老任务持久化的 JSON 里没有这个字段。
+    #[serde(default)]
+    pub short_key: String,
 }
 
 /// 根目录文件列表结果（包含 uk/shareid，用于子目录导航拼接 dir）

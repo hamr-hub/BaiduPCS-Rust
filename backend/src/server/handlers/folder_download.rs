@@ -154,6 +154,29 @@ pub async fn get_folder_download(
     }
 }
 
+/// GET /api/v1/downloads/folder/:id/skipped
+/// 获取该文件夹因冲突策略被跳过的文件明细
+///
+/// 跳过的文件不会创建子任务，因此不会出现在 `/downloads/all` 的任务列表里。
+/// 前端下载详情用本接口把它们以「跳过」状态补进子任务列表，否则用户看到的是
+/// 「已完成 + 空列表」，无从判断跳过了哪些文件（issue #141 用户反馈）。
+///
+/// 单独开接口而不是塞进文件夹列表：明细条数与文件数同量级，塞进列表会让大文件夹的
+/// 列表响应显著膨胀（`skipped_entries` 因此标了 `skip_serializing`）。
+pub async fn get_folder_skipped_files(
+    State(app_state): State<AppState>,
+    Path(folder_id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<crate::downloader::folder::SkippedFile>>>, StatusCode> {
+    match app_state
+        .folder_download_manager
+        .get_folder(&folder_id)
+        .await
+    {
+        Some(folder) => Ok(Json(ApiResponse::success(folder.skipped_entries))),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
 /// GET /api/v1/downloads/all
 /// 获取所有下载（文件+文件夹混合，按创建时间排序）
 ///
@@ -236,7 +259,29 @@ pub async fn get_all_downloads_mixed(
 
         // 🔥 使用 compute_downloaded_size：completed_downloaded_size + active_sum
         // max() 保证单调性，不再用活跃子任务之和覆盖 folder.downloaded_size
-        let active_downloaded: u64 = folder_tasks.iter().map(|t| t.downloaded_size).sum();
+        //
+        // 🔥 必须用 active_downloaded_excluding_counted 而不是裸求和：
+        //    子任务成功时 completed_downloaded_size 已 += 该文件 total_size，但完成的任务
+        //    可能仍残留在内存任务表里（downloaded_size 已钳到 total_size）。裸求和会把它们
+        //    再算一遍，与 completed_downloaded_size 双重累加。
+        //
+        //    本接口是下载列表 UI 的数据源，且操作的是 folder 的**克隆**，虚高只污染 API
+        //    响应、不写回内存也不落盘 —— 表现为"磁盘快照正确、界面进度虚高且重启也不恢复"
+        //    （实测 17.02 GB 被显示成 30.78 GB / 98.2%，多出来的正好是已完成文件的字节总和）。
+        //    folder_manager 里另外两处调用一直是带排除的，只有这里漏了。
+        //
+        // 🔥 这里还必须额外按 status 过滤掉已完成任务，光靠 counted_task_ids 不够：
+        //    本接口的 all_tasks 来自 `get_all_tasks()`，它会把**历史数据库**里已归档的
+        //    已完成子任务也捞回来（downloaded_size = 文件完整大小）。而 counted_task_ids
+        //    是运行时字段、不持久化，重启后为空，排除不到这些历史任务 —— 这正是虚高
+        //    重启也不恢复的原因。已完成子任务的字节必定已计入 completed_downloaded_size，
+        //    任何情况下都不该再进 active_sum。
+        let active_downloaded = folder.active_downloaded_excluding_counted(
+            folder_tasks
+                .iter()
+                .filter(|t| t.status != TaskStatus::Completed)
+                .map(|t| (t.id.as_str(), t.downloaded_size)),
+        );
         folder.compute_downloaded_size(active_downloaded);
 
         items.push(DownloadItem::Folder {

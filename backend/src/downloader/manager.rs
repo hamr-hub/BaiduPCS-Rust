@@ -28,6 +28,19 @@ use tracing::{debug, error, info, warn};
 /// 防止"失败→立即拉起→立即失败"的死循环。
 pub const REQUEUE_COOLDOWN_SECS: i64 = 60;
 
+/// 🔥 auto_requeue 退回次数上限
+///
+/// 超过后不再退回等待队列，而是把任务真正置为 `Failed`。
+///
+/// 此前没有任何上限：CDN 对某文件持续返回 403 这类情况会「失败 → 退回队尾 → 冷却 60s
+/// → 再失败」无限循环，每轮烧一次槽位、刷一批 ERROR 日志；更糟的是任务从不进入
+/// `Failed`，所属文件夹的 `completed + skipped + failed` 永远凑不满 `total_files`，
+/// 整个文件夹永远到不了终态。
+///
+/// 置为 Failed 后，文件夹层面的 `MAX_SUBTASK_AUTO_RETRIES` 会再给几次机会，
+/// 仍失败才计入 `failed_count`，文件夹得以正常收尾。
+pub const MAX_AUTO_REQUEUE: u32 = 5;
+
 /// 🔥 启动阶段（prepare / register）失败重试上限
 ///
 /// 三条启动链路统一使用：
@@ -38,6 +51,28 @@ pub const REQUEUE_COOLDOWN_SECS: i64 = 60;
 /// 文件夹子任务或备份任务在启动阶段累计失败 `MAX_START_RETRIES` 次后，不再无限重入等待队列，
 /// 改为标记为 `Failed` 以避免死循环 / 队列堵塞。普通单文件任务从第 1 次失败即标记 Failed。
 pub const MAX_START_RETRIES: u32 = 3;
+
+/// 文件夹子任务回落到**全局槽位**分配时应使用的优先级：跟随所属文件夹的归属。
+///
+/// 后台文件夹（自动备份 / 分享同步，带 `backup_config_id`）的子任务同样是后台任务。
+/// 若这里仍固定用 `SubTask`(20)，它照样能抢占 `Backup`(30) —— 那么
+/// `folder_slot_priority` 把文件夹主任务降为 `Backup` 的修复，会在子任务这一层
+/// 原样再现（后台同步依旧把别的后台下载踢下槽位）。
+///
+/// 取不到文件夹信息时回退 `SubTask`，维持旧行为。
+async fn folder_subtask_slot_priority(
+    folder_manager: &Arc<RwLock<Option<Arc<crate::downloader::FolderDownloadManager>>>>,
+    group_id: Option<&str>,
+) -> TaskPriority {
+    let Some(folder_id) = group_id else {
+        return TaskPriority::SubTask;
+    };
+    let fm = folder_manager.read().await.clone();
+    match fm {
+        Some(fm) => fm.subtask_slot_priority(folder_id).await,
+        None => TaskPriority::SubTask,
+    }
+}
 
 /// 🔥 自动退回队列请求（scheduler → manager 消息）
 ///
@@ -98,6 +133,12 @@ pub struct DownloadManager {
     task_slot_pool: Arc<TaskSlotPool>,
     /// 🔥 文件夹下载管理器引用（可选，用于回收借调槽位）
     folder_manager: Arc<RwLock<Option<Arc<FolderDownloadManager>>>>,
+
+    /// 🔥 全局配置（延迟注入）
+    ///
+    /// 仅用于在调用方未显式指定冲突策略时回退到用户在设置页配置的默认下载策略。
+    /// 存引用而非快照，保证设置改动即时生效。
+    app_config: Arc<RwLock<Option<Arc<RwLock<crate::config::AppConfig>>>>>,
     /// 🔥 加密快照管理器（用于查询加密文件映射，获取原始文件名）
     snapshot_manager: Arc<RwLock<Option<Arc<crate::encryption::snapshot::SnapshotManager>>>>,
     /// 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
@@ -246,6 +287,7 @@ impl DownloadManager {
                 pool
             },
             folder_manager: Arc::new(RwLock::new(None)),
+            app_config: Arc::new(RwLock::new(None)),
             snapshot_manager: Arc::new(RwLock::new(None)),
             encryption_config_store: Arc::new(RwLock::new(None)),
             max_retries,
@@ -538,7 +580,7 @@ impl DownloadManager {
         // task / 持久化 / Created event 全部用 effective_uid，根除事后 override 竞态。
         let effective_uid = owner_uid_override.unwrap_or(self.owner_uid);
         // 获取默认策略（如果未指定）
-        let strategy = conflict_strategy.unwrap_or(crate::uploader::conflict::DownloadConflictStrategy::Overwrite);
+        let strategy = self.resolve_conflict_strategy(conflict_strategy).await;
 
         // 解决冲突
         use crate::uploader::conflict_resolver::ConflictResolver;
@@ -561,6 +603,7 @@ impl DownloadManager {
                     task_id: format!("skipped-{}", uuid::Uuid::new_v4()),
                     filename,
                     reason: "文件已存在".to_string(),
+                    group_id: None,
 
                     owner_uid: Some(effective_uid.raw()),
                 })
@@ -807,13 +850,9 @@ impl DownloadManager {
 
                         // 🔥 如果有被抢占的备份任务，需要暂停它并加入等待队列末尾
                         if let Some(preempted_id) = preempted_task_id {
-                            info!("普通任务 {} 抢占了备份任务 {} 的槽位: slot_id={}，已刷新槽位时间戳", task_id, preempted_id, slot_id);
-                            // 暂停被抢占的备份任务（skip_try_start_waiting=true，避免循环）
-                            if let Err(e) = self.pause_task(&preempted_id, true).await {
-                                warn!("暂停被抢占的备份任务 {} 失败: {}", preempted_id, e);
-                            }
-                            // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
-                            self.add_preempted_backup_to_queue(&preempted_id).await;
+                            info!("普通任务 {} 抢占了槽位持有者 {}: slot_id={}，已刷新槽位时间戳", task_id, preempted_id, slot_id);
+                            // 被抢占者可能是单文件任务，也可能是文件夹 —— 统一分发
+                            self.handle_preempted_slot_owner(&preempted_id).await;
                         } else {
                             info!("普通任务 {} 获得固定任务位: slot_id={}，已刷新槽位时间戳", task_id, slot_id);
                         }
@@ -845,10 +884,8 @@ impl DownloadManager {
                                         self.task_slot_pool.touch_slot(task_id).await;
                                         // 🔥 处理被抢占的备份任务
                                         if let Some(preempted_id) = preempted_task_id {
-                                            info!("普通任务 {} 通过回收借调槽位获得任务位并抢占了备份任务 {}: slot_id={} (回收的槽位={})，已刷新槽位时间戳", task_id, preempted_id, slot_id, reclaimed_slot_id);
-                                            self.pause_preempted_task(&preempted_id).await;
-                                            // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
-                                            self.add_preempted_backup_to_queue(&preempted_id).await;
+                                            info!("普通任务 {} 通过回收借调槽位获得任务位并抢占了槽位持有者 {}: slot_id={} (回收的槽位={})，已刷新槽位时间戳", task_id, preempted_id, slot_id, reclaimed_slot_id);
+                                            self.handle_preempted_slot_owner(&preempted_id).await;
                                         } else {
                                             info!("普通任务 {} 通过回收借调槽位获得任务位: slot_id={} (回收的槽位={})，已刷新槽位时间戳", task_id, slot_id, reclaimed_slot_id);
                                         }
@@ -1212,6 +1249,41 @@ impl DownloadManager {
                 );
                 return Ok(());
             }
+        }
+
+        // 🔥 退回次数上限：耗尽后不再重排，真正置为 Failed，让上层（文件夹重试 / 用户）接手
+        {
+            let mut t = task.lock().await;
+            if t.requeue_count >= MAX_AUTO_REQUEUE {
+                let error_msg = format!(
+                    "自动重排 {} 次仍失败（最后原因: {}）",
+                    MAX_AUTO_REQUEUE, reason
+                );
+                warn!(
+                    "auto_requeue_task: 任务 {} 已退回 {} 次，不再重排，标记为失败: {}",
+                    task_id, t.requeue_count, error_msg
+                );
+                drop(t);
+
+                // 复用既有失败收尾：置 Failed、释放槽位、落盘、发事件，
+                // 并通过 notify_subtask_failed 通知文件夹管理器
+                Self::handle_task_failure(
+                    task_id.to_string(),
+                    Arc::clone(&task),
+                    error_msg,
+                    Arc::clone(&self.waiting_queue),
+                    Arc::clone(&self.cancellation_tokens),
+                    self.ws_manager.read().await.clone(),
+                    self.persistence_manager.clone(),
+                    Arc::clone(&self.tasks),
+                    Arc::clone(&self.task_slot_pool),
+                    Arc::clone(&self.folder_manager),
+                    self.backup_notification_tx.read().await.clone(),
+                )
+                    .await;
+                return Ok(());
+            }
+            t.requeue_count += 1;
         }
 
         // 同时取出真实 owner_uid
@@ -2058,9 +2130,13 @@ impl DownloadManager {
                                 break;
                             }
                         } else {
-                            // 🔥 非备份任务：根据是否为文件夹子任务选择优先级
+                            // 🔥 非备份任务：文件夹子任务的优先级跟随所属文件夹
                             let priority = if is_folder_subtask {
-                                TaskPriority::SubTask
+                                folder_subtask_slot_priority(
+                                    &self.folder_manager,
+                                    try_start_group_id.as_deref(),
+                                )
+                                    .await
                             } else {
                                 TaskPriority::Normal
                             };
@@ -2084,11 +2160,8 @@ impl DownloadManager {
 
                                     // 处理被抢占的备份任务
                                     if let Some(preempted_id) = preempted_task_id {
-                                        info!("{} {} 抢占了备份任务 {} 的槽位: slot_id={}，已刷新槽位时间戳", task_type_str, id, preempted_id, sid);
-                                        // 🔥 直接暂停被抢占的任务（不调用 pause_task 避免递归）
-                                        self.pause_preempted_task(&preempted_id).await;
-                                        // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
-                                        self.add_preempted_backup_to_queue(&preempted_id).await;
+                                        info!("{} {} 抢占了槽位持有者 {}: slot_id={}，已刷新槽位时间戳", task_type_str, id, preempted_id, sid);
+                                        self.handle_preempted_slot_owner(&preempted_id).await;
                                     } else {
                                         info!("为{} {} 分配槽位: {}，已刷新槽位时间戳", task_type_str, id, sid);
                                     }
@@ -2273,10 +2346,15 @@ impl DownloadManager {
 
                                     if !used_folder_fixed_slot {
                                         // 🔥 根据任务类型选择优先级
+                                        // 文件夹子任务跟随所属文件夹的归属（后台文件夹 → Backup）
                                         let priority = if is_backup {
                                             TaskPriority::Backup
                                         } else if is_folder_subtask {
-                                            TaskPriority::SubTask
+                                            folder_subtask_slot_priority(
+                                                &folder_manager_arc_for_monitor,
+                                                monitor_group_id.as_deref(),
+                                            )
+                                                .await
                                         } else {
                                             TaskPriority::Normal
                                         };
@@ -3049,10 +3127,15 @@ impl DownloadManager {
 
                                     if !used_folder_fixed_slot {
                                         // 🔥 根据任务类型选择优先级
+                                        // 文件夹子任务跟随所属文件夹的归属（后台文件夹 → Backup）
                                         let priority = if is_backup {
                                             TaskPriority::Backup
                                         } else if is_folder_subtask {
-                                            TaskPriority::SubTask
+                                            folder_subtask_slot_priority(
+                                                &folder_manager_arc_for_trigger,
+                                                zero_delay_group_id.as_deref(),
+                                            )
+                                                .await
                                         } else {
                                             TaskPriority::Normal
                                         };
@@ -3853,6 +3936,11 @@ impl DownloadManager {
                 t.status = TaskStatus::Pending;
                 info!("被抢占的备份任务 {} 状态已从 Paused 改为 Pending", task_id);
             }
+            // 🔥 进入等待队列即不再产生流量，速度必须归零。
+            // 否则 `speed` 会一直保留被抢占那一刻的瞬时值，被上层的速度聚合
+            // （文件夹进度 / 分享同步子任务进度）当成真实贡献累加进去 ——
+            // 表现为「只有一个任务在跑，界面却显示好几 MB/s」。
+            t.speed = 0;
             (t.group_id.clone(), t.is_backup, t.owner_uid.raw())
         };
 
@@ -4251,6 +4339,44 @@ impl DownloadManager {
     /// - 不调用 try_start_waiting_tasks（避免递归）
     ///
     /// 🔥 修复：现在会发送状态变更通知（Transferring -> Paused）
+    /// 🔥 处理被抢占的**槽位持有者**（统一入口）。
+    ///
+    /// 槽位的 owner 有两种可能：
+    /// - **单文件下载任务** —— 走 `pause_preempted_task` + 重新入队
+    /// - **文件夹** —— 文件夹主任务持有固定位时，`task_slot_pool` 记录的 owner 是
+    ///   `folder_id`，不是下载任务 id。必须走 `pause_folder`，它会取消该组子任务、
+    ///   释放文件夹持有的全部槽位、把状态置为 Paused，之后由上层（分享同步的
+    ///   恢复逻辑 / 用户操作）在有空槽时重新拉起。
+    ///
+    /// 此前这里写死按任务处理。文件夹优先级还是 `Normal` 时不会被抢占，所以这条
+    /// 路径是死代码；把后台文件夹降为 `Backup` 后它变得可达，于是出现：
+    /// ```text
+    /// 抢占备份任务槽位: preempted_task=Some("<folder_id>")
+    /// 暂停被抢占的备份任务 <folder_id> 失败: 任务不存在
+    /// 加入等待队列失败：任务 <folder_id> 不存在
+    /// ⚠️ 槽位诊断: 活跃任务数 2 超过任务槽上限 1
+    /// ```
+    /// 槽位被拿走了，文件夹却仍在跑 —— 又回到超限状态。
+    pub async fn handle_preempted_slot_owner(&self, owner_id: &str) {
+        let folder_mgr = self.folder_manager.read().await.clone();
+        if let Some(fm) = folder_mgr {
+            if fm.is_known_folder(owner_id).await {
+                match fm.pause_folder(owner_id).await {
+                    Ok(()) => info!(
+                        "被抢占的文件夹 {} 已暂停并释放槽位，等待空槽后由上层恢复",
+                        owner_id
+                    ),
+                    Err(e) => warn!("暂停被抢占的文件夹 {} 失败: {}", owner_id, e),
+                }
+                return;
+            }
+        }
+
+        // 单文件下载任务
+        self.pause_preempted_task(owner_id).await;
+        self.add_preempted_backup_to_queue(owner_id).await;
+    }
+
     async fn pause_preempted_task(&self, task_id: &str) {
         // 获取任务
         let task = match self.tasks.read().await.get(task_id).cloned() {
@@ -4390,6 +4516,10 @@ impl DownloadManager {
 
             // 将状态改回 Pending，准备重新启动
             t.status = TaskStatus::Pending;
+            // 🔥 恢复 = 明确要求重试，重置 auto_requeue 额度。
+            //    否则一个跑了很久、中途遇到几次网络波动的大任务会被历史计数误伤，
+            //    用户点了继续也很快又被判死。
+            t.requeue_count = 0;
             // 🔥 用户主动重试：复位收尾标记，允许重试后的下载重新收尾
             t.finalize_spawned = false;
             group_id = t.group_id.clone();
@@ -4491,9 +4621,13 @@ impl DownloadManager {
                     return Ok(());
                 }
             } else {
-                // 🔥 非备份任务：根据是否为文件夹子任务选择优先级
+                // 🔥 非备份任务：文件夹子任务的优先级跟随所属文件夹
                 let priority = if is_folder_subtask {
-                    TaskPriority::SubTask
+                    folder_subtask_slot_priority(
+                        &self.folder_manager,
+                        resume_group_id.as_deref(),
+                    )
+                        .await
                 } else {
                     TaskPriority::Normal
                 };
@@ -4516,10 +4650,8 @@ impl DownloadManager {
 
                         // 处理被抢占的备份任务
                         if let Some(preempted_id) = preempted_task_id {
-                            info!("恢复{} {} 抢占了备份任务 {} 的槽位: slot_id={}，已刷新槽位时间戳", task_type_str, task_id, preempted_id, slot_id);
-                            self.pause_preempted_task(&preempted_id).await;
-                            // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
-                            self.add_preempted_backup_to_queue(&preempted_id).await;
+                            info!("恢复{} {} 抢占了槽位持有者 {}: slot_id={}，已刷新槽位时间戳", task_type_str, task_id, preempted_id, slot_id);
+                            self.handle_preempted_slot_owner(&preempted_id).await;
                         } else {
                             info!("恢复{} {} 获得任务位: slot_id={}，已刷新槽位时间戳", task_type_str, task_id, slot_id);
                         }
@@ -4551,10 +4683,8 @@ impl DownloadManager {
                                         self.task_slot_pool.touch_slot(task_id).await;
                                         // 🔥 处理被抢占的备份任务
                                         if let Some(preempted_id) = preempted_task_id {
-                                            info!("恢复{} {} 通过回收借调槽位获得任务位并抢占了备份任务 {}: slot_id={} (回收的槽位={})，已刷新槽位时间戳", task_type_str, task_id, preempted_id, slot_id, reclaimed_slot_id);
-                                            self.pause_preempted_task(&preempted_id).await;
-                                            // 🔥 将被暂停的备份任务加入等待队列末尾（包含状态转换和通知）
-                                            self.add_preempted_backup_to_queue(&preempted_id).await;
+                                            info!("恢复{} {} 通过回收借调槽位获得任务位并抢占了槽位持有者 {}: slot_id={} (回收的槽位={})，已刷新槽位时间戳", task_type_str, task_id, preempted_id, slot_id, reclaimed_slot_id);
+                                            self.handle_preempted_slot_owner(&preempted_id).await;
                                         } else {
                                             info!("恢复{} {} 通过回收借调槽位获得任务位: slot_id={} (回收的槽位={})，已刷新槽位时间戳", task_type_str, task_id, slot_id, reclaimed_slot_id);
                                         }
@@ -5541,10 +5671,10 @@ impl DownloadManager {
         owner_uid: crate::auth::Uid,
     ) -> Result<String> {
         use crate::uploader::conflict_resolver::ConflictResolver;
-        use crate::uploader::conflict::{ConflictResolution, DownloadConflictStrategy};
+        use crate::uploader::conflict::ConflictResolution;
 
         // 获取默认策略（如果未指定，使用 Overwrite 默认值）
-        let strategy = conflict_strategy.unwrap_or(DownloadConflictStrategy::Overwrite);
+        let strategy = self.resolve_conflict_strategy(conflict_strategy).await;
 
         // 解决下载冲突
         let resolution = ConflictResolver::resolve_download_conflict(&local_path, strategy)?;
@@ -5565,6 +5695,7 @@ impl DownloadManager {
                     task_id: format!("backup-skipped-{}", uuid::Uuid::new_v4()),
                     filename,
                     reason: "文件已存在".to_string(),
+                    group_id: None,
 
                     // 用调用方传入的 owner_uid，
                     // 不再用共享 manager 的 self.owner_uid（共享 manager 下不可靠）
@@ -5685,6 +5816,7 @@ impl DownloadManager {
             is_backup: metadata.is_backup,
             backup_config_id: metadata.backup_config_id.clone(),
             start_retry_count: 0,
+            requeue_count: 0,
             // 解密字段（历史任务默认无解密）
             is_encrypted: false,
             decrypt_progress: 0.0,
@@ -6942,6 +7074,35 @@ impl DownloadManager {
     pub async fn set_folder_manager(&self, folder_manager: Arc<FolderDownloadManager>) {
         *self.folder_manager.write().await = Some(folder_manager);
     }
+
+    /// 🔥 注入全局配置（用于冲突策略回退，见 `resolve_conflict_strategy`）
+    pub async fn set_app_config(&self, config: Arc<RwLock<crate::config::AppConfig>>) {
+        *self.app_config.write().await = Some(config);
+    }
+
+    /// 🔥 解析生效的下载冲突策略
+    ///
+    /// 优先级：调用方显式指定 > 设置页的全局默认 > `Overwrite`。
+    ///
+    /// 中间那层是必需的：HTTP handler 会自己读配置后传进来，但**内部发起的下载**
+    /// （离线下载完成后转本地下载、转存完成后自动下载）一直传 `None`，此前会被
+    /// 硬编码兜底成 `Overwrite` —— 用户在设置页选了「跳过」，这两条路径却照样覆盖
+    /// 本地已有文件，表现为"跳过时灵时不灵"。
+    async fn resolve_conflict_strategy(
+        &self,
+        explicit: Option<crate::uploader::conflict::DownloadConflictStrategy>,
+    ) -> crate::uploader::conflict::DownloadConflictStrategy {
+        if let Some(s) = explicit {
+            return s;
+        }
+
+        let cfg_opt = self.app_config.read().await.clone();
+        if let Some(cfg) = cfg_opt {
+            return cfg.read().await.conflict_strategy.default_download_strategy;
+        }
+
+        crate::uploader::conflict::DownloadConflictStrategy::Overwrite
+    }
 }
 
 impl Drop for DownloadManager {
@@ -6958,7 +7119,7 @@ mod tests {
     use crate::auth::UserAuth;
     use tempfile::TempDir;
 
-    fn create_mock_user_auth() -> UserAuth {
+    pub(super) fn create_mock_user_auth() -> UserAuth {
         UserAuth {
             uid: 123456789,
             username: "test_user".to_string(),
@@ -7308,6 +7469,69 @@ mod tests {
         assert_eq!(
             manager.lookup_aggregate_outcome("does_not_exist").await,
             DownloadAggregateOutcome::NotFound,
+        );
+    }
+}
+
+#[cfg(test)]
+mod conflict_strategy_tests {
+    use super::*;
+    use crate::uploader::conflict::DownloadConflictStrategy;
+    use tempfile::TempDir;
+
+    async fn make_manager(temp: &TempDir) -> DownloadManager {
+        let user_auth = super::tests::create_mock_user_auth();
+        DownloadManager::new(user_auth, temp.path().to_path_buf())
+            .await
+            .unwrap()
+    }
+
+    /// 未注入配置时退回 Overwrite（保持旧行为，不至于 panic 或改变语义）
+    #[tokio::test]
+    async fn test_resolve_falls_back_to_overwrite_without_config() {
+        let temp = TempDir::new().unwrap();
+        let mgr = make_manager(&temp).await;
+
+        assert_eq!(
+            mgr.resolve_conflict_strategy(None).await,
+            DownloadConflictStrategy::Overwrite
+        );
+    }
+
+    /// 调用方显式指定时，无条件优先于全局默认
+    #[tokio::test]
+    async fn test_explicit_strategy_wins_over_global_default() {
+        let temp = TempDir::new().unwrap();
+        let mgr = make_manager(&temp).await;
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.conflict_strategy.default_download_strategy = DownloadConflictStrategy::Skip;
+        mgr.set_app_config(Arc::new(RwLock::new(cfg))).await;
+
+        assert_eq!(
+            mgr.resolve_conflict_strategy(Some(DownloadConflictStrategy::AutoRename))
+                .await,
+            DownloadConflictStrategy::AutoRename
+        );
+    }
+
+    /// 调用方传 None 时必须读设置页的全局默认，而不是硬编码 Overwrite。
+    ///
+    /// 回归点：离线下载完成后转本地下载、转存完成后自动下载这两条内部路径一直传 None，
+    /// 此前被硬编码兜底成 Overwrite，用户在设置页选的「跳过」对它们完全不生效。
+    #[tokio::test]
+    async fn test_none_falls_back_to_global_default_not_overwrite() {
+        let temp = TempDir::new().unwrap();
+        let mgr = make_manager(&temp).await;
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.conflict_strategy.default_download_strategy = DownloadConflictStrategy::Skip;
+        mgr.set_app_config(Arc::new(RwLock::new(cfg))).await;
+
+        assert_eq!(
+            mgr.resolve_conflict_strategy(None).await,
+            DownloadConflictStrategy::Skip,
+            "内部调用方传 None 时应跟随设置页默认策略"
         );
     }
 }

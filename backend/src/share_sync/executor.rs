@@ -1438,6 +1438,32 @@ impl<'a> ShareSyncExecutor<'a> {
             let attempt_err: ShareSyncError = match submit_result {
                 Ok(task_id) => {
                     let require_download_completion = matches!(target, SyncTarget::Local(_));
+
+                    // 🔥 提交成功就先记账（在途状态），不要等跑完才写。
+                    // run_item 里的 transfer_task_id 是「重启后找回上一轮在做什么」的
+                    // 唯一线索（见 `probe_resumable_run`）。进程若在等待期间被杀，
+                    // 没记账就意味着续跑判据找不到这个正在跑的任务，只能清理重跑，
+                    // 已下载的进度全部作废。下面成功/失败分支会把它覆盖成终态。
+                    let in_flight_status = if require_download_completion {
+                        RunItemStatus::Downloading
+                    } else {
+                        RunItemStatus::Transferring
+                    };
+                    for leaf_idx in indices.iter().flat_map(|&i| tree.descendants_leaves(i)) {
+                        let leaf = tree.get(leaf_idx);
+                        let _ = self.persistence.add_run_item(
+                            run_id,
+                            &leaf.path,
+                            action_for_path(action_by_path, &leaf.path),
+                            target_kind,
+                            Some(task_id.as_str()),
+                            None,
+                            in_flight_status,
+                            None,
+                            None,
+                        );
+                    }
+
                     let wait_res = self
                         .hooks
                         .wait_transfer_task(
@@ -1544,20 +1570,43 @@ impl<'a> ShareSyncExecutor<'a> {
                         "share_sync_already_exists_local: run_id={} depth={} first_path={} → 网盘副本已在,改走分享直下补本地副本",
                         run_id, depth, first_path
                     );
+                    // 🔥 记账必须在**等待之前**：run_item 里的 transfer_task_id 是
+                    // 「重启后找回上一轮在做什么」的唯一线索（见 `probe_resumable_run`）。
+                    // 原来是先 wait 再记账，进程若在下载途中被杀，这个正在跑的任务
+                    // 压根没进 run_items —— 续跑判据找不到它，只能退化成清理重跑，
+                    // 已下载的进度全部作废。与上面正常批量转存路径的顺序保持一致。
                     let direct_res = match self
                         .hooks
                         .submit_download_batch(&items_to_submit, &t.local_path, strategy, None)
                         .await
                     {
-                        Ok(task_id) => self
-                            .hooks
-                            .wait_transfer_task(&task_id, true, TASK_WAIT_TIMEOUT)
-                            .await
-                            .map(|()| task_id),
+                        Ok(task_id) => {
+                            for leaf_idx in indices.iter().flat_map(|&i| tree.descendants_leaves(i))
+                            {
+                                let leaf = tree.get(leaf_idx);
+                                let _ = self.persistence.add_run_item(
+                                    run_id,
+                                    &leaf.path,
+                                    action_for_path(action_by_path, &leaf.path),
+                                    target_kind,
+                                    Some(task_id.as_str()),
+                                    None,
+                                    RunItemStatus::Downloading,
+                                    None,
+                                    None,
+                                );
+                            }
+                            self.hooks
+                                .wait_transfer_task(&task_id, true, TASK_WAIT_TIMEOUT)
+                                .await
+                                .map(|()| task_id)
+                        }
                         Err(e) => Err(e),
                     };
                     match direct_res {
                         Ok(task_id) => {
+                            // 等待成功：把上面记的 Downloading 覆盖成终态
+                            // （`add_run_item` 对同一 (run_id, path) 走 upsert 合并）
                             for leaf_idx in indices.iter().flat_map(|&i| tree.descendants_leaves(i))
                             {
                                 let leaf = tree.get(leaf_idx);
@@ -2624,6 +2673,7 @@ mod tests {
             uk: "456".into(),
             share_uk: "456".into(),
             bdstoken: "tok".into(),
+            kind: crate::transfer::ShareKind::Personal,
             password: None,
             randsk: None,
         }

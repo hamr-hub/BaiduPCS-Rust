@@ -116,6 +116,14 @@ pub struct DownloadTask {
     #[serde(skip)]
     pub start_retry_count: u32,
 
+    /// 🔥 auto_requeue 退回次数（用于限制"下载阶段反复失败"的无限重排）
+    ///
+    /// `auto_requeue` 此前没有任何次数上限：一个持续失败的文件（例如 CDN 对该文件
+    /// 返回 403）会「失败 → 退回队尾 → 冷却 60s → 再失败」无限循环，一直烧槽位、
+    /// 刷日志，而且因为任务从不进入 `Failed`，所属文件夹永远到不了终态。
+    #[serde(skip)]
+    pub requeue_count: u32,
+
     // === 🔥 解密相关字段 ===
     /// 是否为加密文件（通过文件名或内容检测）
     #[serde(default)]
@@ -258,6 +266,7 @@ impl DownloadTask {
             is_backup: false,
             backup_config_id: None,
             start_retry_count: 0,
+            requeue_count: 0,
             // 解密字段初始化
             is_encrypted: false,
             decrypt_progress: 0.0,

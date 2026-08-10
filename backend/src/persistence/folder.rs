@@ -172,6 +172,7 @@ impl FolderPersisted {
             completed_downloaded_size: 0,
             failed_count: 0,
             failed_task_ids: std::collections::HashSet::new(),
+            subtask_retry_counts: std::collections::HashMap::new(),
         }
     }
 }

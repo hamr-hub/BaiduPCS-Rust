@@ -189,6 +189,14 @@ pub struct FolderDownload {
     #[serde(default, skip)]
     pub failed_count: u64,
 
+    /// 🔥 子任务自动重试次数（task_id → 已重试次数，运行时字段）
+    ///
+    /// 子任务耗尽分片级/链接级重试后仍失败时不直接判死：把它重新排到等待队列尾部再试，
+    /// 最多 `MAX_SUBTASK_AUTO_RETRIES` 次，耗尽才计入 `failed_count`。
+    /// 与 `failed_task_ids` 一样不持久化——重启后重新给一份额度。
+    #[serde(default, skip)]
+    pub subtask_retry_counts: HashMap<String, u32>,
+
     /// 🔥 已失败的任务ID集合（运行时字段）
     /// 避免同一任务多次失败时重复计数；重试成功时从此集合移除并减少 failed_count
     #[serde(default, skip)]
@@ -244,6 +252,7 @@ impl FolderDownload {
             completed_downloaded_size: 0,
             failed_count: 0,
             failed_task_ids: HashSet::new(),
+            subtask_retry_counts: HashMap::new(),
         }
     }
 

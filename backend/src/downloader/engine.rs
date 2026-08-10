@@ -203,6 +203,20 @@ fn is_server_throttled_error(err: &anyhow::Error) -> bool {
         || msg.contains("retry-after")
 }
 
+/// 🔥 判断是否为「该链接对本文件永久拒绝」的 HTTP 错误
+///
+/// 403/404/410 不是网络抖动，重试同一个链接不可能变好。此前分类只看「链接是否用尽」
+/// （`tried_urls.len() >= available_count`），没用尽就一律判 `Transient`，于是 403 会以
+/// 100ms 退避被反复轰炸，直到连续 6 次 chunk 失败才触发 auto_requeue。
+///
+/// 实测中一个 CDN 节点对某文件持续 403，任务因此卡了 8 分钟才靠换链接自愈。
+fn is_permanent_http_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{:#}", err);
+    msg.contains("HTTP错误: 403")
+        || msg.contains("HTTP错误: 404")
+        || msg.contains("HTTP错误: 410")
+}
+
 /// 🔥 计算指数退避延迟
 ///
 /// # 延迟序列
@@ -3477,6 +3491,17 @@ impl DownloadEngine {
 
                     // 🔥 判断错误类型供后续分类用
                     let is_throttled = is_server_throttled_error(&e);
+                    let is_permanent = is_permanent_http_error(&e);
+
+                    // 🔥 该链接对本文件永久拒绝（403/404/410）→ 立刻打入冷却，让链接选择器跳过它，
+                    //    不要继续在坏节点上轮询。复用探测失败那套指数退避冷却（10s→40s）。
+                    if is_permanent {
+                        warn!(
+                            "[分片线程{}] 分片 #{} 链接返回永久性错误，冷却该链接: {} ({})",
+                            chunk_thread_id, chunk_index, current_url, e
+                        );
+                        url_health.lock().await.handle_probe_failure(&current_url);
+                    }
 
                     last_error = Some(e);
 
@@ -3516,7 +3541,9 @@ impl DownloadEngine {
                             // 🔥 根据错误类型返回精细化失败分类
                             let failure = if is_throttled {
                                 ChunkDownloadFailure::ServerThrottled(err)
-                            } else if tried_urls.len() >= available_count {
+                            } else if is_permanent || tried_urls.len() >= available_count {
+                                // 🔥 永久性 HTTP 错误（403/404/410）直接判 Fatal：此前只按「链接是否用尽」
+                                //    分类，403 在链接没用尽时会被判 Transient，然后以 100ms 退避反复轰炸坏链接
                                 // 所有链接都试过 → Fatal（scheduler mark_deferred）
                                 ChunkDownloadFailure::Fatal(err)
                             } else {

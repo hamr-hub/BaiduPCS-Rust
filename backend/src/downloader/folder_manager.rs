@@ -107,6 +107,16 @@ pub struct FolderDownloadManager {
 /// 对账兜底，不会造成重复下载。
 const FOLDER_PERSIST_THROTTLE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// 🔥 子任务在文件夹层面的自动重试次数上限
+///
+/// 这已是第三层重试：分片级瞬时错误退避（100ms→5s）、链接级切换、调度级重试都耗尽后
+/// 才轮到这里。此前会直接判死并计入 `failed_count`，而 `resume_folder` 只接受
+/// Paused/Failed 状态，用户在下载途中对单个失败文件无法做任何操作，只能删掉整个
+/// 文件夹任务重来（issue #141 用户反馈）。
+///
+/// 现在改为自动把失败子任务重新排到等待队列尾部重试，耗尽次数才计入 `failed_count`。
+const MAX_SUBTASK_AUTO_RETRIES: u32 = 3;
+
 /// 🔥 一批补任务的结果，用于 `refill_tasks` 判断是否需要继续补下一批
 #[derive(Debug, Default, Clone, Copy)]
 struct RefillBatch {
@@ -1290,6 +1300,8 @@ impl FolderDownloadManager {
                     let slot_pool = dm.task_slot_pool();
 
                     // 🔥 直接处理收到的 task_id
+                    // 🔥 本次失败若还有重试额度，记下是第几次，锁释放后再重新入队
+                    let mut retry_attempt: Option<u32> = None;
                     let (slot_id_to_release, released_fixed_slot) = {
                         let mut folders_guard = folders.write().await;
 
@@ -1329,6 +1341,7 @@ impl FolderDownloadManager {
                             if is_success && !already_counted {
                                 // 🔥 成功且未计数：递增 completed_count
                                 folder.counted_task_ids.insert(task_id.clone());
+                                folder.subtask_retry_counts.remove(&task_id);
                                 folder.completed_count += 1;
                                 folder.completed_downloaded_size += file_size;
                                 // 如果之前失败过（retry→success），从 failed 中移除
@@ -1345,12 +1358,25 @@ impl FolderDownloadManager {
                                     );
                                 }
                             } else if !is_success && !already_counted {
-                                // 🔥 失败且未成功计数：记入 failed_task_ids（去重）
-                                if folder.failed_task_ids.insert(task_id.clone()) {
-                                    folder.failed_count += 1;
+                                // 🔥 失败：先看还有没有自动重试额度，耗尽才判死
+                                let attempts = folder
+                                    .subtask_retry_counts
+                                    .entry(task_id.clone())
+                                    .or_insert(0);
+                                if *attempts < MAX_SUBTASK_AUTO_RETRIES {
+                                    *attempts += 1;
+                                    retry_attempt = Some(*attempts);
                                     info!(
-                                        "文件夹 {} 子任务失败 (failed_count={}, task_id={})",
-                                        group_id, folder.failed_count, task_id
+                                        "文件夹 {} 子任务失败，将重新入队重试 ({}/{}, task_id={})",
+                                        group_id, *attempts, MAX_SUBTASK_AUTO_RETRIES, task_id
+                                    );
+                                    // 刻意不计入 failed_count：否则 completed+skipped+failed
+                                    // 会提前凑满 total_files，重试还没跑文件夹就被判成终态
+                                } else if folder.failed_task_ids.insert(task_id.clone()) {
+                                    folder.failed_count += 1;
+                                    warn!(
+                                        "文件夹 {} 子任务重试 {} 次仍失败，计为失败 (failed_count={}, task_id={})",
+                                        group_id, MAX_SUBTASK_AUTO_RETRIES, folder.failed_count, task_id
                                     );
                                 }
                             }
@@ -1378,6 +1404,48 @@ impl FolderDownloadManager {
 
                     // 🔥 尝试启动等待队列中的任务
                     dm.try_start_waiting_tasks().await;
+
+                    // 🔥 失败子任务：立即重新入队
+                    //
+                    //    刻意放在「释放槽位 + 拉起等待任务」之后：此刻空出的槽位已被排在
+                    //    前面的子任务抢走，本任务 resume 后只能进等待队列 —— 即"回到队尾"。
+                    //
+                    //    用 resume_task 复用原任务（Failed → Pending）而非重建：已下载的
+                    //    分片全部保留，大文件在 90% 处失败不会前功尽弃。
+                    //
+                    //    不做延迟重试：定时器只存在于内存，服务在退避窗口内重启会把重试
+                    //    整个吞掉（任务永远停在 Failed 无人再管）。立即入队则任务以 Pending
+                    //    落进 WAL，重启后能正常恢复。
+                    if let Some(attempt) = retry_attempt {
+                        // 失败通知有多条来源（槽位超时、启动失败、调度耗尽…），而暂停/取消
+                        // 文件夹会连带终止在途子任务。不加这道闸门，一旦某条路径以
+                        // is_success=false 上报，就会把刚被用户停掉的任务立刻拉起来。
+                        let still_running = {
+                            let guard = folders.read().await;
+                            matches!(
+                                guard.get(&group_id).map(|f| &f.status),
+                                Some(FolderStatus::Downloading) | Some(FolderStatus::Scanning)
+                            )
+                        };
+
+                        if !still_running {
+                            info!(
+                                "文件夹 {} 已不在下载中，跳过子任务 {} 的自动重试",
+                                group_id, task_id
+                            );
+                        } else if let Err(e) = dm.resume_task(&task_id).await {
+                            // 任务可能已被用户删除，或状态已不允许恢复
+                            warn!(
+                                "文件夹 {} 子任务重新入队失败 (task_id={}): {}",
+                                group_id, task_id, e
+                            );
+                        } else {
+                            info!(
+                                "文件夹 {} 子任务已重新入队 ({}/{}, task_id={})",
+                                group_id, attempt, MAX_SUBTASK_AUTO_RETRIES, task_id
+                            );
+                        }
+                    }
                 }
 
                 // 🔥 计算文件夹可用的槽位数量（借调位 + 固定位）
@@ -3057,6 +3125,8 @@ impl FolderDownloadManager {
             if folder.status == FolderStatus::Failed {
                 folder.failed_count = 0;
                 folder.failed_task_ids.clear();
+                // 用户手动点继续 = 明确要求重试，给一份新的自动重试额度
+                folder.subtask_retry_counts.clear();
                 folder.error = None;
             }
 

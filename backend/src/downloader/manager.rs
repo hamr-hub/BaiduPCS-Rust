@@ -28,6 +28,19 @@ use tracing::{debug, error, info, warn};
 /// 防止"失败→立即拉起→立即失败"的死循环。
 pub const REQUEUE_COOLDOWN_SECS: i64 = 60;
 
+/// 🔥 auto_requeue 退回次数上限
+///
+/// 超过后不再退回等待队列，而是把任务真正置为 `Failed`。
+///
+/// 此前没有任何上限：CDN 对某文件持续返回 403 这类情况会「失败 → 退回队尾 → 冷却 60s
+/// → 再失败」无限循环，每轮烧一次槽位、刷一批 ERROR 日志；更糟的是任务从不进入
+/// `Failed`，所属文件夹的 `completed + skipped + failed` 永远凑不满 `total_files`，
+/// 整个文件夹永远到不了终态。
+///
+/// 置为 Failed 后，文件夹层面的 `MAX_SUBTASK_AUTO_RETRIES` 会再给几次机会，
+/// 仍失败才计入 `failed_count`，文件夹得以正常收尾。
+pub const MAX_AUTO_REQUEUE: u32 = 5;
+
 /// 🔥 启动阶段（prepare / register）失败重试上限
 ///
 /// 三条启动链路统一使用：
@@ -1229,6 +1242,41 @@ impl DownloadManager {
                 );
                 return Ok(());
             }
+        }
+
+        // 🔥 退回次数上限：耗尽后不再重排，真正置为 Failed，让上层（文件夹重试 / 用户）接手
+        {
+            let mut t = task.lock().await;
+            if t.requeue_count >= MAX_AUTO_REQUEUE {
+                let error_msg = format!(
+                    "自动重排 {} 次仍失败（最后原因: {}）",
+                    MAX_AUTO_REQUEUE, reason
+                );
+                warn!(
+                    "auto_requeue_task: 任务 {} 已退回 {} 次，不再重排，标记为失败: {}",
+                    task_id, t.requeue_count, error_msg
+                );
+                drop(t);
+
+                // 复用既有失败收尾：置 Failed、释放槽位、落盘、发事件，
+                // 并通过 notify_subtask_failed 通知文件夹管理器
+                Self::handle_task_failure(
+                    task_id.to_string(),
+                    Arc::clone(&task),
+                    error_msg,
+                    Arc::clone(&self.waiting_queue),
+                    Arc::clone(&self.cancellation_tokens),
+                    self.ws_manager.read().await.clone(),
+                    self.persistence_manager.clone(),
+                    Arc::clone(&self.tasks),
+                    Arc::clone(&self.task_slot_pool),
+                    Arc::clone(&self.folder_manager),
+                    self.backup_notification_tx.read().await.clone(),
+                )
+                    .await;
+                return Ok(());
+            }
+            t.requeue_count += 1;
         }
 
         // 同时取出真实 owner_uid
@@ -4461,6 +4509,10 @@ impl DownloadManager {
 
             // 将状态改回 Pending，准备重新启动
             t.status = TaskStatus::Pending;
+            // 🔥 恢复 = 明确要求重试，重置 auto_requeue 额度。
+            //    否则一个跑了很久、中途遇到几次网络波动的大任务会被历史计数误伤，
+            //    用户点了继续也很快又被判死。
+            t.requeue_count = 0;
             // 🔥 用户主动重试：复位收尾标记，允许重试后的下载重新收尾
             t.finalize_spawned = false;
             group_id = t.group_id.clone();
@@ -5757,6 +5809,7 @@ impl DownloadManager {
             is_backup: metadata.is_backup,
             backup_config_id: metadata.backup_config_id.clone(),
             start_retry_count: 0,
+            requeue_count: 0,
             // 解密字段（历史任务默认无解密）
             is_encrypted: false,
             decrypt_progress: 0.0,

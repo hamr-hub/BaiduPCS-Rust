@@ -878,6 +878,42 @@ npm run dev
 - **容器化**: Docker + Docker Compose
 - **多阶段构建**: 优化镜像大小
 - **健康检查**: 自动故障检测
+- **本地部署（无 Docker）**: `scripts/local-deploy.sh` 一键构建/启停后端+前端，支持 `status/logs` 与 **systemd 开机自启**
+
+#### 本地部署（systemd 模式）
+
+适合直接跑在本机或一台 Linux 服务器上。脚本会：
+
+1. 用 `cargo build` 产出后端二进制（debug / release 可选）
+2. 用 `npm install` + `vite preview` 跑前端（默认端口 `4923`）
+3. 把后端+前端注册成 systemd 服务（`baidupcs-backend.service` / `baidupcs-frontend.service`），写入 `/etc/systemd/system/`，启用开机自启
+4. 加固：`ProtectSystem=strict`、`PrivateTmp=true`、`NoNewPrivileges=true` 等，防止服务污染系统
+
+```bash
+# 首次安装（需 sudo，会自动检测目标用户的 PATH）
+sudo ./scripts/local-deploy.sh install-systemd
+
+# 查看状态
+./scripts/local-deploy.sh status            # 手动模式
+sudo ./scripts/local-deploy.sh systemd-status  # systemd 模式
+
+# 跟踪日志（二选一）
+./scripts/local-deploy.sh logs              # 手动模式：直接 tail 文件
+sudo ./scripts/local-deploy.sh systemd-logs # systemd 模式：journalctl -f
+
+# 升级后端/前端代码后，重复跑 install-systemd 即可刷新 unit 文件 + 重启服务
+sudo ./scripts/local-deploy.sh install-systemd
+
+# 卸载
+sudo ./scripts/local-deploy.sh uninstall-systemd
+```
+
+默认端口：
+
+| 服务 | 端口 | 说明 |
+| --- | --- | --- |
+| 前端 | `4923` | `vite preview`，绑定 `0.0.0.0` |
+| 后端 | `18888` | 取自 `config/app.toml`（`[server].port`） |
 
 ---
 

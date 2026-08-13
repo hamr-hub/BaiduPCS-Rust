@@ -3,7 +3,7 @@
 # 本地部署脚本（不使用 Docker）
 # 直接在本机构建并启动后端（rust 二进制）+ 前端（vite）
 # 前端端口：4923（vite preview，绑定 0.0.0.0）
-# 后端端口：取自 config/app.toml（默认 4924）
+# 后端端口：取自 config/app.toml（默认 18888）
 #
 # 关键设计：
 #   - 后端：cargo build 后直接 exec 出 target/<profile> 二进制，PID 即为服务进程，避免 cargo wrapper 残留
@@ -48,7 +48,7 @@ SKIP_BACKEND_BUILD=false
 FRONTEND_PORT=4923
 FRONTEND_HOST="0.0.0.0"
 BACKEND_HOST="127.0.0.1"
-BACKEND_PORT=4924
+BACKEND_PORT=18888
 MODE="prod"   # prod | dev
 
 # systemd
@@ -493,6 +493,8 @@ install_systemd() {
 Description=BaiduPCS-Rust Backend
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -508,6 +510,18 @@ KillSignal=SIGTERM
 TimeoutStopSec=20
 StandardOutput=append:$BACKEND_LOG
 StandardError=append:$BACKEND_LOG
+# 安全加固（v2.2.0 起启用）：限制服务可写区域，避免污染系统
+ProtectSystem=strict
+ReadWritePaths=$PROJECT_ROOT/downloads $PROJECT_ROOT/data $PROJECT_ROOT/logs $PROJECT_ROOT/.pids
+# Home 目录：nvm/rustup/cargo 用户级安装需要可读访问（不可写即可）
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
 
 [Install]
 WantedBy=multi-user.target
@@ -520,6 +534,8 @@ Description=BaiduPCS-Rust Frontend (vite)
 After=network-online.target $SYSTEMD_BACKEND_UNIT
 Wants=network-online.target
 PartOf=$SYSTEMD_BACKEND_UNIT
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -535,6 +551,18 @@ KillSignal=SIGTERM
 TimeoutStopSec=20
 StandardOutput=append:$FRONTEND_LOG
 StandardError=append:$FRONTEND_LOG
+# 安全加固：前端是纯静态服务（vite preview），不需要写业务目录
+ProtectSystem=strict
+ReadWritePaths=$PROJECT_ROOT/.pids
+# Home 目录：vite / npm 用户级安装需要访问 nvm nodejs
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
 
 [Install]
 WantedBy=multi-user.target

@@ -347,6 +347,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/downloads/folder/:id", get(handlers::get_folder_download))
         .route(
+            "/downloads/folder/:id/skipped",
+            get(handlers::get_folder_skipped_files),
+        )
+        .route(
             "/downloads/folder/:id/pause",
             post(handlers::pause_folder_download),
         )

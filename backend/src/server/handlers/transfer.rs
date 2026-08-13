@@ -288,8 +288,20 @@ pub async fn get_all_transfers(
         None => {
             // 全局共享历史库会被每个账号的 get_all_tasks 各捞一遍，跨账号聚合时
             // 按 id 去重，避免同一历史任务因账号数 N 而重复出现 N 次。
+            //
+            // 去重是「先到先得」，所以**必须先收内存里的活跃任务**：历史库里同一条
+            // 任务会被非归属账号的 manager 用 convert_history_to_task 重建，那份副本的
+            // transferred_count 是按「全部成功」伪造的。若让它先进 seen，部分成功的
+            // 任务会被显示成「7/7 全部成功」，把真实进度盖掉。
             let mut all = Vec::new();
             let mut seen = std::collections::HashSet::new();
+            for (_uid, tm) in app_state.list_transfer_managers() {
+                for t in tm.get_live_tasks().await {
+                    if seen.insert(t.id.clone()) {
+                        all.push(t);
+                    }
+                }
+            }
             for (_uid, tm) in app_state.list_transfer_managers() {
                 for t in tm.get_all_tasks().await {
                     if seen.insert(t.id.clone()) {
@@ -449,6 +461,16 @@ pub struct PreviewShareInfo {
     pub shareid: String,
     pub uk: String,
     pub bdstoken: String,
+    /// 分享体系类型：`personal` / `apaas`
+    ///
+    /// 前端只需原样缓存并在子目录导航时回传，不必理解含义。
+    pub kind: crate::transfer::ShareKind,
+    /// 提取码凭据
+    ///
+    /// 企业版（apaas）的 spwd 不在 Cookie 里，翻子目录必须回传；
+    /// 个人版为 randsk，回传只是为了两边一致。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// POST /api/v1/transfers/preview
@@ -485,6 +507,8 @@ pub async fn preview_share_files(
                     shareid: result.shareid,
                     uk: result.uk,
                     bdstoken: result.bdstoken,
+                    kind: result.kind,
+                    token: result.token,
                 }),
             }))
         }
@@ -530,6 +554,14 @@ pub struct PreviewShareDirRequest {
     pub page: Option<u32>,
     /// 每页数量（默认 100）
     pub num: Option<u32>,
+    /// 分享体系类型，由前端从预览结果原样回传
+    ///
+    /// 缺省为个人版：老前端不带这个字段时行为与改动前完全一致。
+    #[serde(default)]
+    pub kind: crate::transfer::ShareKind,
+    /// 提取码凭据，由前端从预览结果原样回传（企业版必需）
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 /// POST /api/v1/transfers/preview/dir
@@ -562,6 +594,8 @@ pub async fn preview_share_dir(
             &req.dir,
             page,
             num,
+            req.kind,
+            req.token.as_deref(),
         )
         .await
     {

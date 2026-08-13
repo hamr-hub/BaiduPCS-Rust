@@ -133,7 +133,10 @@ impl HistoryDbManager {
                 completed_at INTEGER,
                 error TEXT,
                 transfer_task_id TEXT,
-                pending_files_json TEXT
+                pending_files_json TEXT,
+                skipped_count INTEGER DEFAULT 0,
+                skipped_size INTEGER DEFAULT 0,
+                skipped_entries_json TEXT
             )
             "#,
             [],
@@ -192,8 +195,20 @@ impl HistoryDbManager {
         );
         // 🔥 分享同步：文件夹下载也需要 backup_config_id 归属，否则重启后
         // 内部隐藏文件夹会退回 None 而重新泄漏进「下载管理」。
+let _ = conn.execute("ALTER TABLE folder_history ADD COLUMN backup_config_id TEXT", []);
+        // 🔥 跳过统计与明细：已完成的文件夹归档到本表后，重启会从这里加载。
+        //    不建列就会丢掉「跳过了几个/多少字节/哪些文件」，表现为重启后进度回到 0%、
+        //    详情里的跳过行全部消失（issue #141 用户反馈）。
         let _ = conn.execute(
-            "ALTER TABLE folder_history ADD COLUMN backup_config_id TEXT",
+            "ALTER TABLE folder_history ADD COLUMN skipped_count INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE folder_history ADD COLUMN skipped_size INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE folder_history ADD COLUMN skipped_entries_json TEXT",
             [],
         );
 
@@ -1028,6 +1043,43 @@ impl HistoryDbManager {
         Ok(deleted > 0)
     }
 
+    /// 🔥 按 group_id 查询已成功完成的子任务相对路径集合
+    ///
+    /// 用于文件夹下载恢复时对 `pending_files` 做对账：已完成的子任务在归档后会从活跃
+    /// 任务表移除，仅存在于本历史库；若不据此剔除，陈旧的 `pending_files` 快照会把这些
+    /// 文件重新排进任务队列并重复下载（issue #141）。
+    ///
+    /// 只返回 `relative_path` 非空的记录（单文件下载无此字段）。
+    pub fn get_completed_relative_paths_by_group(
+        &self,
+        group_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
+
+        let mut stmt = conn.prepare(
+            "SELECT relative_path FROM task_history \
+             WHERE group_id = ?1 AND status = 'completed' \
+             AND relative_path IS NOT NULL AND relative_path != ''",
+        )?;
+
+        let rows = stmt.query_map(params![group_id], |row| row.get::<_, String>(0))?;
+
+        let mut result = std::collections::HashSet::new();
+        for row in rows {
+            match row {
+                Ok(path) => {
+                    result.insert(path);
+                }
+                Err(e) => warn!("读取已完成子任务相对路径失败: {}", e),
+            }
+        }
+
+        Ok(result)
+    }
+
     /// 按 group_id 删除任务
     pub fn remove_tasks_by_group(&self, group_id: &str) -> Result<usize> {
         let conn = self
@@ -1108,6 +1160,12 @@ impl HistoryDbManager {
             .map_err(|e| anyhow!("获取数据库锁失败: {}", e))?;
 
         let status = format!("{:?}", folder.status).to_lowercase();
+        // 🔥 跳过明细：空数组存 NULL，避免每行都塞一个 "[]"
+        let skipped_entries_json = if folder.skipped_entries.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&folder.skipped_entries).ok()
+        };
         let pending_files_json = if folder.pending_files.is_empty() {
             None
         } else {
@@ -1121,13 +1179,15 @@ impl HistoryDbManager {
                 total_files, total_size, created_count, completed_count, downloaded_size,
                 scan_completed, scan_progress,
                 created_at, started_at, completed_at, error,
-                transfer_task_id, pending_files_json, owner_uid, backup_config_id
+                transfer_task_id, pending_files_json, owner_uid, backup_config_id,
+                skipped_count, skipped_size, skipped_entries_json
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12,
                 ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20
+                ?17, ?18, ?19, ?20,
+                ?21, ?22, ?23
             )
             "#,
             params![
@@ -1152,6 +1212,9 @@ impl HistoryDbManager {
                 // 🔥 多账号归属：Some(0) 也当 None 写入
                 folder.owner_uid.filter(|u| *u != 0).map(|u| u as i64),
                 folder.backup_config_id,
+                folder.skipped_count as i64,
+                folder.skipped_size as i64,
+                skipped_entries_json,
             ],
         )?;
 
@@ -1181,19 +1244,27 @@ impl HistoryDbManager {
                     total_files, total_size, created_count, completed_count, downloaded_size,
                     scan_completed, scan_progress,
                     created_at, started_at, completed_at, error,
-                    transfer_task_id, pending_files_json, owner_uid, backup_config_id
+                    transfer_task_id, pending_files_json, owner_uid, backup_config_id,
+                    skipped_count, skipped_size, skipped_entries_json
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5,
                     ?6, ?7, ?8, ?9, ?10,
                     ?11, ?12,
                     ?13, ?14, ?15, ?16,
-                    ?17, ?18, ?19, ?20
+                    ?17, ?18, ?19, ?20,
+                    ?21, ?22, ?23
                 )
                 "#,
             )?;
 
             for folder in folders {
                 let status = format!("{:?}", folder.status).to_lowercase();
+                // 🔥 跳过明细：空数组存 NULL，避免每行都塞一个 "[]"
+                let skipped_entries_json = if folder.skipped_entries.is_empty() {
+                    None
+                } else {
+                    serde_json::to_string(&folder.skipped_entries).ok()
+                };
                 let pending_files_json = if folder.pending_files.is_empty() {
                     None
                 } else {
@@ -1222,6 +1293,9 @@ impl HistoryDbManager {
                     // 🔥 多账号归属：Some(0) 也当 None 写入
                     folder.owner_uid.filter(|u| *u != 0).map(|u| u as i64),
                     folder.backup_config_id,
+                    folder.skipped_count as i64,
+                    folder.skipped_size as i64,
+                    skipped_entries_json,
                 ])?;
                 count += 1;
             }
@@ -1246,7 +1320,8 @@ impl HistoryDbManager {
                 total_files, total_size, created_count, completed_count, downloaded_size,
                 scan_completed, scan_progress,
                 created_at, started_at, completed_at, error,
-                transfer_task_id, pending_files_json, owner_uid, backup_config_id
+                transfer_task_id, pending_files_json, owner_uid, backup_config_id,
+                skipped_count, skipped_size, skipped_entries_json
             FROM folder_history
             ORDER BY completed_at DESC
             "#,
@@ -1274,6 +1349,9 @@ impl HistoryDbManager {
                 pending_files_json: row.get(17)?,
                 owner_uid: row.get(18)?,
                 backup_config_id: row.get(19)?,
+                skipped_count: row.get(20).unwrap_or(0),
+                skipped_size: row.get(21).unwrap_or(0),
+                skipped_entries_json: row.get(22).unwrap_or(None),
             })
         })?;
 
@@ -1561,6 +1639,14 @@ impl HistoryDbManager {
             // 🔥 多账号归属：从列读出
             owner_uid: row.owner_uid.map(|u| u as u64),
             failure_reason: None,
+            // 历史库存的是已归档的终态文件夹，不会再走补任务，冲突策略无意义，故不建列
+            conflict_strategy: None,
+            skipped_count: row.skipped_count.max(0) as u64,
+            skipped_size: row.skipped_size.max(0) as u64,
+            skipped_entries: row
+                .skipped_entries_json
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
         })
     }
 }
@@ -1633,6 +1719,12 @@ struct FolderHistoryRow {
     owner_uid: Option<i64>,
     /// 归属备份配置 ID（内部隐藏文件夹下载）
     backup_config_id: Option<String>,
+    /// 因冲突策略跳过的文件数
+    skipped_count: i64,
+    /// 因冲突策略跳过的字节数
+    skipped_size: i64,
+    /// 跳过文件明细（JSON 数组）
+    skipped_entries_json: Option<String>,
 }
 
 // ========================================================================
@@ -1884,5 +1976,85 @@ impl HistoryDbManager {
             info!("已清理 {} 条离线下载自动下载配置", deleted);
         }
         Ok(deleted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::downloader::folder::{FolderStatus, SkippedFile};
+    use tempfile::TempDir;
+
+    fn sample_folder() -> FolderPersisted {
+        FolderPersisted {
+            id: "f-1".into(),
+            name: "23真题和解析".into(),
+            remote_root: "/13/23真题和解析".into(),
+            local_root: std::path::PathBuf::from("/local/23"),
+            status: FolderStatus::Completed,
+            total_files: 4,
+            total_size: 3_307_595,
+            created_count: 0,
+            completed_count: 0,
+            downloaded_size: 0,
+            scan_completed: true,
+            scan_progress: None,
+            pending_files: Vec::new(),
+            created_at: 100,
+            started_at: Some(100),
+            completed_at: Some(200),
+            error: None,
+            transfer_task_id: None,
+            backup_config_id: None,
+            owner_uid: Some(42),
+            failure_reason: None,
+            conflict_strategy: None,
+            skipped_count: 4,
+            skipped_size: 3_307_595,
+            skipped_entries: vec![
+                SkippedFile { relative_path: "a.pdf".into(), size: 1, skipped_at: 1 },
+                SkippedFile { relative_path: "子目录/b.doc".into(), size: 2, skipped_at: 2 },
+            ],
+        }
+    }
+
+    /// issue #141：已完成的文件夹重启后从历史库加载，跳过统计与明细必须一起还原。
+    ///
+    /// 丢失时的表现是「进度回到 0%、详情里的跳过行全部消失」。
+    /// 本用例同时守住 INSERT 的参数个数——rusqlite 参数与占位符不匹配只在运行时报错，
+    /// 编译期查不出来。
+    #[test]
+    fn test_folder_history_roundtrip_keeps_skipped_info() {
+        let dir = TempDir::new().unwrap();
+        let db = HistoryDbManager::new(&dir.path().join("h.db")).unwrap();
+
+        db.add_folder_to_history(&sample_folder()).unwrap();
+
+        let loaded = db.load_all_folder_history().unwrap();
+        assert_eq!(loaded.len(), 1);
+        let f = &loaded[0];
+        assert_eq!(f.skipped_count, 4, "跳过文件数必须还原");
+        assert_eq!(f.skipped_size, 3_307_595, "跳过字节数必须还原");
+        assert_eq!(f.skipped_entries.len(), 2, "跳过明细必须还原");
+        assert_eq!(f.skipped_entries[1].relative_path, "子目录/b.doc");
+    }
+
+    /// 批量归档路径与单条走的是两段独立 SQL，参数个数同样要守住。
+    #[test]
+    fn test_folder_history_batch_keeps_skipped_info() {
+        let dir = TempDir::new().unwrap();
+        let db = HistoryDbManager::new(&dir.path().join("h.db")).unwrap();
+
+        let mut second = sample_folder();
+        second.id = "f-2".into();
+        db.add_folders_to_history_batch(&[sample_folder(), second])
+            .unwrap();
+
+        let loaded = db.load_all_folder_history().unwrap();
+        assert_eq!(loaded.len(), 2);
+        for f in &loaded {
+            assert_eq!(f.skipped_count, 4);
+            assert_eq!(f.skipped_entries.len(), 2);
+        }
     }
 }

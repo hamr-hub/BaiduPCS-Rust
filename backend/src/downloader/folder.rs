@@ -33,6 +33,21 @@ pub struct PendingFile {
     pub size: u64,
 }
 
+/// 因冲突策略被跳过的文件（不会创建子任务）
+///
+/// 跳过的文件既不产生子任务、也不产生下载字节，若不单独记下来，下载详情里就完全看不到
+/// 它们——用户看到的是「已完成 + 空列表」，无法确认到底跳过了哪些文件（issue #141 用户
+/// 反馈"希望详情里能有跳过状态"）。这里持久化文件级明细，供详情列表以「跳过」状态展示。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedFile {
+    /// 相对文件夹根的路径
+    pub relative_path: String,
+    /// 文件大小
+    pub size: u64,
+    /// 跳过时间（秒级时间戳）
+    pub skipped_at: i64,
+}
+
 /// 文件夹下载任务组
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderDownload {
@@ -133,6 +148,10 @@ pub struct FolderDownload {
     pub counted_task_ids: HashSet<String>,
 
     /// 🔥 下载冲突策略（用于子任务）
+    ///
+    /// 注意：这里的 `skip` 只是不参与 `FolderDownload` 自身的序列化（该结构体用于
+    /// 接口返回），**不代表本字段无需持久化**。跨重启的持久化走
+    /// `FolderPersisted.conflict_strategy`，原因见该字段注释（issue #141）。
     #[serde(default, skip)]
     pub conflict_strategy: Option<crate::uploader::conflict::DownloadConflictStrategy>,
 
@@ -142,10 +161,41 @@ pub struct FolderDownload {
     #[serde(default, skip)]
     pub completed_downloaded_size: u64,
 
+    /// 🔥 因冲突策略命中"跳过"而未创建任务的文件数
+    ///
+    /// 与 `completed_count` 分开统计：两者都算"已处理完"（共同参与终态判定），
+    /// 但语义不同——前者是真下载完，后者是本地已存在被跳过。前端据此展示
+    /// "已跳过 N 个"，让用户能确认队列在工作而不是卡住（issue #141 用户反馈）。
+    #[serde(default)]
+    pub skipped_count: u64,
+
+    /// 🔥 因冲突策略跳过的文件字节数
+    ///
+    /// 跳过的文件不产生子任务、也不产生下载字节，光看 `downloaded_size` 的话，
+    /// 一个"全部跳过"的文件夹会显示 0% 却又是「已完成」状态，用户无从判断发生了什么。
+    /// 前端用 `(downloaded_size + skipped_size) / total_size` 作为整体处理进度。
+    #[serde(default)]
+    pub skipped_size: u64,
+
+    /// 🔥 被跳过文件的明细清单
+    ///
+    /// 与 `pending_files` 同样 `skip_serializing`：列表接口不需要它，避免大文件夹的响应
+    /// 膨胀；详情通过 `GET /downloads/folder/:id/skipped` 单独取。
+    #[serde(default, skip_serializing)]
+    pub skipped_entries: Vec<SkippedFile>,
+
     /// 🔥 失败的子任务数（运行时字段）
     /// 用于判断文件夹是否应进入终态：completed_count + failed_count >= total_files
     #[serde(default, skip)]
     pub failed_count: u64,
+
+    /// 🔥 子任务自动重试次数（task_id → 已重试次数，运行时字段）
+    ///
+    /// 子任务耗尽分片级/链接级重试后仍失败时不直接判死：把它重新排到等待队列尾部再试，
+    /// 最多 `MAX_SUBTASK_AUTO_RETRIES` 次，耗尽才计入 `failed_count`。
+    /// 与 `failed_task_ids` 一样不持久化——重启后重新给一份额度。
+    #[serde(default, skip)]
+    pub subtask_retry_counts: HashMap<String, u32>,
 
     /// 🔥 已失败的任务ID集合（运行时字段）
     /// 避免同一任务多次失败时重复计数；重试成功时从此集合移除并减少 failed_count
@@ -196,9 +246,13 @@ impl FolderDownload {
             encrypted_folder_mappings: HashMap::new(),
             counted_task_ids: HashSet::new(),
             conflict_strategy: None,
+            skipped_count: 0,
+            skipped_size: 0,
+            skipped_entries: Vec::new(),
             completed_downloaded_size: 0,
             failed_count: 0,
             failed_task_ids: HashSet::new(),
+            subtask_retry_counts: HashMap::new(),
         }
     }
 
@@ -244,10 +298,34 @@ impl FolderDownload {
 
     /// 🔥 计算并更新 downloaded_size：已完成累计 + 当前活跃子任务已下载
     ///
-    /// 使用 max() 保证单调性，即使完成通知和进度通知乱序也不会丢字节
+    /// 使用 max() 保证单调性，即使完成通知和进度通知乱序也不会丢字节。
+    ///
+    /// **封顶到 total_size**：`completed_downloaded_size` 与 `active_sum` 一旦有一次重复累加，
+    /// `max()` 会把虚高值永久锁死（实测出现过 30.78 GB / 31.35 GB = 98.2%，而真实下载量只有
+    /// 17 GB）。已下载超过总大小在任何情况下都不是合法状态，这里钳住并告警，把静默的数据
+    /// 损坏变成可定位的信号，而不是让用户看到一个永远回不去的错误进度。
+    ///
+    /// 注意：`total_size == 0` 表示扫描尚未完成，此时不封顶。
     pub fn compute_downloaded_size(&mut self, active_sum: u64) -> u64 {
         let computed = self.completed_downloaded_size + active_sum;
-        self.downloaded_size = self.downloaded_size.max(computed);
+        let mut next = self.downloaded_size.max(computed);
+
+        if self.total_size > 0 && next > self.total_size {
+            tracing::warn!(
+                "文件夹 {} 已下载字节超过总大小并被钳制: {} > {} (completed_downloaded_size={}, active_sum={}, completed_count={}/{}), \
+                 通常意味着已完成字节被重复计入活跃任务",
+                self.id,
+                next,
+                self.total_size,
+                self.completed_downloaded_size,
+                active_sum,
+                self.completed_count,
+                self.total_files,
+            );
+            next = self.total_size;
+        }
+
+        self.downloaded_size = next;
         self.downloaded_size
     }
 

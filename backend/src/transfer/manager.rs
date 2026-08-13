@@ -121,6 +121,13 @@ pub struct PreviewShareResult {
     pub bdstoken: String,
     /// 分享根的绝对路径（来自 share/list?root=1 响应的 title 字段）
     pub share_root_path: Option<String>,
+    /// 分享体系类型（前端需原样回传，子目录导航要据此分流）
+    pub kind: crate::transfer::ShareKind,
+    /// 提取码校验换来的凭据
+    ///
+    /// 个人版是 randsk（已同时写进 Cookie，回传只是为了统一）；
+    /// 企业版是 spwd，**后续每个请求都必须显式带上**，不回传就没法翻子目录。
+    pub token: Option<String>,
 }
 
 /// handle_transfer_error 的返回值，区分恢复成功、友好失败、无法识别三种场景
@@ -278,38 +285,35 @@ impl TransferManager {
     ) -> Result<PreviewShareResult> {
         info!("预览分享链接: url={}", share_url);
 
-        // 1. 解析分享链接
-        let share_link = self.client.read().unwrap().parse_share_link(share_url)?;
+        // 1. 解析分享链接（个人版 / 企业版由 netdisk::share 自动判定）
+        let mut share_link = self.client.read().unwrap().parse_share_link(share_url)?;
 
         // 合并密码：请求中的密码 > 链接中的密码
         let password = password.or(share_link.password.clone());
+        share_link.password = password.clone();
 
         // 🔥 从共享引用快照当前客户端
         let client = self.client.read().unwrap().clone();
 
         // 2. 访问分享页面，获取分享信息
-        let share_info = client
-            .access_share_page(&share_link.short_key, &password, true)
-            .await?;
+        let share_info = client.access_share_page_for(&share_link, true).await?;
 
         // 3. 如果有密码，验证密码
-        if let Some(ref pwd) = password {
-            let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
-            client
-                .verify_share_password(
-                    &share_info.shareid,
-                    &share_info.share_uk,
-                    &share_info.bdstoken,
-                    pwd,
-                    &referer,
-                )
-                .await?;
-            info!("预览: 提取码验证成功");
-        }
+        //
+        // 拿到的凭据个人版是 randsk（同时已写进 Cookie），企业版是 spwd（必须
+        // 显式带进后续每个请求）。所以这里不能像以前那样丢弃返回值。
+        let token = match password {
+            Some(ref pwd) => {
+                let t = client.verify_share_password_for(&share_info, pwd).await?;
+                info!("预览: 提取码验证成功");
+                Some(t)
+            }
+            None => None,
+        };
 
         // 4. 获取文件列表（根目录，由前端传入分页参数）
         let list_result = client
-            .list_share_files(&share_link.short_key, &share_info.bdstoken, page, num)
+            .list_share_files_for(&share_info, page, num, token.as_deref())
             .await?;
 
         // 用根目录响应中的 uk/shareid 补充（access_share_page 可能提取失败）
@@ -332,11 +336,13 @@ impl TransferManager {
         );
         Ok(PreviewShareResult {
             files: list_result.files,
-            short_key: share_link.short_key,
+            short_key: share_info.short_key.clone(),
             shareid,
             uk,
             bdstoken: share_info.bdstoken,
             share_root_path: list_result.share_root_path,
+            kind: share_info.kind,
+            token,
         })
     }
 
@@ -344,6 +350,10 @@ impl TransferManager {
     ///
     /// 用于文件夹导航：前端点击文件夹后，调用此方法获取子目录内容。
     /// 需要传入首次预览时获取的 share_info，避免重复访问分享页面。
+    ///
+    /// `kind` / `token` 由前端从首次预览的结果原样回传：企业版的 spwd
+    /// 不像个人版 randsk 那样存在 Cookie 里，不带上就取不到子目录。
+    #[allow(clippy::too_many_arguments)]
     pub async fn preview_share_dir(
         &self,
         short_key: &str,
@@ -353,15 +363,27 @@ impl TransferManager {
         dir: &str,
         page: u32,
         num: u32,
+        kind: crate::transfer::ShareKind,
+        token: Option<&str>,
     ) -> Result<Vec<SharedFileInfo>> {
         info!(
-            "浏览分享子目录: short_key={}, dir={}, page={}, num={}",
-            short_key, dir, page, num
+            "浏览分享子目录: kind={:?}, short_key={}, dir={}, page={}, num={}",
+            kind, short_key, dir, page, num
         );
+
+        // 从前端回传的散字段还原分享上下文，避免重新访问分享页
+        let share_info = crate::transfer::SharePageInfo {
+            shareid: shareid.to_string(),
+            uk: uk.to_string(),
+            share_uk: uk.to_string(),
+            bdstoken: bdstoken.to_string(),
+            kind,
+            short_key: short_key.to_string(),
+        };
 
         let client = self.client.read().unwrap().clone();
         let file_list = client
-            .list_share_files_in_dir(short_key, shareid, uk, bdstoken, dir, page, num)
+            .list_share_files_in_dir_for(&share_info, dir, page, num, token)
             .await?;
 
         info!("子目录: 获取到 {} 个文件, dir={}", file_list.len(), dir);
@@ -407,6 +429,7 @@ impl TransferManager {
             short_key: share_link.short_key,
             raw_url: share_link.raw_url,
             password: password.clone(), // 密码已提取
+            kind: share_link.kind,
         };
 
         // 2. 处理分享直下模式
@@ -470,35 +493,28 @@ impl TransferManager {
         //    其它调用方仍走 access_share_page 解析。
         let client = self.client.read().unwrap().clone();
         let share_info_result = match request.prefetched_share.clone() {
-            Some(info) => {
+            Some(mut info) => {
                 info!(
                     "复用已捕获分享上下文，跳过 access_share_page: shareid={}",
                     info.shareid
                 );
+                // 兼容老数据：`kind`/`short_key` 是后加的字段，重启后从库里读回来的
+                // 快照没有它们（serde default 会给出 Personal + 空串）。空的 short_key
+                // 会让个人版列表接口的 shorturl 变成空，这里用刚解析出的链接补齐。
+                if info.short_key.is_empty() {
+                    info.short_key = share_link.short_key.clone();
+                    info.kind = share_link.kind;
+                }
                 Ok(info)
             }
-            None => {
-                client
-                    .access_share_page(&share_link.short_key, &share_link.password, true)
-                    .await
-            }
+            None => client.access_share_page_for(&share_link, true).await,
         };
 
         match share_info_result {
             Ok(info) => {
                 // 如果有密码，先验证密码
                 if let Some(ref pwd) = password {
-                    let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
-                    match client
-                        .verify_share_password(
-                            &info.shareid,
-                            &info.share_uk,
-                            &info.bdstoken,
-                            pwd,
-                            &referer,
-                        )
-                        .await
-                    {
+                    match client.verify_share_password_for(&info, pwd).await {
                         Ok(verified_randsk) => {
                             info!("提取码验证成功");
                             task.randsk = Some(verified_randsk);
@@ -689,7 +705,9 @@ impl TransferManager {
             .await;
 
             if let Err(e) = result {
-                let error_msg = e.to_string();
+                // `{:#}` 展开完整 anyhow 链：这个串会直接写进任务状态给用户看，
+                // 只取最外层 context 的话网络类失败全都长一个样。
+                let error_msg = format!("{:#}", e);
                 error!("转存任务执行失败: task_id={}, error={}", task_id, error_msg);
 
                 // 更新任务状态为失败
@@ -799,6 +817,7 @@ impl TransferManager {
             t.randsk.clone()
         };
 
+
         // 检查取消
         if cancellation_token.is_cancelled() {
             return Ok(());
@@ -814,37 +833,37 @@ impl TransferManager {
                 .is_some_and(|ids| !ids.is_empty())
         };
 
-        let (file_list, share_root_path_from_api): (Vec<SharedFileInfo>, Option<String>) = if has_selected_fs_ids {
+        // 根目录响应里的 uk/shareid 才是权威值：access_share_page 常常提取不到 uk
+        // （日志里 `提取分享信息成功: shareid=..., uk=` 就是空的），而超限后下钻列子目录
+        // 必须带正确的 uk，否则拿不到子项。
+        let (file_list, share_root_path_from_api, root_uk, root_shareid): (
+            Vec<SharedFileInfo>,
+            Option<String>,
+            String,
+            String,
+        ) = if has_selected_fs_ids {
             // 用户已选择文件，只拉第一页用于展示文件名
             let result = client
-                .list_share_files_with_randsk(
-                    &share_link.short_key,
-                    &share_info.bdstoken,
-                    1,
-                    100,
-                    randsk.as_deref(),
-                )
+                .list_share_files_for(&share_info, 1, 100, randsk.as_deref())
                 .await?;
-            (result.files, result.share_root_path)
+            (result.files, result.share_root_path, result.uk, result.shareid)
         } else {
             // 全选模式，循环分页拉取全部
             let mut all_files = Vec::new();
             let mut share_root_path: Option<String> = None;
+            let mut uk = String::new();
+            let mut shareid = String::new();
             let page_size: u32 = 100;
             let mut page: u32 = 1;
             loop {
                 let result = client
-                    .list_share_files_with_randsk(
-                        &share_link.short_key,
-                        &share_info.bdstoken,
-                        page,
-                        page_size,
-                        randsk.as_deref(),
-                    )
+                    .list_share_files_for(&share_info, page, page_size, randsk.as_deref())
                     .await?;
                 let batch_len = result.files.len();
                 if page == 1 {
                     share_root_path = result.share_root_path;
+                    uk = result.uk;
+                    shareid = result.shareid;
                 }
                 all_files.extend(result.files);
                 if (batch_len as u32) < page_size {
@@ -852,7 +871,19 @@ impl TransferManager {
                 }
                 page += 1;
             }
-            (all_files, share_root_path)
+            (all_files, share_root_path, uk, shareid)
+        };
+
+        // 空值回退到分享页提取的值
+        let list_uk = if root_uk.is_empty() {
+            share_info.uk.clone()
+        } else {
+            root_uk
+        };
+        let list_shareid = if root_shareid.is_empty() {
+            share_info.shareid.clone()
+        } else {
+            root_shareid
         };
 
         info!(
@@ -905,6 +936,26 @@ impl TransferManager {
         } else {
             file_list.clone()
         };
+
+        // 逐项剥离虚拟根：前端可能对不同目录拿到不同的 uk，导致同一次选择里混进
+        // `/sharelink0-<shareid>/` 与 `/sharelink<真实uk>-<shareid>/` 两种前缀。
+        // 不在这里归一的话，`derive_share_root` 会因「前缀不统一」判不出虚拟根，
+        // 转存目标凭空多出一层 `/sharelink…/`（实测日志里出现过两次）。
+        let filtered_file_list: Vec<SharedFileInfo> = filtered_file_list
+            .into_iter()
+            .map(|mut f| {
+                f.path = strip_virtual_share_root(&f.path);
+                f
+            })
+            .collect();
+        let virtual_roots_stripped = filtered_file_list
+            .iter()
+            .any(|f| !f.path.starts_with("/sharelink"));
+        debug!(
+            "选择集路径归一完成: {} 项, 已剥离虚拟根={}",
+            filtered_file_list.len(),
+            virtual_roots_stripped
+        );
 
         // 🔥 从过滤后的文件列表中提取主要文件名
         let transfer_file_name = if !filtered_file_list.is_empty() {
@@ -1068,7 +1119,8 @@ impl TransferManager {
             t.total_count = fs_ids.len();
         }
 
-        let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
+        // Referer 现在由各体系的 provider 按自己的分享页地址拼（个人版 /s/xxx、
+        // 企业版 /apaas/share?surl=xxx），这里不再需要手工构造。
 
         // ========== 转存请求摘要日志 ==========
         {
@@ -1145,6 +1197,31 @@ impl TransferManager {
             }
         }
 
+        // 百度单次转存有目标文件数上限（默认 500），且按「递归展开后的文件总数」
+        // (`target_file_nums`) 判定，不是按提交的 fs_id 个数——选中一个含 800 个文件
+        // 的目录只有 1 个 fs_id，照样撞 errno=12。
+        //
+        // 这里**不做**主动预扫：要知道一个目录底下有多少文件就得递归列目录，而绝大
+        // 多数转存根本不到 500，为此让每次转存都先爬一遍分享树是不划算的（实测选中
+        // 99 项里含目录时预扫要跑十分钟）。改为惰性——先按已知信息尽量拆，真撞上
+        // 超限了再逐层下钻拆分**那一批**（见 `split_over_limit_batch`）。
+        //
+        // share-sync 那边同样有失败后二分（`executor.rs` 的 `share_sync_bisect_split`），
+        // 这里用的是同一对拆分函数；它额外还做急切预拆，是因为它为了算 diff 本来就持有
+        // 整棵树，`descendants_leaves()` 是纯内存操作、预拆免费，transfer 侧没这个前提。
+        let file_limit = transfer_file_limit();
+
+        // 超限下钻的上下文在整个任务内共享：
+        // - 目录缓存让多个批次下钻到同一目录时不重复列（你提的「复用查询」）
+        // - QuotaLimiter 让「列目录 + 转存提交」合计受同一个全局 RPS 约束，防 errno=132
+        let dir_children_cache: Arc<Mutex<HashMap<String, Vec<SharedFileInfo>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let scan_rate_limiter = crate::share_sync::rate_limit::QuotaLimiter::from_env();
+
+        // 进度条的分母。初值是选中项数，超限下钻把目录展开成子项后会随之增长
+        // （否则出现「转存 34 / 共 8」这种分子大于分母的显示）。
+        let mut effective_total_units = fs_ids.len();
+
         // ========== 转存策略：统一按原始父目录分组，保留完整目录结构 ==========
         let (transfer_result, batch_groups_info): (
             Result<TransferResult>,
@@ -1154,10 +1231,22 @@ impl TransferManager {
                 let t = task.read().await;
                 t.share_root_path.clone()
             };
-            let share_root =
-                derive_share_root(task_share_root_path.as_deref(), &filtered_file_list);
-            let groups = group_files_by_parent_dir(&filtered_file_list, &share_root);
+let share_root = derive_share_root(task_share_root_path.as_deref(), &filtered_file_list);
+            // 先按父目录分组还原目录结构，再按上限把每组切成多批。
+            //
+            // 这一步是**零请求**的：只按选中项个数切，一个组里塞了 1200 个文件时
+            // 必然超限，不用问百度也知道要拆。选中项是目录时无从判断（1 个 fs_id 底下
+            // 可能有上万文件），那种情况留给下面的惰性兜底。
+            let dir_groups = group_files_by_parent_dir(&filtered_file_list, &share_root);
+            let dir_group_count = dir_groups.len();
+            let groups = split_groups_by_file_limit(dir_groups, file_limit);
             let total_groups = groups.len();
+            if total_groups > dir_group_count {
+                info!(
+                    "按单次转存上限切批: {} 个目录组 → {} 个批次, limit={}",
+                    dir_group_count, total_groups, file_limit
+                );
+            }
 
             // 诊断日志：跨目录同名检测（仅用于日志）
             let cross_dir_dups = detect_cross_dir_duplicates(&filtered_file_list);
@@ -1236,13 +1325,10 @@ impl TransferManager {
 
                 // 转存该组
                 let result = client
-                    .transfer_share_files_with_randsk(
-                        &share_info.shareid,
-                        &share_info.share_uk,
-                        &share_info.bdstoken,
+                    .transfer_share_files_for(
+                        &share_info,
                         &group_fs_ids,
                         &group_target_dir,
-                        &referer,
                         Some(task_id),
                         randsk.as_deref(),
                     )
@@ -1261,13 +1347,10 @@ impl TransferManager {
                                 warn!("重试时创建目录失败: {}", e);
                             }
                             client
-                                .transfer_share_files_with_randsk(
-                                    &share_info.shareid,
-                                    &share_info.share_uk,
-                                    &share_info.bdstoken,
+                                .transfer_share_files_for(
+                                    &share_info,
                                     &group_fs_ids,
                                     &group_target_dir,
-                                    &referer,
                                     Some(task_id),
                                     randsk.as_deref(),
                                 )
@@ -1276,6 +1359,105 @@ impl TransferManager {
                             result
                         }
                     }
+                    _ => result,
+                };
+
+                // 临时错误退避重试：百度的 `errno=4「请求超时，请稍后再试」` 之类
+                // 重试同一批就能过，不该让一次抖动废掉整批（实测批次 2/3 就是这么挂的）。
+                // 注意与另两类区分：文件数超限要拆小、空间不足要停手，都不在这里重试。
+                let mut result = result;
+                let mut transient_attempt: u32 = 0;
+                let max_transient = transfer_transient_retries();
+                while transient_attempt < max_transient {
+                    let should_retry = matches!(
+                        &result,
+                        Ok(r) if !r.success
+                            && is_transient_transfer_error(r.error.as_deref().unwrap_or(""))
+                    );
+                    if !should_retry {
+                        break;
+                    }
+                    transient_attempt += 1;
+                    let backoff = Duration::from_millis(
+                        transfer_transient_backoff_ms() * (1u64 << (transient_attempt - 1)),
+                    );
+                    warn!(
+                        "批次 {}/{} 遇到临时错误，{:?} 后第 {}/{} 次重试: {}",
+                        batch_num,
+                        total_groups,
+                        backoff,
+                        transient_attempt,
+                        max_transient,
+                        result
+                            .as_ref()
+                            .ok()
+                            .and_then(|r| r.error.as_deref())
+                            .unwrap_or("")
+                    );
+                    tokio::time::sleep(backoff).await;
+                    result = client
+                        .transfer_share_files_for(
+                            &share_info,
+                            &group_fs_ids,
+                            &group_target_dir,
+                            Some(task_id),
+                            randsk.as_deref(),
+                        )
+                        .await;
+                }
+                let result = result;
+
+                // 「转存文件数超过上限」惰性兜底：只有真撞上了才去爬这一批的子树，
+                // 用 share-sync 同一套 tree 精确拆分后重提。没超限的转存一路零额外请求。
+                let result = match &result {
+                    Ok(r)
+                    if !r.success
+                        && is_file_limit_exceeded(r.error.as_deref().unwrap_or("")) =>
+                        {
+                            warn!(
+                            "批次 {}/{} 撞到转存文件数上限，开始抓取该批子树并拆分重提: {} 个条目 -> {}",
+                            batch_num,
+                            total_groups,
+                            group_files.len(),
+                            group_target_dir
+                        );
+                            // 失败的那次转存百度可能已按 ondup 建出改名的空壳目录，先清掉
+                            cleanup_ondup_shells(&client, &group_target_dir, &group_files).await;
+
+                            let dir_ctx = ShareDirCtx {
+                                client: &client,
+                                short_key: &share_info.short_key,
+                                shareid: &list_shareid,
+                                uk: &list_uk,
+                                bdstoken: &share_info.bdstoken,
+                                kind: share_info.kind,
+                                randsk: randsk.as_deref(),
+                                rate_limiter: Arc::clone(&scan_rate_limiter),
+                                cache: Arc::clone(&dir_children_cache),
+                            };
+                            match split_over_limit_batch(
+                                &dir_ctx,
+                                &share_info,
+                                group_files.clone(),
+                                &group_target_dir,
+                                task_id,
+                                randsk.as_deref(),
+                            )
+                                .await
+                            {
+                                Ok((r, unit_total)) => {
+                                    // 下钻把目录换成了子项，进度分母要跟着长，
+                                    // 否则会显示成「34/8」这种转存数大于总数的样子
+                                    effective_total_units = adjust_total_units(
+                                        effective_total_units,
+                                        group_files.len(),
+                                        unit_total,
+                                    );
+                                    Ok(r)
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
                     _ => result,
                 };
 
@@ -1467,6 +1649,9 @@ impl TransferManager {
                 let (auto_download, file_list, is_share_direct_download) = {
                     let mut t = task.write().await;
                     t.transferred_count = result.transferred_paths.len();
+// 超限下钻展开过目录时，分母已经从「选中项数」长到「实际单元数」；
+                    // 再兜一层 max，保证任何情况下分子都不会超过分母
+                    t.total_count = effective_total_units.max(t.transferred_count);
                     (
                         t.auto_download,
                         t.file_list.clone(),
@@ -1579,7 +1764,10 @@ impl TransferManager {
                 }
             }
             Err(e) => {
-                let raw_err_msg = e.to_string();
+                // `{:#}` 展开完整 anyhow 链。下面 handle_transfer_error 是按
+                // `task_errno=` 子串抽错误码的，链变长不影响抽取；而识别不出错误码时
+                // 会原样透出这个串，此时多出来的底层原因（超时/连接重置）正是排障要的。
+                let raw_err_msg = format!("{:#}", e);
 
                 // 🔥 尝试友好错误处理（区分 task_errno 场景）
                 let handled = Self::handle_transfer_error(&task, &client, &raw_err_msg).await;
@@ -3742,6 +3930,30 @@ impl TransferManager {
     ///
     /// 这里改为先克隆 `(id, Arc<RwLock<TransferTask>>)` 再依次 `read().await`，
     /// 锁等待是瞬时的（写锁持续期短），但保证不漏任何任务。
+    /// 只取内存中的活跃任务（不含历史库重建的副本）。
+    ///
+    /// 跨账号聚合时必须先收集这一份：历史库是全局共享的，非归属账号的 manager 也会
+    /// 从里面捞到同一条任务并用 `convert_history_to_task` 重建，而那份重建副本的
+    /// `transferred_count` 是按「全部成功」伪造的。谁先进去谁赢的去重会让伪造副本
+    /// 盖掉真实进度（实测部分成功的任务被显示成 7/7）。
+    pub async fn get_live_tasks(&self) -> Vec<TransferTask> {
+        let task_arcs: Vec<Arc<RwLock<TransferTask>>> = self
+            .tasks
+            .iter()
+            .map(|e| e.value().task.clone())
+            .collect();
+
+        let mut result = Vec::new();
+        for task_arc in task_arcs {
+            let task = task_arc.read().await;
+            if task.is_internal {
+                continue;
+            }
+            result.push(task.clone());
+        }
+        result
+    }
+
     pub async fn get_all_tasks(&self) -> Vec<TransferTask> {
         let mut result = Vec::new();
 
@@ -5025,6 +5237,32 @@ fn detect_virtual_share_root_prefix(files: &[SharedFileInfo]) -> Option<String> 
     }
 }
 
+/// 逐项剥离虚拟根前缀 `/sharelink<uk>-<shareid>`，把路径归一到「分享内」命名空间。
+///
+/// [`detect_virtual_share_root_prefix`] 要求**所有**路径共享同一个前缀才肯剥。但前端
+/// 在分享内导航时，不同目录可能拿到不同的 uk（取不到时为 0），于是同一次选择里会混进
+/// `/sharelink0-<shareid>/` 和 `/sharelink<真实uk>-<shareid>/` 两种前缀——整体剥离随即
+/// 失效，`share_root` 退化为空，虚拟根被当成目录名转存出来（用户看到目标位置多出
+/// 一层 `/sharelink…/`）。这里改为按项各剥各的，混合前缀也能归到同一命名空间。
+///
+/// 只剥虚拟根这一层；分享根目录本身（如 `/13`）仍保留，与 `derive_share_root` 的
+/// 「分享根保留在 relative_parent 里」保持一致。
+fn strip_virtual_share_root(path: &str) -> String {
+    let trimmed = path.trim_start_matches('/');
+    let (top, rest) = match trimmed.split_once('/') {
+        Some(pair) => pair,
+        None => (trimmed, ""),
+    };
+    if !is_virtual_share_root(top) {
+        return path.to_string();
+    }
+    if rest.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", rest)
+    }
+}
+
 /// 推导用于剥离分享者私有上层目录的 share_root。
 ///
 /// 优先使用百度 `share/list?root=1` 响应里的 `title` 字段（分享根的绝对路径），
@@ -5081,6 +5319,475 @@ fn group_files_by_parent_dir(
     result
 }
 
+/// 百度单次转存的目标文件数上限，默认 500；实际值以超限时响应里的
+/// `target_file_nums_limit` 为准，可用 `BAIDUPCS_TRANSFER_FILE_LIMIT` 覆盖。
+/// 与 share-sync 的预拆批共用同一个环境变量，两边保持一致。
+///
+/// 注意：百度按「递归展开后的文件总数」(`target_file_nums`) 判定，不是按提交的
+/// fs_id 个数——选中一个含 800 个文件的目录只提交 1 个 fs_id，同样会撞 errno=12。
+const TRANSFER_FILE_LIMIT_DEFAULT: usize = 500;
+
+fn transfer_file_limit() -> usize {
+    std::env::var("BAIDUPCS_TRANSFER_FILE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(TRANSFER_FILE_LIMIT_DEFAULT)
+}
+
+/// 判断转存失败信息是否为「转存文件数超过上限」（对应 errno=12 + target_file_nums 超限）。
+fn is_file_limit_exceeded(err: &str) -> bool {
+    err.contains("转存文件数") && err.contains("超过上限")
+}
+
+/// 用某个批次「展开后的实际单元数」修正进度条分母。
+///
+/// 超限下钻会把 1 个目录换成 N 个子项，分母不跟着长就会出现「转存 34 / 共 8」
+/// 这种分子大于分母的显示。展开只会让单元数变多，但仍用 saturating 运算兜底，
+/// 避免日后改动引入下溢（usize 下溢会得到天文数字，比显示错更难查）。
+fn adjust_total_units(current_total: usize, batch_before: usize, batch_after: usize) -> usize {
+    current_total
+        .saturating_sub(batch_before)
+        .saturating_add(batch_after)
+}
+
+/// 判断转存失败信息是否为百度的**临时性**错误（超时 / 抖动 / 限流）。
+///
+/// 关键字与 `share_sync::error` 的 `TRANSIENT_KEYWORDS` 保持一致。典型是
+/// `errno=4「请求超时，请稍后再试」`——重试同一批就能过，跟「文件数超限」
+/// （必须拆小）和「空间不足」（拆多小都没用）是三码事。
+fn is_transient_transfer_error(err: &str) -> bool {
+    const TRANSIENT_KEYWORDS: &[&str] = &[
+        "请求超时",
+        "超时",
+        "请稍后",
+        "稍后再试",
+        "timeout",
+        "timed out",
+        "temporarily",
+        "temporary",
+        "网络异常",
+        "connection reset",
+    ];
+    TRANSIENT_KEYWORDS.iter().any(|k| err.contains(k))
+}
+
+/// 转存批次遇到临时错误时的重试次数与退避基准，可用环境变量覆盖
+/// （与 share-sync 的 `BAIDUPCS_SHARE_SYNC_TRANSIENT_*` 对应）。
+fn transfer_transient_retries() -> u32 {
+    std::env::var("BAIDUPCS_TRANSFER_TRANSIENT_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
+}
+
+fn transfer_transient_backoff_ms() -> u64 {
+    std::env::var("BAIDUPCS_TRANSFER_TRANSIENT_BACKOFF_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
+}
+
+/// 判断转存失败信息是否为「网盘空间不足」。
+///
+/// 关键字与 `share_sync::error` 的 `QUOTA_KEYWORDS` 保持一致。这类失败**重试没有
+/// 意义**：拆多小都不会有空间。dfe1a0b 就是因为把它误判成文件数超限，一路对半拆到
+/// 每批 1 个文件、刷了 347 次 errno=-32 才修掉，这里必须及早停手。
+fn is_quota_exceeded(err: &str) -> bool {
+    const QUOTA_KEYWORDS: &[&str] = &[
+        "网盘空间不足",
+        "空间不足",
+        "errno=-32",
+        "errno=-7",
+        "errno=-12",
+    ];
+    QUOTA_KEYWORDS.iter().any(|k| err.contains(k))
+}
+
+/// 按单次转存文件数上限把每个父目录组切成多批。
+///
+/// **零请求**：只按选中项个数切。一个组里塞了 1200 个条目时必然超限，不用问百度；
+/// 但选中项是目录时无从判断（1 个 fs_id 底下可能有上万文件），那种情况交给
+/// `split_over_limit_batch` 惰性处理。
+fn split_groups_by_file_limit(
+    groups: Vec<(String, Vec<SharedFileInfo>)>,
+    limit: usize,
+) -> Vec<(String, Vec<SharedFileInfo>)> {
+    let limit = limit.max(1);
+    let mut out: Vec<(String, Vec<SharedFileInfo>)> = Vec::new();
+
+    for (parent, files) in groups {
+        if files.len() <= limit {
+            out.push((parent, files));
+            continue;
+        }
+        for chunk in files.chunks(limit) {
+            out.push((parent.clone(), chunk.to_vec()));
+        }
+    }
+
+    out
+}
+
+/// 列子目录时用的分享上下文（超限下钻专用）。
+///
+/// `shareid`/`uk` 刻意与 `SharePageInfo` 分开存：这里要用的是**根目录响应**
+/// 里的权威值，access_share_page 拿到的那份经常缺 uk。
+struct ShareDirCtx<'a> {
+    client: &'a NetdiskClient,
+    short_key: &'a str,
+    shareid: &'a str,
+    uk: &'a str,
+    bdstoken: &'a str,
+    /// 分享体系类型，决定列目录走哪套接口
+    kind: crate::transfer::ShareKind,
+    randsk: Option<&'a str>,
+    rate_limiter: Arc<crate::share_sync::rate_limit::QuotaLimiter>,
+    /// 目录 → 直接子项。同一个任务内多个批次下钻到同一目录时直接复用，不重复请求。
+    cache: Arc<Mutex<HashMap<String, Vec<SharedFileInfo>>>>,
+}
+
+impl ShareDirCtx<'_> {
+    /// 列出目录的**直接子项**（自动翻页，带退避重试）。
+    ///
+    /// 只要一层：超限下钻每次只需要把当前目录拆成子项，不需要整棵子树。
+    /// 这是跟「全量抓快照」的关键差别——实测全量抓一次要十分钟，且中途任一请求
+    /// 最终失败会让整批告吹。
+    async fn list_children(&self, dir: &str) -> Result<Vec<SharedFileInfo>> {
+        if let Some(hit) = self.cache.lock().await.get(dir).cloned() {
+            debug!("超限下钻命中目录缓存: dir={}, {} 个子项", dir, hit.len());
+            return Ok(hit);
+        }
+
+        const PAGE_SIZE: u32 = 100;
+        const MAX_PAGES: u32 = 500;
+        const MAX_RETRIES: u32 = 3;
+
+        let mut all: Vec<SharedFileInfo> = Vec::new();
+        let mut page: u32 = 1;
+        loop {
+            let mut attempt: u32 = 0;
+            let batch = loop {
+                // 与转存提交共用同一个令牌桶，避免列目录突发撞百度风控 errno=132
+                self.rate_limiter.acquire().await;
+                let dir_share_info = crate::transfer::SharePageInfo {
+                    shareid: self.shareid.to_string(),
+                    uk: self.uk.to_string(),
+                    share_uk: self.uk.to_string(),
+                    bdstoken: self.bdstoken.to_string(),
+                    kind: self.kind,
+                    short_key: self.short_key.to_string(),
+                };
+                match self
+                    .client
+                    .list_share_files_in_dir_for(
+                        &dir_share_info,
+                        dir,
+                        page,
+                        PAGE_SIZE,
+                        self.randsk,
+                    )
+                    .await
+                {
+                    Ok(b) => break b,
+                    Err(e) if attempt < MAX_RETRIES => {
+                        attempt += 1;
+                        let backoff = Duration::from_millis(800 * (1u64 << (attempt - 1)));
+                        warn!(
+                            "超限下钻列目录失败，{:?} 后第 {} 次重试: dir={}, page={}, error={:#}",
+                            backoff, attempt, dir, page, e
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+
+            let batch_len = batch.len() as u32;
+            all.extend(batch);
+            if batch_len < PAGE_SIZE {
+                break;
+            }
+            page += 1;
+            if page > MAX_PAGES {
+                warn!("超限下钻翻页超过上限，子项可能不全: dir={}", dir);
+                break;
+            }
+        }
+
+        self.cache.lock().await.insert(dir.to_string(), all.clone());
+        Ok(all)
+    }
+}
+
+/// 撞到「转存文件数超限」后的惰性拆分：失败驱动，一次只下钻一层。
+///
+/// 这就是 share-sync `share_sync_bisect_split`（`executor.rs:1651`）的等价物：
+/// - 一批有多项 → 对半拆（`split_indices_two` 的语义），**零请求**
+/// - 只剩一个目录还超限 → 列它的**直接子项**当作新的一批（`split_two` 的语义），
+///   目标目录追加该目录名以保持结构，只花 1 次请求
+/// - 拆到单个文件仍失败 → 认输，如实报错
+///
+/// 之所以不先抓整棵子树：实测抓一次十分钟，且中途任一请求最终失败整批就废了。
+/// share-sync 那边为了算 diff 本来就持有整棵树，所以它能免费预拆；transfer 没这个
+/// 前提，只能按需下钻，代价与「真正出问题的节点数」成正比而不是与分享规模成正比。
+#[allow(clippy::too_many_arguments)]
+async fn split_over_limit_batch(
+    ctx: &ShareDirCtx<'_>,
+    share_info: &SharePageInfo,
+    items: Vec<SharedFileInfo>,
+    target_dir: &str,
+    internal_task_id: &str,
+    randsk: Option<&str>,
+) -> Result<(TransferResult, usize)> {
+    /// 下钻深度上限，与 share-sync 的 `BISECT_MAX_DEPTH` 对齐
+    const MAX_DEPTH: u32 = 32;
+
+    // 「已知单元数」——进度条的分母。下钻会把 1 个目录换成 N 个子项，
+    // 分母必须跟着长，否则会出现「34/8」这种转存数大于总数的显示。
+    // 对半拆不改变单元数，只有下钻才改变。
+    let mut unit_total = items.len();
+
+    let mut merged = TransferResult {
+        success: false,
+        transferred_paths: Vec::new(),
+        from_paths: Vec::new(),
+        transferred_fs_ids: Vec::new(),
+        error: None,
+    };
+    let mut last_error: Option<String> = None;
+    let mut submits = 0usize;
+    let mut lists = 0usize;
+
+    // (待提交项, 目标目录, 深度)
+    let mut pending: Vec<(Vec<SharedFileInfo>, String, u32)> =
+        vec![(items, target_dir.to_string(), 0)];
+
+    while let Some((mut items, dir, depth)) = pending.pop() {
+        if items.is_empty() {
+            continue;
+        }
+
+        let fs_ids: Vec<u64> = items.iter().map(|f| f.fs_id).collect();
+        submits += 1;
+        let mut result = client_transfer(
+            ctx.client,
+            share_info,
+            &fs_ids,
+            &dir,
+            internal_task_id,
+            randsk,
+        )
+            .await?;
+
+        // 临时错误（errno=4 超时等）退避重试同一组；拆小对它没用，重试才有用
+        let mut transient_attempt: u32 = 0;
+        while transient_attempt < transfer_transient_retries()
+            && !result.success
+            && is_transient_transfer_error(result.error.as_deref().unwrap_or(""))
+        {
+            transient_attempt += 1;
+            let backoff = Duration::from_millis(
+                transfer_transient_backoff_ms() * (1u64 << (transient_attempt - 1)),
+            );
+            warn!(
+                "超限拆分子批次遇到临时错误，{:?} 后第 {} 次重试: {} 项 -> {}",
+                backoff,
+                transient_attempt,
+                items.len(),
+                dir
+            );
+            tokio::time::sleep(backoff).await;
+            result = client_transfer(
+                ctx.client,
+                share_info,
+                &fs_ids,
+                &dir,
+                internal_task_id,
+                randsk,
+            )
+                .await?;
+        }
+
+        if result.success {
+            merged.success = true;
+            merged.transferred_paths.extend(result.transferred_paths);
+            merged.from_paths.extend(result.from_paths);
+            merged.transferred_fs_ids.extend(result.transferred_fs_ids);
+            continue;
+        }
+
+        let err = result.error.unwrap_or_default();
+
+        // 网盘空间不足：拆多小都不会有空间，继续提交纯属浪费且徒增风控风险。
+        // 立刻停掉所有待处理分支，把剩下的算作未转存（实测一次这样的转存白提交了
+        // 14 次，其中 5 次全是空间不足）。
+        if is_quota_exceeded(&err) {
+            let abandoned: usize = pending.iter().map(|(items, _, _)| items.len()).sum();
+            warn!(
+                "网盘空间不足，停止后续拆分与提交: {} 项 -> {}, 放弃剩余 {} 项, error={}",
+                items.len(),
+                dir,
+                abandoned,
+                err
+            );
+            last_error = Some(err);
+            pending.clear();
+            break;
+        }
+
+        if !is_file_limit_exceeded(&err) || depth >= MAX_DEPTH {
+            warn!(
+                "超限拆分子批次失败（不再下钻）: {} 项 -> {}, depth={}, error={}",
+                items.len(),
+                dir,
+                depth,
+                err
+            );
+            last_error = Some(err);
+            continue;
+        }
+
+        if items.len() >= 2 {
+            // 多项：对半拆，零请求
+            let mid = items.len() / 2;
+            let right = items.split_off(mid_index(&items, mid));
+            info!(
+                "超限拆分: {} 项 → {} + {}, dir={}, depth={}",
+                right.len() + items.len(),
+                items.len(),
+                right.len(),
+                dir,
+                depth
+            );
+            pending.push((right, dir.clone(), depth + 1));
+            pending.push((items, dir, depth + 1));
+            continue;
+        }
+
+        // 单项：只有目录能继续拆，列出它的直接子项
+        let only = &items[0];
+        if !only.is_dir {
+            warn!("单个文件仍报超限，无法继续拆分: path={}", only.path);
+            last_error = Some(err);
+            continue;
+        }
+
+        lists += 1;
+        let children = match ctx.list_children(&only.path).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "超限下钻列目录失败，该目录放弃: path={}, error={:#}",
+                    only.path, e
+                );
+                last_error = Some(format!("{}（下钻列目录失败: {:#}）", err, e));
+                continue;
+            }
+        };
+        if children.is_empty() {
+            warn!("目录报超限但列不出子项，放弃: path={}", only.path);
+            last_error = Some(err);
+            continue;
+        }
+
+        // 1 个目录展开成 N 个子项，已知单元数随之增长
+        unit_total = unit_total + children.len() - 1;
+
+        // 子项落到 <目标目录>/<该目录名>，保持原有目录结构
+        let child_dir = format!("{}/{}", dir.trim_end_matches('/'), only.name);
+        if let Err(e) = ensure_dirs_exist(ctx.client, &child_dir).await {
+            warn!("下钻前预建目录失败（继续尝试）: {}, error={}", child_dir, e);
+        }
+        info!(
+            "超限下钻: 目录 {} → {} 个子项 -> {}, depth={}",
+            only.path,
+            children.len(),
+            child_dir,
+            depth
+        );
+        pending.push((children, child_dir, depth + 1));
+    }
+
+    merged.error = last_error;
+    info!(
+        "超限拆分完成: 提交 {} 次, 列目录 {} 次, success={}, 转存 {}/{} 个单元",
+        submits,
+        lists,
+        merged.success,
+        merged.transferred_paths.len(),
+        unit_total
+    );
+    Ok((merged, unit_total))
+}
+
+/// `items.split_off` 的下标兜底：保证两边都非空，避免 0 分割导致死循环。
+fn mid_index(items: &[SharedFileInfo], mid: usize) -> usize {
+    mid.clamp(1, items.len().saturating_sub(1).max(1))
+}
+
+/// 提交一次转存（把参数收拢，方便上面的拆分循环调用）。
+async fn client_transfer(
+    client: &NetdiskClient,
+    share_info: &SharePageInfo,
+    fs_ids: &[u64],
+    target_dir: &str,
+    internal_task_id: &str,
+    randsk: Option<&str>,
+) -> Result<TransferResult> {
+    client
+        .transfer_share_files_for(
+            share_info,
+            fs_ids,
+            target_dir,
+            Some(internal_task_id),
+            randsk,
+        )
+        .await
+}
+
+/// 清理那次超限失败留下的空壳目录。
+///
+/// 转存超限失败时百度仍会按 ondup 把同名目标改名建出一个空目录（用户看到的
+/// `name_<时间戳>` 残留）。拆批重提之前先删掉，否则重提又会撞同名再改一次名。
+async fn cleanup_ondup_shells(
+    client: &NetdiskClient,
+    target_dir: &str,
+    batch_files: &[SharedFileInfo],
+) {
+    let existing = match client.get_file_list(target_dir, 1, 1000).await {
+        Ok(list) => list,
+        Err(e) => {
+            warn!("清理空壳目录前列目录失败，跳过清理: dir={}, error={}", target_dir, e);
+            return;
+        }
+    };
+
+    let expected: HashSet<&str> = batch_files.iter().map(|f| f.name.as_str()).collect();
+    // 只删「名字是 <选中项名>_<数字后缀> 且为空目录」的，避免误伤用户已有文件
+    let shells: Vec<String> = existing
+        .list
+        .iter()
+        .filter(|item| item.isdir == 1)
+        .filter(|item| {
+            item.server_filename
+                .rsplit_once('_')
+                .is_some_and(|(stem, suffix)| {
+                    expected.contains(stem) && suffix.chars().all(|c| c.is_ascii_digit())
+                })
+        })
+        .map(|item| item.path.clone())
+        .collect();
+
+    if shells.is_empty() {
+        return;
+    }
+    info!("清理超限失败留下的空壳目录: {} 个, {:?}", shells.len(), shells);
+    if let Err(e) = client.delete_files(&shells).await {
+        warn!("清理空壳目录失败（不影响后续拆批）: {}", e);
+    }
+}
+
 /// 合并分批转存结果
 ///
 /// 关键逻辑：至少一个批次成功就标记 success=true，继续自动下载流程。
@@ -5099,11 +5806,18 @@ fn merge_batch_results(
     let mut batch_groups_info = Vec::new();
     let mut failed_batches = Vec::new();
     let mut success_count = 0usize;
+    // 批次内部「部分成功」的告警：整批标 success=true，但里面有子批次失败。
+    // 超限拆分就是典型——12 项拆成多批，6 项成功、其余因空间不足失败，
+    // 若丢掉这些信息，界面会显示「已转存」而用户看到进度条只走了一半。
+    let mut partial_warnings: Vec<String> = Vec::new();
 
     for (batch_index, group_id, group_files, result) in results {
         match result {
             Ok(r) if r.success => {
                 success_count += 1;
+                if let Some(ref warn_msg) = r.error {
+                    partial_warnings.push(format!("batch_{} ({}): {}", batch_index, group_id, warn_msg));
+                }
                 merged.transferred_paths.extend(r.transferred_paths.clone());
                 merged.from_paths.extend(r.from_paths);
                 merged
@@ -5126,24 +5840,37 @@ fn merge_batch_results(
                 failed_batches.push((batch_index, group_id, r.error.unwrap_or_default()));
             }
             Err(e) => {
-                failed_batches.push((batch_index, group_id, e.to_string()));
+                // 用 `{:#}` 展开完整 anyhow 链。`{}`（即 to_string）只取最外层
+                // context，网络类失败就只剩一句「转存请求失败」，看不出是超时、
+                // 连接重置还是代理不通——排障只能去翻日志。
+                // share_sync 那边早就是这么做的（见 snapshot.rs 的同款注释）。
+                failed_batches.push((batch_index, group_id, format!("{:#}", e)));
             }
         }
     }
 
     if success_count > 0 {
         merged.success = true;
+        let mut notes: Vec<String> = Vec::new();
         if !failed_batches.is_empty() {
             let failed_info: Vec<String> = failed_batches
                 .iter()
                 .map(|(idx, gid, err)| format!("batch_{} ({}): {}", idx, gid, err))
                 .collect();
-            merged.error = Some(format!(
+            notes.push(format!(
                 "部分批次失败 ({}/{}): {}",
                 failed_batches.len(),
                 success_count + failed_batches.len(),
                 failed_info.join("; ")
             ));
+        }
+        // 批次整体算成功、但内部有子批次失败（超限拆分的常见形态）也要如实报出来，
+        // 否则界面显示「已转存」而实际只转了一部分。
+        if !partial_warnings.is_empty() {
+            notes.push(format!("部分文件未转存: {}", partial_warnings.join("; ")));
+        }
+        if !notes.is_empty() {
+            merged.error = Some(notes.join("；"));
         }
     } else {
         let all_errors: Vec<String> = failed_batches
@@ -5576,6 +6303,405 @@ mod tests {
             "久别不成悲18集包含纯净版/纯净版/爸爸，别再丢下我和妈妈/抖音"
         );
         assert!(!groups[0].0.contains("sharelink"));
+    }
+
+    // ========== 虚拟根逐项剥离 ==========
+
+    #[test]
+    fn test_strip_virtual_share_root_basic() {
+        assert_eq!(
+            strip_virtual_share_root("/sharelink0-37559844790/13/玉溪资料"),
+            "/13/玉溪资料"
+        );
+        assert_eq!(
+            strip_virtual_share_root("/sharelink3745347292-37559844790/13/张工"),
+            "/13/张工"
+        );
+    }
+
+    /// 非虚拟根路径原样返回，不能误伤真实目录名。
+    #[test]
+    fn test_strip_virtual_share_root_leaves_normal_paths() {
+        assert_eq!(strip_virtual_share_root("/13/玉溪资料"), "/13/玉溪资料");
+        assert_eq!(strip_virtual_share_root("/a.mp4"), "/a.mp4");
+        // 名字里带 sharelink 但格式不符（uk/shareid 非纯数字）不算虚拟根
+        assert_eq!(
+            strip_virtual_share_root("/sharelink-abc/x"),
+            "/sharelink-abc/x"
+        );
+        assert_eq!(strip_virtual_share_root("/sharelinkfoo/x"), "/sharelinkfoo/x");
+    }
+
+    /// 路径就是虚拟根本身时剥成根，不产生空路径。
+    #[test]
+    fn test_strip_virtual_share_root_bare_root() {
+        assert_eq!(strip_virtual_share_root("/sharelink0-123"), "/");
+    }
+
+    /// 复现日志里的真实场景：前端对不同目录拿到了不同的 uk（0 与真实 uk），
+    /// 整体剥离（detect_virtual_share_root_prefix）会因前缀不统一而失效，
+    /// 逐项剥离后两组必须归到同一个相对父目录，转存目标不再多出 sharelink 一层。
+    #[test]
+    fn test_mixed_virtual_roots_normalize_to_one_namespace() {
+        let raw = vec![
+            make_file("/sharelink0-37559844790/13/玉溪资料2", 1),
+            make_file("/sharelink3745347292-37559844790/13/张工", 2),
+        ];
+        // 混合前缀时整体识别确实失效——这正是逐项剥离要解决的
+        assert!(detect_virtual_share_root_prefix(&raw).is_none());
+
+        let normalized: Vec<SharedFileInfo> = raw
+            .into_iter()
+            .map(|mut f| {
+                f.path = strip_virtual_share_root(&f.path);
+                f
+            })
+            .collect();
+
+        let share_root = derive_share_root(Some("/13"), &normalized);
+        let groups = group_files_by_parent_dir(&normalized, &share_root);
+
+        assert_eq!(groups.len(), 1, "两种前缀归一后应落进同一个组");
+        assert_eq!(groups[0].0, "13");
+        assert_eq!(groups[0].1.len(), 2);
+        assert!(
+            !groups[0].0.contains("sharelink"),
+            "relative_parent 不得残留虚拟根: {}",
+            groups[0].0
+        );
+    }
+
+    /// 归一后必须保留分享根目录本身（如 `/13`）——超限下钻是拿这个路径去列
+    /// 子目录的，多剥一层就会列不到东西。
+    #[test]
+    fn test_normalized_paths_keep_share_root_dir_for_include() {
+        let p = strip_virtual_share_root("/sharelink0-37559844790/13/玉溪资料");
+        assert!(
+            p.starts_with("/13/"),
+            "分享根目录 13 必须保留，否则 include 匹配不上 collector 的快照: {}",
+            p
+        );
+    }
+
+    // ========== 单次转存文件数上限拆批（零请求那一层） ==========
+
+    fn make_dir(path: &str, fs_id: u64) -> SharedFileInfo {
+        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        SharedFileInfo {
+            fs_id,
+            is_dir: true,
+            path: path.to_string(),
+            size: 0,
+            name,
+        }
+    }
+
+    /// 同一父目录下选中 1200 个条目，按上限 500 应切成 500 + 500 + 200 三批。
+    /// 这一层不需要任何网络请求：条目数本身就超限，不用问百度。
+    #[test]
+    fn test_split_groups_splits_oversized_group() {
+        let files: Vec<SharedFileInfo> = (0..1200)
+            .map(|i| make_file(&format!("/share/影视/{}.mp4", i), i as u64))
+            .collect();
+
+        let batches = split_groups_by_file_limit(vec![("影视".to_string(), files)], 500);
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].1.len(), 500);
+        assert_eq!(batches[1].1.len(), 500);
+        assert_eq!(batches[2].1.len(), 200);
+        // 切批不改变落点，每批仍指向同一个相对父目录
+        assert!(batches.iter().all(|(parent, _)| parent == "影视"));
+        // 一个都不能丢
+        assert_eq!(batches.iter().map(|(_, f)| f.len()).sum::<usize>(), 1200);
+    }
+
+    /// 恰好等于上限不切批。
+    #[test]
+    fn test_split_groups_exactly_at_limit_stays_one_batch() {
+        let files: Vec<SharedFileInfo> = (0..500)
+            .map(|i| make_file(&format!("/share/{}.jpg", i), i as u64))
+            .collect();
+
+        let batches = split_groups_by_file_limit(vec![("".to_string(), files)], 500);
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].1.len(), 500);
+    }
+
+    /// 未超限时原样返回，不产生多余批次。
+    #[test]
+    fn test_split_groups_noop_when_under_limit() {
+        let files: Vec<SharedFileInfo> = (0..10)
+            .map(|i| make_file(&format!("/share/{}.jpg", i), i as u64))
+            .collect();
+
+        let batches = split_groups_by_file_limit(vec![("".to_string(), files)], 500);
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].1.len(), 10);
+    }
+
+    /// 不同父目录本来就分属不同批，切批不应把它们混到一起。
+    #[test]
+    fn test_split_groups_keeps_parent_dirs_separate() {
+        let groups = vec![
+            ("抖音".to_string(), vec![make_file("/share/抖音/1.mp4", 1)]),
+            ("微信".to_string(), vec![make_file("/share/微信/2.mp4", 2)]),
+        ];
+
+        let batches = split_groups_by_file_limit(groups, 500);
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].0, "抖音");
+        assert_eq!(batches[1].0, "微信");
+    }
+
+    /// 选中的是目录时这一层无从判断（1 个 fs_id 底下可能上万文件），
+    /// 保持一批原样提交，交给惰性兜底——这正是不主动预扫的代价与前提。
+    #[test]
+    fn test_split_groups_cannot_judge_directories() {
+        let dirs = vec![
+            make_dir("/share/巨大目录", 1),
+            make_dir("/share/另一个", 2),
+        ];
+
+        let batches = split_groups_by_file_limit(vec![("".to_string(), dirs)], 500);
+
+        assert_eq!(batches.len(), 1, "目录数没超限，这一层不该拆");
+        assert_eq!(batches[0].1.len(), 2);
+    }
+
+    // ========== 超限拆分的分割不变量 ==========
+
+    /// 对半拆必须两边都非空，否则 pending 会无限循环。
+    #[test]
+    fn test_mid_index_never_produces_empty_side() {
+        for len in 2..64usize {
+            let items: Vec<SharedFileInfo> = (0..len)
+                .map(|i| make_file(&format!("/x/{}.mp4", i), i as u64))
+                .collect();
+            let idx = mid_index(&items, len / 2);
+            assert!(idx >= 1, "左边不能为空: len={}, idx={}", len, idx);
+            assert!(idx < len, "右边不能为空: len={}, idx={}", len, idx);
+        }
+    }
+
+    /// 长度为 2 时必须切成 1 + 1。
+    #[test]
+    fn test_mid_index_splits_pair_evenly() {
+        let items = vec![make_file("/x/a", 1), make_file("/x/b", 2)];
+        assert_eq!(mid_index(&items, 1), 1);
+    }
+
+    /// 下钻时子项的目标目录 = 原目标目录 + 该目录名，保持分享里的层级。
+    #[test]
+    fn test_child_dir_preserves_structure() {
+        let cases = [
+            ("/13", "上传", "/13/上传"),
+            ("/13/", "上传", "/13/上传"),
+            // 根目录：trim 掉全部尾部斜杠后不能拼出 `//`
+            ("/", "影视", "/影视"),
+        ];
+        for (dir, name, want) in cases {
+            let got = format!("{}/{}", dir.trim_end_matches('/'), name);
+            assert_eq!(got, want, "dir={} name={}", dir, name);
+        }
+    }
+
+    /// 复现日志里的「34/8」：8 项里有 1 个目录被下钻成 32 个子项，
+    /// 分母应变成 8 - 1 + 32 = 39，而不是继续停在 8。
+    #[test]
+    fn test_adjust_total_units_matches_real_case() {
+        // 该批 8 项，展开后共 39 个单元
+        assert_eq!(adjust_total_units(8, 8, 39), 39);
+        // 转存了 34 个，34 <= 39，不会再出现分子大于分母
+        assert!(34 <= adjust_total_units(8, 8, 39));
+    }
+
+    /// 多批次场景：只修正当前批，其他批的计数不受影响。
+    #[test]
+    fn test_adjust_total_units_only_affects_current_batch() {
+        // 共 20 项分 3 批（4 + 7 + 9），第二批 7 项展开成 30
+        let total = 20;
+        assert_eq!(adjust_total_units(total, 7, 30), 43); // 20 - 7 + 30
+    }
+
+    /// 没展开时分母不变。
+    #[test]
+    fn test_adjust_total_units_noop_when_not_expanded() {
+        assert_eq!(adjust_total_units(12, 4, 4), 12);
+    }
+
+    /// 任何参数组合都不下溢——usize 下溢会得到天文数字，比显示错更难查。
+    #[test]
+    fn test_adjust_total_units_never_underflows() {
+        assert_eq!(adjust_total_units(0, 100, 0), 0);
+        assert_eq!(adjust_total_units(3, 10, 2), 2);
+        assert_eq!(adjust_total_units(usize::MAX, 0, usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn test_is_transient_transfer_error() {
+        // 实测挂掉批次 2/3 的那条响应
+        assert!(is_transient_transfer_error("请求超时，请稍后再试"));
+        assert!(is_transient_transfer_error("转存失败: connection reset by peer"));
+        assert!(is_transient_transfer_error("operation timed out"));
+        assert!(!is_transient_transfer_error("同名文件已存在: a.mp4"));
+        assert!(!is_transient_transfer_error(""));
+    }
+
+    /// 三类失败必须互斥：临时错误重试同一组、文件数超限拆小、空间不足停手。
+    /// 混淆任意两类都会退化成 dfe1a0b 那种空转（347 次 errno=-32）。
+    #[test]
+    fn test_three_failure_kinds_are_disjoint() {
+        let transient = "请求超时，请稍后再试";
+        let limit = "转存文件数 1815 超过上限 500";
+        let quota = "网盘空间不足，无法转存";
+
+        assert!(is_transient_transfer_error(transient));
+        assert!(!is_file_limit_exceeded(transient) && !is_quota_exceeded(transient));
+
+        assert!(is_file_limit_exceeded(limit));
+        assert!(!is_transient_transfer_error(limit) && !is_quota_exceeded(limit));
+
+        assert!(is_quota_exceeded(quota));
+        assert!(!is_transient_transfer_error(quota) && !is_file_limit_exceeded(quota));
+    }
+
+    #[test]
+    fn test_is_quota_exceeded() {
+        assert!(is_quota_exceeded("网盘空间不足，无法转存（剩余空间不足，无法转存）"));
+        assert!(is_quota_exceeded("转存失败: errno=-32"));
+        assert!(is_quota_exceeded("空间不足"));
+        // 文件数超限不能被误判成空间不足——那是要继续拆的
+        assert!(!is_quota_exceeded("转存文件数 800 超过上限 500"));
+        assert!(!is_quota_exceeded("同名文件已存在: a.mp4"));
+        assert!(!is_quota_exceeded(""));
+    }
+
+    /// 空间不足与文件数超限必须互斥判定：前者停手，后者继续拆。
+    /// dfe1a0b 就是把前者误判成后者，一路拆到每批 1 个文件刷了 347 次。
+    #[test]
+    fn test_quota_and_file_limit_are_disjoint() {
+        let quota = "网盘空间不足，无法转存";
+        let limit = "转存文件数 1815 超过上限 500";
+        assert!(is_quota_exceeded(quota) && !is_file_limit_exceeded(quota));
+        assert!(is_file_limit_exceeded(limit) && !is_quota_exceeded(limit));
+    }
+
+    /// 批次整体成功但内部有子批次失败时，警告必须冒泡到任务上，
+    /// 否则界面显示「已转存」而进度条只走了一半（实测 12 项只成功 6 项）。
+    #[test]
+    fn test_merge_surfaces_partial_failure_inside_successful_batch() {
+        let partial = TransferResult {
+            success: true,
+            transferred_paths: vec!["/13/a".into(), "/13/b".into()],
+            from_paths: vec!["/a".into(), "/b".into()],
+            transferred_fs_ids: vec![1, 2],
+            error: Some("网盘空间不足，无法转存".into()),
+        };
+        let results = vec![(1usize, "13".to_string(), vec![make_file("/13/a", 1)], Ok(partial))];
+
+        let (merged, _) = merge_batch_results(results, "/tmp");
+
+        assert!(merged.success, "有成功条目，整体仍算成功");
+        let err = merged.error.expect("部分失败必须留下告警，不能被吞掉");
+        assert!(err.contains("部分文件未转存"), "实际: {}", err);
+        assert!(err.contains("网盘空间不足"), "实际: {}", err);
+    }
+
+    /// 全部成功且无内部告警时不应凭空产生错误信息。
+    #[test]
+    fn test_merge_clean_success_has_no_warning() {
+        let ok = TransferResult {
+            success: true,
+            transferred_paths: vec!["/13/a".into()],
+            from_paths: vec!["/a".into()],
+            transferred_fs_ids: vec![1],
+            error: None,
+        };
+        let results = vec![(1usize, "13".to_string(), vec![make_file("/13/a", 1)], Ok(ok))];
+
+        let (merged, _) = merge_batch_results(results, "/tmp");
+
+        assert!(merged.success);
+        assert!(merged.error.is_none(), "干净成功不该带告警: {:?}", merged.error);
+    }
+
+    #[test]
+    fn test_is_file_limit_exceeded() {
+        assert!(is_file_limit_exceeded("转存文件数 800 超过上限 500"));
+        assert!(!is_file_limit_exceeded("同名文件已存在: a.mp4"));
+        assert!(!is_file_limit_exceeded("转存失败: {\"errno\":2}"));
+        assert!(!is_file_limit_exceeded(""));
+    }
+
+    /// 企业版转存错误必须落进本模块这三个分类器，否则自适应分批对企业版失效。
+    ///
+    /// 这三个判定全是**字符串关键字匹配**，`netdisk::share::apaas` 那边一旦
+    /// 改了文案就会静默失联：超限不再下钻拆批而是整批失败、抖动不再退避重试、
+    /// 空间不足不再早停（dfe1a0b 那次 347 连败就是这么来的）。
+    /// 这里把跨模块契约钉死。
+    #[test]
+    fn apaas_transfer_errors_match_batch_classifiers() {
+        use crate::netdisk::share::apaas::describe_transfer_errno;
+
+        // 空间不足 → 早停，且不能被误判成「文件数超限」而去无限拆分
+        for errno in [-10, -32, 31112] {
+            let msg = describe_transfer_errno(errno, "空间不足，转存失败");
+            assert!(is_quota_exceeded(&msg), "errno={} 应判为空间不足: {}", errno, msg);
+            assert!(
+                !is_file_limit_exceeded(&msg),
+                "errno={} 不该判为文件数超限: {}",
+                errno,
+                msg
+            );
+        }
+
+        // 文件数超限 → 触发下钻拆批，且不能被误判成空间不足而早停
+        for errno in [-33, 120, 130, 31075, 31174, 31175] {
+            let msg = describe_transfer_errno(errno, "");
+            assert!(
+                is_file_limit_exceeded(&msg),
+                "errno={} 应判为文件数超限: {}",
+                errno,
+                msg
+            );
+            assert!(
+                !is_quota_exceeded(&msg),
+                "errno={} 不该判为空间不足: {}",
+                errno,
+                msg
+            );
+        }
+
+        // 临时错误 → 退避重试
+        for errno in [4, -31, 31069, 111, 31171] {
+            let msg = describe_transfer_errno(errno, "");
+            assert!(
+                is_transient_transfer_error(&msg),
+                "errno={} 应判为临时错误: {}",
+                errno,
+                msg
+            );
+            assert!(!is_file_limit_exceeded(&msg) && !is_quota_exceeded(&msg));
+        }
+
+        // 同名冲突：三类都不是，直接失败该批
+        let dup = describe_transfer_errno(-30, "");
+        assert!(!is_transient_transfer_error(&dup));
+        assert!(!is_file_limit_exceeded(&dup));
+        assert!(!is_quota_exceeded(&dup));
+    }
+
+    /// 默认上限 500，env 可覆盖为正整数；非法值回落默认。
+    #[test]
+    fn test_transfer_file_limit_default() {
+        // 未设置 env 时应为默认值（测试进程内不设置该变量）
+        if std::env::var("BAIDUPCS_TRANSFER_FILE_LIMIT").is_err() {
+            assert_eq!(transfer_file_limit(), 500);
+        }
     }
 
     #[test]

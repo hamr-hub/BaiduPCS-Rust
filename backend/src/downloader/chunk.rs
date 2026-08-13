@@ -215,10 +215,13 @@ impl Chunk {
         let mut total_bytes_downloaded = 0u64;
         let mut pending_progress = 0u64; // 累积的待更新字节数
         const PROGRESS_UPDATE_THRESHOLD: u64 = 256 * 1024; // 每256KB更新一次进度（减少锁竞争）
-                                                           // 🔥 读取超时：防止CDN连接挂起导致分片线程永久卡死
-                                                           // 当服务端返回headers后数据流停止时，reqwest的全局timeout不会生效，
-                                                           // 需要对每次stream.next()单独设置超时
-                                                           // 使用动态值（由 engine 根据链接速度计算），慢链接获得更长超时
+        const PROGRESS_UPDATE_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(500);
+        let mut last_progress_update = std::time::Instant::now();
+        // 🔥 读取超时：防止CDN连接挂起导致分片线程永久卡死
+        // 当服务端返回headers后数据流停止时，reqwest的全局timeout不会生效，
+        // 需要对每次stream.next()单独设置超时
+        // 使用动态值（由 engine 根据链接速度计算），慢链接获得更长超时
 
         let read_timeout_dur = std::time::Duration::from_secs(read_timeout_secs);
 
@@ -302,11 +305,14 @@ impl Chunk {
             total_bytes_downloaded += chunk_len;
             pending_progress += chunk_len;
 
-            // 🔥 批量更新进度：累积到阈值或下载完成时才回调（大幅减少锁竞争）
-            if pending_progress >= PROGRESS_UPDATE_THRESHOLD || total_bytes_downloaded >= remaining
+// 批量更新进度：高速下载按字节阈值刷新，低速下载至少每 500ms 刷新一次。
+            if pending_progress >= PROGRESS_UPDATE_THRESHOLD
+                || last_progress_update.elapsed() >= PROGRESS_UPDATE_INTERVAL
+                || total_bytes_downloaded >= remaining
             {
                 progress_callback(pending_progress);
                 pending_progress = 0;
+                last_progress_update = std::time::Instant::now();
             }
         }
 
@@ -645,22 +651,29 @@ mod tests {
 
     #[test]
     fn test_chunk_calculation() {
-        // 测试完整分片
-        let manager = ChunkManager::new(100, 10, Uid::default());
-        assert_eq!(manager.chunk_count(), 10);
-        assert_eq!(manager.chunks[0].range, 0..10);
-        assert_eq!(manager.chunks[9].range, 90..100);
+        // 🔥 尺寸必须大于 SMALL_FILE_SINGLE_CHUNK_THRESHOLD（10MB）：
+        //    小于等于该阈值的文件会被有意压成单分片（见 ChunkManager::new），
+        //    用字节级的小尺寸构造用例会永远得到 chunk_count() == 1。
+        const UNIT: u64 = SMALL_FILE_SINGLE_CHUNK_THRESHOLD; // 每片 10MB
 
-        // 测试不完整分片
-        let manager = ChunkManager::new(105, 10, Uid::default());
+        // 测试完整分片：100MB / 10MB = 10 片
+        let manager = ChunkManager::new(UNIT * 10, UNIT, Uid::default());
+        assert_eq!(manager.chunk_count(), 10);
+        assert_eq!(manager.chunks[0].range, 0..UNIT);
+        assert_eq!(manager.chunks[9].range, UNIT * 9..UNIT * 10);
+
+        // 测试不完整分片：最后一片不足 UNIT
+        let manager = ChunkManager::new(UNIT * 10 + 5, UNIT, Uid::default());
         assert_eq!(manager.chunk_count(), 11);
-        assert_eq!(manager.chunks[10].range, 100..105);
+        assert_eq!(manager.chunks[10].range, UNIT * 10..UNIT * 10 + 5);
         assert_eq!(manager.chunks[10].size(), 5);
     }
 
     #[test]
     fn test_progress_calculation() {
-        let mut manager = ChunkManager::new(1000, 100, Uid::default());
+        // 同上：需超过小文件单分片阈值，否则只会得到 1 个分片
+        const UNIT: u64 = SMALL_FILE_SINGLE_CHUNK_THRESHOLD; // 每片 10MB
+        let mut manager = ChunkManager::new(UNIT * 10, UNIT, Uid::default());
         assert_eq!(manager.progress(), 0.0);
 
         // 完成前5个分片
@@ -668,7 +681,7 @@ mod tests {
             manager.mark_completed(i);
         }
         assert_eq!(manager.completed_count(), 5);
-        assert_eq!(manager.downloaded_bytes(), 500);
+        assert_eq!(manager.downloaded_bytes(), UNIT * 5);
         assert_eq!(manager.progress(), 50.0);
 
         // 完成所有分片
@@ -681,7 +694,9 @@ mod tests {
 
     #[test]
     fn test_next_pending() {
-        let mut manager = ChunkManager::new(300, 100, Uid::default());
+        // 同上：需超过小文件单分片阈值，否则只会得到 1 个分片
+        const UNIT: u64 = SMALL_FILE_SINGLE_CHUNK_THRESHOLD; // 每片 10MB
+        let mut manager = ChunkManager::new(UNIT * 3, UNIT, Uid::default());
 
         let chunk1 = manager.next_pending();
         assert!(chunk1.is_some());

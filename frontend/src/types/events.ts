@@ -108,8 +108,20 @@ export interface DownloadEventDecryptCompleted {
   owner_uid?: number
 }
 
+/** 因冲突策略跳过某文件（不会创建子任务，故无真实 task_id） */
+export interface DownloadEventSkipped {
+  event_type: 'skipped'
+  task_id: string
+  filename: string
+  reason: string
+  owner_uid?: number
+  /** 所属文件夹下载 ID；单文件下载为空 */
+  group_id?: string
+}
+
 export type DownloadEvent =
     | DownloadEventCreated
+    | DownloadEventSkipped
     | DownloadEventProgress
     | DownloadEventStatusChanged
     | DownloadEventCompleted
@@ -137,6 +149,10 @@ export interface FolderEventProgress {
   downloaded_size: number
   total_size: number
   completed_files: number
+  /** 因冲突策略跳过的文件数 */
+  skipped_files?: number
+  /** 因冲突策略跳过的字节数 */
+  skipped_size?: number
   total_files: number
   speed: number
   status: string

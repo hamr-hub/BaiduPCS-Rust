@@ -43,6 +43,13 @@ pub enum DownloadEvent {
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_uid: Option<u64>,
+        /// 🔥 所属文件夹下载 ID（单文件下载为 `None`）
+        ///
+        /// 文件夹下载按冲突策略跳过某个文件时不会创建子任务，前端此前收不到任何信号，
+        /// 表现为"详情里长时间看不到任务在进行"，无法判断队列是卡住还是在正常跳过
+        /// （issue #141 用户反馈）。带上 group_id 才能把跳过归到对应文件夹展示。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_id: Option<String>,
     },
     /// 进度更新
     Progress {
@@ -266,6 +273,12 @@ pub enum FolderEvent {
         downloaded_size: u64,
         total_size: u64,
         completed_files: u64,
+        /// 🔥 因冲突策略跳过的文件数（本地已存在，未创建子任务）
+        #[serde(default)]
+        skipped_files: u64,
+        /// 🔥 因冲突策略跳过的字节数（用于整体处理进度，跳过的文件不产生下载字节）
+        #[serde(default)]
+        skipped_size: u64,
         total_files: u64,
         speed: u64,
         status: String,

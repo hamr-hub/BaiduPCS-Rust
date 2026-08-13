@@ -4,6 +4,7 @@ pub mod client;
 pub mod client_pool;
 pub mod cloud_dl;
 pub mod cloud_dl_monitor;
+pub mod share;
 pub mod types;
 
 pub use client::NetdiskClient;

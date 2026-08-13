@@ -549,15 +549,16 @@ pub async fn preview_tree(
         .get_client(owner_uid)
         .ok_or_else(|| unavailable_msg(owner_uid.raw(), "client 未入池".to_string()))?;
 
-    // 解析链接
-    let share_link = client
+    // 解析链接（个人版 / 企业版自动判定）
+    let mut share_link = client
         .parse_share_link(&req.share_url)
         .map_err(|e| err_bad(&format!("解析分享链接失败: {}", e)))?;
     let effective_pwd = req.password.or(share_link.password.clone());
+    share_link.password = effective_pwd.clone();
 
     // 访问分享页取 bdstoken
     let page = client
-        .access_share_page(&share_link.short_key, &effective_pwd, true)
+        .access_share_page_for(&share_link, true)
         .await
         .map_err(|e| err_bad(&format!("访问分享页失败: {}", e)))?;
     if page.shareid.is_empty() {
@@ -568,11 +569,7 @@ pub async fn preview_tree(
     let mut randsk = None;
     if let Some(ref pwd) = effective_pwd {
         if !pwd.is_empty() {
-            let referer = format!("https://pan.baidu.com/s/{}", share_link.short_key);
-            match client
-                .verify_share_password(&page.shareid, &page.share_uk, &page.bdstoken, pwd, &referer)
-                .await
-            {
+            match client.verify_share_password_for(&page, pwd).await {
                 Ok(sekey) => randsk = Some(sekey),
                 Err(e) => return Err(err_bad(&format!("验证提取码失败: {}", e))),
             }
@@ -581,13 +578,7 @@ pub async fn preview_tree(
 
     // 列根
     let root = client
-        .list_share_files_with_randsk(
-            &share_link.short_key,
-            &page.bdstoken,
-            1,
-            100,
-            randsk.as_deref(),
-        )
+        .list_share_files_for(&page, 1, 100, randsk.as_deref())
         .await
         .map_err(|e| err_bad(&format!("列根失败: {}", e)))?;
     let root_shareid = if !root.shareid.is_empty() {
@@ -601,28 +592,32 @@ pub async fn preview_tree(
         page.uk.clone()
     };
 
+    // 递归展开时用根目录响应里的 shareid/uk（比分享页解析出的更权威）
+    let tree_share_info = crate::transfer::SharePageInfo {
+        shareid: root_shareid.clone(),
+        uk: root_uk,
+        ..page.clone()
+    };
+
     // 展开为 TreeNode（异步递归 → 用 Box::Future 显式签名）
     let share_root = infer_share_root(&root.files);
     let mut out: Vec<TreeNode> = Vec::with_capacity(root.files.len());
     for f in root.files {
         let node = build_tree_node(
             &client,
-            &share_link.short_key,
-            &root_shareid,
-            &root_uk,
-            &page.bdstoken,
+            &tree_share_info,
             randsk.as_deref(),
             &share_root,
             f,
             depth - 1,
         )
-        .await;
+            .await;
         out.push(node);
     }
 
     Ok(Json(ApiResponse::success(PreviewTreeResponse {
         root: out,
-        short_key: share_link.short_key,
+        short_key: page.short_key,
         shareid: root_shareid,
     })))
 }
@@ -630,10 +625,7 @@ pub async fn preview_tree(
 /// 递归构造 TreeNode。返回 `Pin<Box<dyn Future>>` 以支持 async 递归。
 fn build_tree_node<'a>(
     client: &'a crate::netdisk::client::NetdiskClient,
-    short_key: &'a str,
-    shareid: &'a str,
-    uk: &'a str,
-    bdstoken: &'a str,
+    share_info: &'a crate::transfer::SharePageInfo,
     randsk: Option<&'a str>,
     share_root: &'a str,
     info: crate::transfer::SharedFileInfo,
@@ -650,9 +642,7 @@ fn build_tree_node<'a>(
         };
         if info.is_dir && remaining_depth > 0 {
             match client
-                .list_share_files_in_dir_with_randsk(
-                    short_key, shareid, uk, bdstoken, &info.path, 1, 100, randsk,
-                )
+                .list_share_files_in_dir_for(share_info, &info.path, 1, 100, randsk)
                 .await
             {
                 Ok(files) => {
@@ -661,16 +651,13 @@ fn build_tree_node<'a>(
                         kids.push(
                             build_tree_node(
                                 client,
-                                short_key,
-                                shareid,
-                                uk,
-                                bdstoken,
+                                share_info,
                                 randsk,
                                 share_root,
                                 f,
                                 remaining_depth - 1,
                             )
-                            .await,
+                                .await,
                         );
                     }
                     node.children = Some(kids);

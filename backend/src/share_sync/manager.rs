@@ -1222,6 +1222,20 @@ impl ShareSyncManager {
             }
         };
 
+        // 0) 清掉上一轮遗留的、没人再驱动的内部子任务。
+        //
+        // 到这里 `running` 已被本次 run 独占（`resume_run_in_place` 走同一把守卫），
+        // 所以此刻还挂在本订阅名下的转存/下载任务必然是**孤儿**：上一轮 run 已经
+        // 结束（超时、失败、或进程被杀后没走到启动续跑），没有任何 run 在等它们。
+        //
+        // 留着它们的代价就是 issue #148：本轮 diff 仍会包含同一批文件（上一轮没成功
+        // ⇒ 快照基线没推进），重新提交后新旧两支一起挂在「进行中子任务」里，同一个
+        // 文件显示两条（旧的 paused / 新的 pending）。
+        //
+        // 与启动续跑路径的处理保持一致（见 `resume_interrupted_runs` 里的同名清理）：
+        // 只删任务记录，已下载的本地文件保留，本轮会按 diff 重新补齐。
+        self.sweep_residual_subtasks(id, owner_uid).await;
+
         // 1) 抓取
         //
         // 百度分享页/列表接口在高频同步时会偶发返回 HTML 风控页或半截响应，
@@ -1531,6 +1545,49 @@ impl ShareSyncManager {
         Ok(outcome)
     }
 
+    /// 清掉某订阅名下没人驱动的内部转存/下载任务（孤儿残留）。
+    ///
+    /// **调用方必须已持有该订阅的 `running` 守卫**——否则会把正在跑的 run 的子任务
+    /// 一起删掉。目前只有 `execute_one_with_run_id` 在建任何新任务之前调用。
+    ///
+    /// 只删任务记录，不删已下载的本地文件：本轮 diff 会把缺的重新补上，而
+    /// `local_file_matches` 对已经落地的文件仍会直接标 Completed，不会白下一遍。
+    async fn sweep_residual_subtasks(&self, id: &str, owner_uid: u64) {
+        let Some(transfer) = self.resolver.transfer_manager(owner_uid).await else {
+            return;
+        };
+
+        // 先探测有没有「还没到终态」的残留，有才动手。
+        //
+        // 健康订阅每个轮询周期都会走到这里，而 `delete_tasks_for_backup_config` 是
+        // 全量操作：会对历史库发 DELETE、还会对**已完成**的文件夹调 `cancel_folder`
+        // （刷一行 warn）。没残留时白跑一遍纯属噪音，探测只读内存、代价可以忽略。
+        //
+        // 转存段一起看：卡在 `checkingshare` / `transferring` 的孤儿转存同样该收。
+        // （前提是 `is_terminal_subtask_status` 认得 `transferred` —— 那是纯网盘腿的
+        // 正常终点，漏判的话每轮都会被误认成有残留。）
+        let residual: Vec<String> = collect_share_sync_subtasks(&transfer, id, owner_uid)
+            .await
+            .into_iter()
+            .filter(|s| !is_terminal_subtask_status(&s.status))
+            .map(|s| format!("{}:{}({})", s.kind, s.name, s.status))
+            .collect();
+        if residual.is_empty() {
+            return;
+        }
+
+        let cfg_id = share_sync_backup_config_id(id);
+        let (mem, hist) = transfer.delete_tasks_for_backup_config(&cfg_id).await;
+        warn!(
+            "share-sync: 订阅 {} 本轮开始前清理上一轮残留子任务 {} 个（转存内存={}, 历史={}）: {}",
+            id,
+            residual.len(),
+            mem,
+            hist,
+            residual.join(", ")
+        );
+    }
+
     fn fail_run(&self, run_id: &str, sub_id: &str, owner_uid: u64, err: &str) {
         use crate::share_sync::types::{DiffSummary, RunStatus};
         let now = chrono::Utc::now().timestamp();
@@ -1775,15 +1832,26 @@ fn no_progress_but_queued<'a>(
     use crate::downloader::TaskStatus;
 
     let mut any_running = false;
-    let mut any_pending = false;
+    let mut any_waiting = false;
     for status in statuses {
         match status {
             TaskStatus::Downloading | TaskStatus::Decrypting => any_running = true,
-            TaskStatus::Pending => any_pending = true,
+            // 🔥 `Paused` 与 `Pending` 同样算「在等」。
+            //
+            // 分享同步的下载走 `create_backup_task` → `TaskPriority::Backup`，是**可被
+            // 抢占**的最低优先级：普通下载任务一来就把它踢成 `Paused`（见
+            // `task_slot_pool.rs` 的 `is_preemptable`）。此前只认 `Pending`，被抢占的
+            // 任务既不算在跑也不算在排队 → `is_waiting_for_download_slot` 返回 false
+            // → idle 计时不清零 → 30 分钟后 run 被判「等待任务完成超时」而失败，
+            // 而它派生的下载子任务还留在系统里，成为下一轮的重复项来源（issue #148）。
+            //
+            // 与下面 `folder_has_queued_work` 的口径也就此统一（那边一直把 `Paused`
+            // 算作待办，理由同样是「恢复出来的子任务以 Paused 起步」）。
+            TaskStatus::Pending | TaskStatus::Paused => any_waiting = true,
             _ => {}
         }
     }
-    any_pending && !any_running
+    any_waiting && !any_running
 }
 
 /// run_item 是否已到终态（不会再变）。
@@ -1796,7 +1864,7 @@ fn is_terminal_run_item_status(status: &str) -> bool {
 
 /// 文件夹是否「还有活没做完，但一个都没在跑」。
 ///
-/// 与 [`no_progress_but_queued`] 的差别：**这里把 `Paused` 也算作待办**。
+/// 与 [`no_progress_but_queued`] 同口径：`Pending` / `Paused` 都算待办。
 ///
 /// 原因：重启恢复出来的文件夹子任务是以 `Paused` 创建的
 /// （日志「恢复模式补任务完成: 文件夹 X 创建了 N 个暂停任务」），
@@ -1970,14 +2038,27 @@ pub async fn collect_share_sync_subtasks(
 ///
 /// 口径覆盖三个来源的状态枚举(lowercased `{:?}`):
 /// - 文件/文件夹下载(`TaskStatus`/`FolderStatus`): `completed` / `failed` / `cancelled`
-/// - 内部转存(`TransferStatus`): `completed` / `transferfailed` / `downloadfailed`
+/// - 内部转存(`TransferStatus`): `completed` / `transferred` / `transferfailed` / `downloadfailed`
 ///
-/// 与前端 `SUBTASK_TERMINAL`(completed/failed/cancelled/success) 对齐,额外纳入
-/// 转存段特有的失败态,确保「进行中子任务」轮询接口不会回包任何已结束的子任务。
+/// `transferred` 也是终态:它是**纯网盘腿的正常终点**（`submit_transfer_batch` 传
+/// `auto_download: false`，枚举上就注释成「转存成功（无自动下载）」），自动下载那条
+/// 路径不经过它而是直接进 `Downloading`。此前漏了它，后果是纯网盘目标的订阅每次
+/// 同步完成后，都会在「进行中子任务」里永久留下一条转存记录不消失（REST 过滤不掉，
+/// WS 也因为不判终态而每秒重推）。`wait_transfer_task` 早就把它当终点处理
+/// （`Transferred if !require_download_completion => Ok(())`），这里补齐口径。
+///
+/// 与前端 `SUBTASK_TERMINAL` 保持一致（两边一起改，否则 REST 不回包、WS 推来的那条
+/// 仍会挂在列表里）。
 fn is_terminal_subtask_status(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "success" | "failed" | "cancelled" | "transferfailed" | "downloadfailed"
+        "completed"
+            | "success"
+            | "failed"
+            | "cancelled"
+            | "transferred"
+            | "transferfailed"
+            | "downloadfailed"
     )
 }
 
@@ -2401,7 +2482,7 @@ impl ProductionHooks {
     /// 三个条件同时成立才算：
     /// 1. 槽位池当前没有空位；
     /// 2. 本订阅**没有任何**下载子任务真的在跑（Downloading / Decrypting）；
-    /// 3. 本订阅有下载子任务在等待队列里（`Pending`）。
+    /// 3. 本订阅有下载子任务在等（`Pending` 排队，或被高优先级任务抢占成 `Paused`）。
     ///
     /// 条件 2、3 的判定抽在 [`no_progress_but_queued`] 里（纯函数，便于单测）。
     ///
@@ -2884,6 +2965,16 @@ impl ExecutorHooks for ProductionHooks {
                 };
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn discard_task(&self, task_id: &str) {
+        let (downloads, folders) = self.transfer_manager().discard_task(task_id).await;
+        if downloads > 0 || folders > 0 {
+            info!(
+                "share-sync: 已丢弃转存任务 {}（连带下载子任务={}, 文件夹子任务={}）",
+                task_id, downloads, folders
+            );
         }
     }
 
@@ -3389,6 +3480,7 @@ mod tests {
             "success",
             "failed",
             "cancelled",
+            "transferred",
             "transferfailed",
             "downloadfailed",
         ] {
@@ -3486,6 +3578,30 @@ mod tests {
         assert!(
             !no_progress_but_queued(std::iter::empty()),
             "还没建出任务 → 不该误报"
+        );
+    }
+
+    /// issue #148：被普通任务抢占成 `Paused` 的下载子任务也算「在等槽位」。
+    ///
+    /// 分享同步的下载是 `TaskPriority::Backup`，普通下载一来就把它踢成 `Paused`。
+    /// 此前只认 `Pending`，这批任务既不算在跑也不算在排队 → idle 一路涨到 30 分钟
+    /// → run 被判「等待任务完成超时」失败，而它派生的下载子任务还留着，下一轮
+    /// 触发就叠出重复项。
+    #[test]
+    fn test_preempted_paused_counts_as_waiting_for_slot() {
+        use crate::downloader::TaskStatus;
+
+        assert!(
+            no_progress_but_queued([TaskStatus::Paused, TaskStatus::Paused].iter()),
+            "全被抢占暂停 → 仍是在等槽位，不该计入 idle 超时"
+        );
+        assert!(
+            no_progress_but_queued([TaskStatus::Paused, TaskStatus::Pending].iter()),
+            "一部分被抢占、一部分排队 → 同样是在等槽位"
+        );
+        assert!(
+            !no_progress_but_queued([TaskStatus::Paused, TaskStatus::Downloading].iter()),
+            "还有在跑的 → 走原来的停滞检测，不能把 idle 清零"
         );
     }
 
@@ -3770,11 +3886,16 @@ mod tests {
     #[test]
     fn test_is_terminal_subtask_status() {
         // 终态：完成/成功/各类失败/取消 → 不应出现在「进行中子任务」
+        //
+        // `transferred` 是纯网盘腿的正常终点（auto_download=false，见枚举注释
+        // 「转存成功（无自动下载）」）。此前误判成非终态，导致纯网盘订阅每次同步完
+        // 都在「进行中子任务」里永久留下一条转存记录。
         for s in [
             "completed",
             "success",
             "failed",
             "cancelled",
+            "transferred",
             "transferfailed",
             "downloadfailed",
         ] {
@@ -3786,7 +3907,6 @@ mod tests {
             "scanning",
             "downloading",
             "transferring",
-            "transferred",
             "waiting_transfer",
             "paused",
         ] {

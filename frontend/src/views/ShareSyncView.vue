@@ -1437,16 +1437,55 @@ function subtaskStat(st: ShareSyncSubtask): string {
   return `${st.downloaded}/${st.total} 文件`
 }
 
-const SUBTASK_TERMINAL = new Set(['completed', 'failed', 'cancelled', 'success'])
+/**
+ * 子任务终态：WS `item_progress` 收到这些状态时把该条从列表移除。
+ *
+ * 必须与后端 `is_terminal_subtask_status` 一致 —— REST `subtasks()` 用后端那份口径
+ * 过滤，两边不一致时会出现「刷新后没了、不刷新一直挂着」的割裂。
+ *
+ * 转存段(`TransferStatus`)特有的三个终态容易漏：
+ * - `transferred`：纯网盘目标的**正常终点**（无自动下载）。漏了它，纯网盘订阅每次
+ *   同步完成后都会永久留着一条「已转存」的转存子任务。
+ * - `transferfailed` / `downloadfailed`：失败终态，失败原因在运行历史里逐文件可查。
+ */
+const SUBTASK_TERMINAL = new Set([
+  'completed',
+  'failed',
+  'cancelled',
+  'success',
+  'transferred',
+  'transferfailed',
+  'downloadfailed',
+])
 
+/**
+ * 子任务状态的中文文案。
+ *
+ * 状态字符串是后端三个枚举 lowercased `{:?}` 的并集（见 `collect_share_sync_subtasks`）：
+ * - 下载段 `TaskStatus`：pending / downloading / decrypting / paused / completed / failed
+ * - 转存段 `TransferStatus`：queued / checkingshare / transferring / transferred /
+ *   transferfailed / downloading / downloadfailed / cleaning / completed
+ * - 文件夹段 `FolderStatus`：scanning / downloading / paused / completed / failed /
+ *   cancelled（外加抢不到槽位时被改写成的 pending）
+ *
+ * 漏一个的后果不是不显示，而是 `|| status` 兜底把**英文原文**直接甩给用户
+ * （之前 checkingshare / cleaning / scanning / decrypting 就是这样露出来的）。
+ *
+ * 终态（transferred / transferfailed / downloadfailed）刻意不列：它们会被
+ * `SUBTASK_TERMINAL` 从列表里剔除，永远走不到这里。
+ */
 function subtaskStatusText(status: string): string {
   const map: Record<string, string> = {
     pending: '等待中',
     queued: '排队中',
     preparing: '准备中',
     waiting_transfer: '等待传输',
+    scanning: '扫描中',
+    checkingshare: '检查分享',
     transferring: '转存中',
     downloading: '下载中',
+    decrypting: '解密中',
+    cleaning: '清理中',
     paused: '已暂停',
     completed: '已完成',
     success: '已完成',
@@ -1463,8 +1502,13 @@ function subtaskStatusColor(status: string): 'success' | 'warning' | 'danger' | 
     case 'failed': return 'danger'
     case 'cancelled':
     case 'paused': return 'warning'
+      // 真的在干活的都走 primary；等待类（pending/queued）留给 default 的 info
+    case 'scanning':
+    case 'checkingshare':
     case 'transferring':
     case 'downloading':
+    case 'decrypting':
+    case 'cleaning':
     case 'preparing':
     case 'waiting_transfer': return 'primary'
     default: return 'info'

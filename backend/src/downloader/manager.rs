@@ -6498,6 +6498,39 @@ impl DownloadManager {
         (memory_count, history_count)
     }
 
+    /// 删除某个转存任务派生出的全部下载子任务（仅内存，下载文件保留）。
+    ///
+    /// 分享同步在一轮 run 内可能对同一批文件反复提交转存（瞬时错误重试、配额二分、
+    /// 「目标已存在同名」回退分享直下）。被放弃的那次提交如果已经走到下载阶段，
+    /// 它派生的下载子任务不会随之消失 —— 于是同一个文件在「进行中子任务」里出现
+    /// 两条（旧的停在 paused，新的是 pending），即 issue #148。
+    ///
+    /// 这里按 `transfer_task_id` 精确清掉被放弃那一支，不影响其它并行提交。
+    /// 返回清理的任务数。
+    pub async fn delete_tasks_for_transfer(&self, transfer_task_id: &str) -> usize {
+        let target_ids: Vec<String> = {
+            let tasks = self.tasks.read().await;
+            let mut ids = Vec::new();
+            for (id, task) in tasks.iter() {
+                let t = task.lock().await;
+                if t.transfer_task_id.as_deref() == Some(transfer_task_id) {
+                    ids.push(id.clone());
+                }
+            }
+            ids
+        };
+
+        let count = target_ids.len();
+        if !target_ids.is_empty() {
+            let (success, failed) = self.batch_delete_tasks(&target_ids, false).await;
+            info!(
+                "delete_tasks_for_transfer: transfer={} batch_delete 完成: 成功={}, 失败={}",
+                transfer_task_id, success, failed
+            );
+        }
+        count
+    }
+
     /// 获取下载目录
     pub async fn download_dir(&self) -> PathBuf {
         self.download_dir.read().await.clone()

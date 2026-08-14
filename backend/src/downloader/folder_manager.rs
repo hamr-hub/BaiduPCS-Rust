@@ -3563,6 +3563,40 @@ impl FolderDownloadManager {
         Ok(())
     }
 
+    /// 🔥 取消并清理某个转存任务派生出的全部文件夹下载（tree 模式整目录转存+自动下载）。
+    ///
+    /// 与 [`DownloadManager::delete_tasks_for_transfer`] 成对使用：分享同步放弃一次
+    /// 转存提交时，要把它派生的下载段一起收走，否则会与重新提交那一支叠成重复项
+    /// （issue #148）。不删本地已下载文件。返回清理的文件夹数。
+    pub async fn delete_folders_for_transfer(&self, transfer_task_id: &str) -> usize {
+        let target_ids: Vec<String> = {
+            let folders = self.folders.read().await;
+            folders
+                .values()
+                .filter(|f| f.transfer_task_id.as_deref() == Some(transfer_task_id))
+                .map(|f| f.id.clone())
+                .collect()
+        };
+
+        let count = target_ids.len();
+        for id in &target_ids {
+            if let Err(e) = self.cancel_folder(id, false).await {
+                warn!(
+                    "delete_folders_for_transfer: 取消文件夹 {} 失败: {}",
+                    id, e
+                );
+            }
+            let _ = self.delete_folder_from_history(id).await;
+        }
+        if count > 0 {
+            info!(
+                "delete_folders_for_transfer: transfer={} 清理 {} 个文件夹下载",
+                transfer_task_id, count
+            );
+        }
+        count
+    }
+
     /// 🔥 删除归属指定 `backup_config_id`（如 `share-sync:{订阅id}`）的全部文件夹下载
     ///
     /// 用于删除分享同步订阅时，连带清掉 tree 模式整目录下载产生的内部隐藏文件夹任务，

@@ -158,17 +158,23 @@ const fileListRef = ref<HTMLElement | null>(null)
 const selectedFiles = ref<FileEntry[]>([])
 const batchDeleting = ref(false)
 
+// 本地路径的分隔符随系统而定：Windows 是 \，类 Unix 是 /，两种都要能拆
+const PATH_SEPARATOR_RE = /[\\/]/
+
 const pathParts = computed(() => {
   if (!currentPath.value || currentPath.value === rootPath.value) return []
   const relative = currentPath.value.startsWith(rootPath.value)
       ? currentPath.value.slice(rootPath.value.length)
       : currentPath.value
-  return relative.split('/').filter(p => p)
+  return relative.split(PATH_SEPARATOR_RE).filter(p => p)
 })
 
 function getPathUpTo(index: number): string {
   const parts = pathParts.value.slice(0, index + 1)
-  return rootPath.value + '/' + parts.join('/')
+  // 沿用根目录自身的分隔符，避免在 Windows 下拼出 D:\root/a/b 这种混合路径
+  const separator = rootPath.value.includes('\\') ? '\\' : '/'
+  const root = rootPath.value.replace(/[\\/]+$/, '')
+  return root + separator + parts.join(separator)
 }
 
 async function loadFiles(path: string, append: boolean = false) {
@@ -319,6 +325,15 @@ export { Folder, Document, Refresh, HomeFilled, Loading, Delete } from '@element
   border-bottom: 1px solid #e0e0e0;
   background: white;
   gap: 12px;
+
+  // 非当前层级的路径可点击跳转，给出手型指针与悬停高亮
+  :deep(.el-breadcrumb__item:not(:last-child) .el-breadcrumb__inner) {
+    cursor: pointer;
+
+    &:hover {
+      color: var(--el-color-primary);
+    }
+  }
 
   .toolbar-buttons {
     display: flex;

@@ -1767,6 +1767,15 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
     text-overflow: ellipsis;
   }
 
+  // 非当前层级的路径可点击跳转，给出手型指针与悬停高亮
+  :deep(.el-breadcrumb__item:not(:last-child) .el-breadcrumb__inner) {
+    cursor: pointer;
+
+    &:hover {
+      color: var(--el-color-primary);
+    }
+  }
+
   .toolbar-buttons {
     display: flex;
     align-items: center;

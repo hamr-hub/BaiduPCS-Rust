@@ -879,12 +879,37 @@ impl FolderDownloadManager {
                     continue;
                 }
 
-                let to_create = needed.min(folder.pending_files.len());
-                if to_create == 0 {
+                // 🔥 底账重建后 pending_files 可能包含「已经恢复出子任务」的文件，
+                //    按 fs_id 去重，只补真正缺任务的那些
+                let existing_fs_ids: std::collections::HashSet<u64> =
+                    existing_tasks.iter().map(|t| t.fs_id).collect();
+                folder
+                    .pending_files
+                    .retain(|f| !existing_fs_ids.contains(&f.fs_id));
+
+                // 🔥 只挑选文件，**不从 pending_files 摘除**
+                //
+                // 子任务在真正启动之前是不落盘的（`add_task` / `add_task_paused` 都只往
+                // 内存任务表里插，只有 `start_task_internal` 才注册持久化）。如果建任务时
+                // 就把文件从 pending_files 摘掉，那「已建任务、还没启动」的文件在重启后
+                // 两头都不存在 —— 实测一个 8 文件的文件夹重启后只剩 2 个任务、0 待处理。
+                //
+                // 所以摘除时机推迟到任务真正落盘那一刻（见
+                // `FolderDownloadManager::drop_pending_file_after_persist`）。在此之前
+                // 文件同时存在于 pending_files 和内存任务里，靠下面的 fs_id 去重
+                // 保证不会重复建任务。
+                let existing_fs_ids: std::collections::HashSet<u64> =
+                    existing_tasks.iter().map(|t| t.fs_id).collect();
+                let files: Vec<_> = folder
+                    .pending_files
+                    .iter()
+                    .filter(|f| !existing_fs_ids.contains(&f.fs_id))
+                    .take(needed)
+                    .cloned()
+                    .collect();
+                if files.is_empty() {
                     continue;
                 }
-
-                let files = folder.pending_files.drain(..to_create).collect::<Vec<_>>();
                 (
                     files,
                     folder.local_root.clone(),
@@ -1080,7 +1105,9 @@ impl FolderDownloadManager {
         // 启动文件夹进度监听器
         self.start_folder_progress_listener(folder_progress_rx);
 
-        info!("文件夹下载管理器已设置下载管理器，任务完成监听和进度监听器已启动（首次初始化）");
+        info!(
+            "文件夹下载管理器已设置下载管理器，任务完成监听和进度监听器已启动（首次初始化）"
+        );
     }
 
     /// 🔥 把已存在的 task_completed / folder_progress sender 注入到新 manager
@@ -1109,6 +1136,64 @@ impl FolderDownloadManager {
                 );
             }
         }
+    }
+
+    /// 🔥 待办文件补任务兜底循环
+    ///
+    /// 补任务原本**只由「本文件夹的子任务完成」事件驱动**
+    /// （`update_folder_progress` 是死代码，没有任何调用方）。
+    ///
+    /// 子任务拿不到槽位时会把文件退回 `pending_files`（见 `refill_tasks_batch`），
+    /// 这是为了让待办可持久化 —— 排队中的任务只活在内存里，后端一重启就整个丢失。
+    /// 但退回之后如果文件夹恰好一个子任务都没在跑（槽位刚好被别的任务回收走），
+    /// 就再没有任何事件能驱动它，待办会一直补不上。
+    ///
+    /// 本循环是兜底：每 3 秒检查一次，只在**池子里确实有空闲槽位**时才去扫还有
+    /// 待办的文件夹，避免无谓的落盘churn。
+    pub fn start_pending_refill_loop(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
+            // 跳过第一次立即触发
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+
+                // 有待办文件、且处于下载中的文件夹
+                let candidates: Vec<(String, crate::auth::Uid)> = {
+                    let folders_guard = manager.folders.read().await;
+                    folders_guard
+                        .iter()
+                        .filter(|(_, f)| {
+                            f.status == FolderStatus::Downloading && !f.pending_files.is_empty()
+                        })
+                        .map(|(id, f)| (id.clone(), f.owner_uid))
+                        .collect()
+                };
+
+                for (folder_id, owner_uid) in candidates {
+                    // 没有空闲槽位就别白跑一趟：refill 会把文件 drain 出来又原样退回，
+                    // 每次都触发一次文件夹快照落盘
+                    let has_free_slot = match manager.download_manager_for(owner_uid).await {
+                        Some(dm) => {
+                            let pool = dm.task_slot_pool();
+                            pool.available_slots().await > 0
+                                || pool.available_borrow_slots().await > 0
+                        }
+                        None => false,
+                    };
+                    if !has_free_slot {
+                        continue;
+                    }
+
+                    if let Err(e) = manager.refill_tasks(&folder_id, 10).await {
+                        warn!("待办补任务失败: folder={}, err={}", folder_id, e);
+                    }
+                }
+            }
+        });
     }
 
     /// 🔥 启动文件夹进度监听器
@@ -1671,9 +1756,26 @@ impl FolderDownloadManager {
                         continue;
                     }
 
-                    // 根据可用槽位数量（借调位+固定位）取出相应数量的文件
-                    let count = folder.pending_files.len().min(available);
-                    let files: Vec<_> = folder.pending_files.drain(..count).collect();
+                    // 🔥 只挑选文件，**不从 pending_files 摘除**
+                    //
+                    // 子任务在真正启动之前是不落盘的（`add_task` / `add_task_paused` 都只往
+                    // 内存任务表里插，只有 `start_task_internal` 才注册持久化）。如果建任务时
+                    // 就把文件从 pending_files 摘掉，那「已建任务、还没启动」的文件在重启后
+                    // 两头都不存在 —— 实测一个 8 文件的文件夹重启后只剩 2 个任务、0 待处理。
+                    //
+                    // 所以摘除时机推迟到任务真正落盘那一刻（见
+                    // `FolderDownloadManager::drop_pending_file_after_persist`）。在此之前
+                    // 文件同时存在于 pending_files 和内存任务里，靠下面的 fs_id 去重
+                    // 保证不会重复建任务。
+                    let existing_fs_ids: std::collections::HashSet<u64> =
+                        tasks.iter().map(|t| t.fs_id).collect();
+                    let files: Vec<_> = folder
+                        .pending_files
+                        .iter()
+                        .filter(|f| !existing_fs_ids.contains(&f.fs_id))
+                        .take(available)
+                        .cloned()
+                        .collect();
                     (files, folder.local_root.clone(), folder.remote_root.clone(), folder.owner_uid)
                 };
 
@@ -1695,8 +1797,7 @@ impl FolderDownloadManager {
                     resolve_folder_conflict_strategy(&folders, &app_config, &group_id).await;
 
                 // 创建任务
-                let mut files_iter = files.into_iter();
-                while let Some(file_to_create) = files_iter.next() {
+                for file_to_create in files {
                     // ✅ 创建任务前再次检查状态，防止竞态条件
                     // 场景：取出文件后、创建任务前，pause_folder 可能已更新状态
                     {
@@ -1722,8 +1823,8 @@ impl FolderDownloadManager {
 
                         if should_abort {
                             drop(folders_guard);
-                            aborted_remainder.push(file_to_create);
-                            aborted_remainder.extend(files_iter.by_ref());
+                            // 文件本来就没从 pending_files 摘走，中止时无需归还
+                            let _ = &file_to_create;
                             break;
                         }
                     }
@@ -1777,6 +1878,8 @@ impl FolderDownloadManager {
                         }
                     }
 
+                    // 拿不到槽位时要把文件原样退回 pending_files，这里先留一份
+
                     let mut task = DownloadTask::new_with_group(
                         file_to_create.fs_id,
                         file_to_create.remote_path.clone(),
@@ -1788,90 +1891,102 @@ impl FolderDownloadManager {
                         folder_owner_uid,
                     );
 
-                    // 🔥 尝试为子任务分配借调位
-                    let borrowed_slot_assigned = {
+                    // 🔥 槽位分配顺序：**文件夹自己的固定位优先，借调位兜底**
+                    //
+                    // 历史实现是反过来的（先借调位、固定位兜底），后果是文件夹把自己的
+                    // 固定位空着、却占着从别人那借来的槽位：实测一个只含 1 个文件的文件夹
+                    // 会持有 5 个槽位（固定位 0 空闲 + 借调位 1 在用 + 借调位 2/3/4 空闲），
+                    // 同账号第二个文件夹一个槽位都拿不到，全部子任务饿死在等待队列。
+                    //
+                    // 先用自己的位、借来的位只在自己的不够时才动，能还回去的自然就多了。
+                    //
+                    // 固定位占用是"直持有语义"：必须写成 `uses_folder_fixed_slot=true,
+                    // slot_id=None`，并同步登记 `folder.fixed_slot_subtask = Some(task.id)`。
+                    // 否则：
+                    // (a) scheduler 完成时会误走 `release_fixed_slot(task_id)`，但 pool 里 owner=group_id，清不掉
+                    // (b) `fixed_slot_subtask` 仍为 None，后续 `try_allocate_fixed_slot_for_subtask` 会把同一 fixed slot 再次分配给别的等待子任务
+                    let fixed_slot_claim: Option<usize> = {
                         let folders_guard = folders.read().await;
-                        if let Some(folder) = folders_guard.get(&group_id) {
-                            // 检查是否有空闲的借调位（未被映射到子任务，且不在已占用槽位中）
-                            let mut assigned = false;
-                            for &slot_id in &folder.borrowed_slot_ids {
-                                // 🔥 关键修复：同时检查 borrowed_subtask_map 和 used_slot_ids
-                                let in_map = folder.borrowed_subtask_map.values().any(|&s| s == slot_id);
-                                let in_use = used_slot_ids.contains(&slot_id);
-                                if !in_map && !in_use {
-                                    // 找到一个空闲的借调位，分配给此任务
-                                    task.slot_id = Some(slot_id);
-                                    task.is_borrowed_slot = true;
-                                    drop(folders_guard);
-
-                                    // 登记借调位映射
-                                    {
-                                        let mut folders_mut = folders.write().await;
-                                        if let Some(folder_mut) = folders_mut.get_mut(&group_id) {
-                                            folder_mut.borrowed_subtask_map.insert(task.id.clone(), slot_id);
+                        match folders_guard.get(&group_id) {
+                            Some(folder) => {
+                                match folder.fixed_slot_id {
+                                    Some(fixed_slot_id)
+                                    if !used_slot_ids.contains(&fixed_slot_id)
+                                        && folder.fixed_slot_subtask.is_none() =>
+                                        {
+                                            Some(fixed_slot_id)
                                         }
-                                    }
-                                    // 🔥 关键修复：将分配的槽位加入已使用集合
-                                    used_slot_ids.insert(slot_id);
-                                    info!("子任务 {} 分配借调位: slot_id={}", task.id, slot_id);
-                                    assigned = true;
-                                    break;
+                                    _ => None,
                                 }
                             }
-                            assigned
-                        } else {
-                            false
+                            None => {
+                                // 文件夹不存在，跳过当前文件
+                                continue;
+                            }
                         }
                     };
 
-                    if !borrowed_slot_assigned {
-                        // 🔥 没有可用的借调位，尝试占用文件夹固定位（直持有语义）
-                        //    关键：必须写成 `uses_folder_fixed_slot=true, slot_id=None`，
-                        //    并同步登记 `folder.fixed_slot_subtask = Some(task.id)`。
-                        //    否则：
-                        //    (a) scheduler 完成时会误走 `release_fixed_slot(task_id)`，但 pool 里 owner=group_id，清不掉
-                        //    (b) `fixed_slot_subtask` 仍为 None，后续 `try_allocate_fixed_slot_for_subtask` 会把同一 fixed slot 再次分配给别的等待子任务
-                        let fixed_slot_claim: Option<usize> = {
+                    if let Some(fixed_slot_id) = fixed_slot_claim {
+                        // 1. 写入任务侧的"文件夹固定位直持有"语义
+                        task.slot_id = None;
+                        task.is_borrowed_slot = false;
+                        task.uses_folder_fixed_slot = true;
+                        // 2. 记入本轮 used_slot_ids，防止同一轮内再次分配
+                        used_slot_ids.insert(fixed_slot_id);
+                        // 3. 同步登记到 folder.fixed_slot_subtask，防止跨轮/并发重复分配
+                        {
+                            let mut folders_mut = folders.write().await;
+                            if let Some(folder_mut) = folders_mut.get_mut(&group_id) {
+                                folder_mut.fixed_slot_subtask = Some(task.id.clone());
+                            }
+                        }
+                        info!(
+                            "子任务 {} 使用文件夹 {} 的固定位 (直持有语义，slot_id={})",
+                            task.id, group_id, fixed_slot_id
+                        );
+                    } else {
+                        // 固定位已被别的子任务占着，退而使用借调位
+                        let borrowed_slot_assigned = {
                             let folders_guard = folders.read().await;
-                            match folders_guard.get(&group_id) {
-                                Some(folder) => {
-                                    match folder.fixed_slot_id {
-                                        Some(fixed_slot_id)
-                                        if !used_slot_ids.contains(&fixed_slot_id)
-                                            && folder.fixed_slot_subtask.is_none() =>
-                                            {
-                                                Some(fixed_slot_id)
+                            if let Some(folder) = folders_guard.get(&group_id) {
+                                // 检查是否有空闲的借调位（未被映射到子任务，且不在已占用槽位中）
+                                let mut assigned = false;
+                                for &slot_id in &folder.borrowed_slot_ids {
+                                    // 🔥 关键修复：同时检查 borrowed_subtask_map 和 used_slot_ids
+                                    let in_map = folder.borrowed_subtask_map.values().any(|&s| s == slot_id);
+                                    let in_use = used_slot_ids.contains(&slot_id);
+                                    if !in_map && !in_use {
+                                        // 找到一个空闲的借调位，分配给此任务
+                                        task.slot_id = Some(slot_id);
+                                        task.is_borrowed_slot = true;
+                                        drop(folders_guard);
+
+                                        // 登记借调位映射
+                                        {
+                                            let mut folders_mut = folders.write().await;
+                                            if let Some(folder_mut) = folders_mut.get_mut(&group_id) {
+                                                folder_mut.borrowed_subtask_map.insert(task.id.clone(), slot_id);
                                             }
-                                        _ => None,
+                                        }
+                                        // 🔥 关键修复：将分配的槽位加入已使用集合
+                                        used_slot_ids.insert(slot_id);
+                                        info!("子任务 {} 分配借调位: slot_id={}", task.id, slot_id);
+                                        assigned = true;
+                                        break;
                                     }
                                 }
-                                None => {
-                                    // 文件夹不存在，跳过当前文件
-                                    continue;
-                                }
+                                assigned
+                            } else {
+                                false
                             }
                         };
 
-                        if let Some(fixed_slot_id) = fixed_slot_claim {
-                            // 1. 写入任务侧的"文件夹固定位直持有"语义
-                            task.slot_id = None;
-                            task.is_borrowed_slot = false;
-                            task.uses_folder_fixed_slot = true;
-                            // 2. 记入本轮 used_slot_ids，防止同一轮内再次分配
-                            used_slot_ids.insert(fixed_slot_id);
-                            // 3. 同步登记到 folder.fixed_slot_subtask，防止跨轮/并发重复分配
-                            {
-                                let mut folders_mut = folders.write().await;
-                                if let Some(folder_mut) = folders_mut.get_mut(&group_id) {
-                                    folder_mut.fixed_slot_subtask = Some(task.id.clone());
-                                }
-                            }
-                            info!(
-                                "子任务 {} 使用文件夹 {} 的固定位 (直持有语义，slot_id={})",
-                                task.id, group_id, fixed_slot_id
-                            );
-                        } else {
-                            // 固定位已被占用或不存在，创建任务但不分配槽位
+                        if !borrowed_slot_assigned {
+                            // 拿不到槽位也照常建任务（进等待队列），保持
+                            // 「最多 target_count 个子任务」的原有阈值 —— 列表里看得见。
+                            //
+                            // 这类任务在真正启动前不落盘，但对应文件还留在 pending_files
+                            // 里（摘除推迟到落盘那一刻），重启后会被重新建出来，不会丢。
                             info!(
                                 "子任务 {} 无空闲槽位，创建任务但不分配槽位（将进入等待队列）",
                                 task.id
@@ -3311,31 +3426,45 @@ impl FolderDownloadManager {
         let mut used_slot_ids: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         for task in &paused_tasks {
-            // 为子任务分配借调位
+            // 🔥 槽位分配顺序：**文件夹自己的固定位优先，借调位兜底**
+            //
+            // 与另外两条补任务路径保持一致。历史实现在这里是反过来的（先借调位、
+            // 固定位兜底），后果是恢复出来的文件夹把自己的固定位空着、却占着借来的位：
+            // 实测（2026-08-21 14:24 日志）一个只含 1 个文件的文件夹恢复后，
+            // 子任务落在借调位 2 上、固定位 1 从头到尾没人用，等于 1 个文件占了 2 个槽，
+            // 另一个 8 文件的文件夹因此少拿一个位。
+            //
+            // 固定位是这个文件夹的保底资源，先用满自己的再去借；借来的位才好还回去。
             let assigned_slot = {
                 let mut folders_guard = self.folders.write().await;
                 if let Some(folder) = folders_guard.get_mut(folder_id) {
-                    // 优先使用借调位
                     let mut found_slot = None;
-                    for &slot_id in &folder.borrowed_slot_ids {
-                        // 🔥 关键修复：同时检查 borrowed_subtask_map 和 used_slot_ids
-                        let in_map = folder.borrowed_subtask_map.values().any(|&s| s == slot_id);
-                        let in_use = used_slot_ids.contains(&slot_id);
-                        if !in_map && !in_use {
-                            found_slot = Some((slot_id, true)); // (slot_id, is_borrowed)
-                            folder.borrowed_subtask_map.insert(task.id.clone(), slot_id);
-                            break;
+
+                    // 1. 先用文件夹自己的固定位（同一时刻只能有一个子任务直持有）
+                    if let Some(fixed_slot) = folder.fixed_slot_id {
+                        if !used_slot_ids.contains(&fixed_slot)
+                            && folder.fixed_slot_subtask.is_none()
+                        {
+                            folder.fixed_slot_subtask = Some(task.id.clone());
+                            found_slot = Some((fixed_slot, false)); // 固定位不是借调位
                         }
                     }
-                    // 如果没有空闲借调位，使用固定位
+
+                    // 2. 固定位已被占用 → 退而使用借调位
                     if found_slot.is_none() {
-                        if let Some(fixed_slot) = folder.fixed_slot_id {
-                            // 🔥 关键修复：检查固定位是否已被使用（通过 used_slot_ids）
-                            if !used_slot_ids.contains(&fixed_slot) {
-                                found_slot = Some((fixed_slot, false)); // 固定位不是借调位
+                        for &slot_id in &folder.borrowed_slot_ids {
+                            // 🔥 关键修复：同时检查 borrowed_subtask_map 和 used_slot_ids
+                            let in_map =
+                                folder.borrowed_subtask_map.values().any(|&s| s == slot_id);
+                            let in_use = used_slot_ids.contains(&slot_id);
+                            if !in_map && !in_use {
+                                found_slot = Some((slot_id, true)); // (slot_id, is_borrowed)
+                                folder.borrowed_subtask_map.insert(task.id.clone(), slot_id);
+                                break;
                             }
                         }
                     }
+
                     found_slot
                 } else {
                     None
@@ -3561,6 +3690,40 @@ impl FolderDownloadManager {
             .await;
 
         Ok(())
+    }
+
+    /// 🔥 取消并清理某个转存任务派生出的全部文件夹下载（tree 模式整目录转存+自动下载）。
+    ///
+    /// 与 [`DownloadManager::delete_tasks_for_transfer`] 成对使用：分享同步放弃一次
+    /// 转存提交时，要把它派生的下载段一起收走，否则会与重新提交那一支叠成重复项
+    /// （issue #148）。不删本地已下载文件。返回清理的文件夹数。
+    pub async fn delete_folders_for_transfer(&self, transfer_task_id: &str) -> usize {
+        let target_ids: Vec<String> = {
+            let folders = self.folders.read().await;
+            folders
+                .values()
+                .filter(|f| f.transfer_task_id.as_deref() == Some(transfer_task_id))
+                .map(|f| f.id.clone())
+                .collect()
+        };
+
+        let count = target_ids.len();
+        for id in &target_ids {
+            if let Err(e) = self.cancel_folder(id, false).await {
+                warn!(
+                    "delete_folders_for_transfer: 取消文件夹 {} 失败: {}",
+                    id, e
+                );
+            }
+            let _ = self.delete_folder_from_history(id).await;
+        }
+        if count > 0 {
+            info!(
+                "delete_folders_for_transfer: transfer={} 清理 {} 个文件夹下载",
+                transfer_task_id, count
+            );
+        }
+        count
     }
 
     /// 🔥 删除归属指定 `backup_config_id`（如 `share-sync:{订阅id}`）的全部文件夹下载
@@ -3811,6 +3974,19 @@ impl FolderDownloadManager {
             .filter_map(|t| t.slot_id)
             .collect();
 
+        // 🔥 先把跑在借调位上的子任务挪回空闲的固定位（腾出借调位），
+        //    再归还这一轮用不上的借调位，最后才判断要不要补任务
+        self.compact_folder_slots(folder_id).await;
+
+        // 🔥 归还这一轮用不上的借调位
+        //
+        // 必须放在下面几处早退**之前**：本方法在「活跃数已够」「pending 为空」
+        // 「文件夹已暂停/取消」时都会提前 return，而恰恰是这些情况下借调位最闲。
+        // 实测（2026-08-21 11:17 日志）：一个恢复出来的单文件文件夹 pending 为空，
+        // 每次周期性补任务都在 `to_create == 0` 处返回，末尾的归还永远执行不到，
+        // 于是它一直攥着 3 个空借调位，另一个文件夹的 4 个子任务全卡在等待队列。
+        self.release_surplus_borrowed_slots(folder_id).await;
+
         // 如果已经足够，不需要补充
         if active_count >= target_count {
             return Ok(RefillBatch::default());
@@ -3834,12 +4010,29 @@ impl FolderDownloadManager {
                 return Ok(RefillBatch::default());
             }
 
-            let to_create = needed.min(folder.pending_files.len());
-            if to_create == 0 {
+            // 🔥 只挑选文件，**不从 pending_files 摘除**
+            //
+            // 子任务在真正启动之前是不落盘的（`add_task` / `add_task_paused` 都只往
+            // 内存任务表里插，只有 `start_task_internal` 才注册持久化）。如果建任务时
+            // 就把文件从 pending_files 摘掉，那「已建任务、还没启动」的文件在重启后
+            // 两头都不存在 —— 实测一个 8 文件的文件夹重启后只剩 2 个任务、0 待处理。
+            //
+            // 所以摘除时机推迟到任务真正落盘那一刻（见
+            // `FolderDownloadManager::drop_pending_file_after_persist`）。在此之前
+            // 文件同时存在于 pending_files 和内存任务里，靠下面的 fs_id 去重
+            // 保证不会重复建任务。
+            let existing_fs_ids: std::collections::HashSet<u64> =
+                tasks.iter().map(|t| t.fs_id).collect();
+            let files: Vec<_> = folder
+                .pending_files
+                .iter()
+                .filter(|f| !existing_fs_ids.contains(&f.fs_id))
+                .take(needed)
+                .cloned()
+                .collect();
+            if files.is_empty() {
                 return Ok(RefillBatch::default());
             }
-
-            let files = folder.pending_files.drain(..to_create).collect::<Vec<_>>();
             (files, folder.local_root.clone(), folder.remote_root.clone(), folder.owner_uid)
         };
 
@@ -3872,8 +4065,7 @@ impl FolderDownloadManager {
         //    永远到不了终态。以前快照不落盘，重启还能从旧快照"救"回来；现在快照是准的，
         //    丢失会被持久化下来，必须显式归还。
         let mut aborted_remainder = Vec::new();
-        let mut files_iter = files_to_create.into_iter();
-        while let Some(pending_file) = files_iter.next() {
+        for pending_file in files_to_create {
             // ✅ 创建任务前再次检查状态，防止竞态条件
             // 场景：取出文件后、创建任务前，pause_folder 可能已更新状态
             {
@@ -3897,8 +4089,8 @@ impl FolderDownloadManager {
 
                 if should_abort {
                     drop(folders_guard);
-                    aborted_remainder.push(pending_file);
-                    aborted_remainder.extend(files_iter.by_ref());
+                    // 文件本来就没从 pending_files 摘走，中止时无需归还
+                    let _ = &pending_file;
                     break;
                 }
             }
@@ -3950,6 +4142,8 @@ impl FolderDownloadManager {
                     .context(format!("创建目录失败: {:?}", parent))?;
             }
 
+            // 拿不到槽位时要把文件原样退回 pending_files，这里先留一份
+
             let mut task = DownloadTask::new_with_group(
                 pending_file.fs_id,
                 pending_file.remote_path.clone(),
@@ -3961,89 +4155,86 @@ impl FolderDownloadManager {
                 folder_owner_uid,
             );
 
-            // 🔥 尝试为子任务分配借调位
-            // 修复：同时检查 borrowed_subtask_map 和已恢复任务的 slot_id，避免重复分配
-            let borrowed_slot_assigned = {
+            // 🔥 槽位分配顺序：文件夹自己的固定位优先，借调位兜底
+            //    与另一条补任务路径保持一致，原因见那里的长注释。
+            let fixed_slot_claim: Option<usize> = {
                 let folders_guard = self.folders.read().await;
-                if let Some(folder) = folders_guard.get(folder_id) {
-                    // 检查是否有空闲的借调位（未被映射到子任务，且不在已占用槽位中）
-                    let mut found_slot = None;
-                    for &slot_id in &folder.borrowed_slot_ids {
-                        // 🔥 关键修复：既要检查 borrowed_subtask_map，也要检查 used_slot_ids
-                        let in_map = folder.borrowed_subtask_map.values().any(|&s| s == slot_id);
-                        let in_use = used_slot_ids.contains(&slot_id);
-                        if !in_map && !in_use {
-                            // 找到一个真正空闲的借调位
-                            found_slot = Some(slot_id);
-                            break;
-                        }
-                    }
-
-                    if let Some(slot_id) = found_slot {
-                        // 分配给此任务
-                        task.slot_id = Some(slot_id);
-                        task.is_borrowed_slot = true;
-                        drop(folders_guard);
-
-                        // 登记借调位映射
-                        self.register_subtask_borrowed_slot(folder_id, &task.id, slot_id).await;
-
-                        // 🔥 关键修复：将分配的槽位加入已使用集合，防止后续任务重复分配
-                        used_slot_ids.insert(slot_id);
-
-                        info!("子任务 {} 分配借调位: slot_id={}", task.id, slot_id);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
+                match folders_guard.get(folder_id) {
+                    Some(folder) => match folder.fixed_slot_id {
+                        Some(fixed_slot_id)
+                        if !used_slot_ids.contains(&fixed_slot_id)
+                            && folder.fixed_slot_subtask.is_none() =>
+                            {
+                                Some(fixed_slot_id)
+                            }
+                        _ => None,
+                    },
+                    None => None,
                 }
             };
 
-            if !borrowed_slot_assigned {
-                // 🔥 没有可用的借调位，尝试占用文件夹固定位（直持有语义）
-                //    必须与另一条补任务路径保持一致：
-                //    - 写入 uses_folder_fixed_slot=true, slot_id=None
-                //    - 同步登记 fixed_slot_subtask = Some(task.id)
-                //    详情见另一处同名注释块。
-                let fixed_slot_claim: Option<usize> = {
+            if let Some(fixed_slot_id) = fixed_slot_claim {
+                // 1. 写入任务侧的"文件夹固定位直持有"语义
+                task.slot_id = None;
+                task.is_borrowed_slot = false;
+                task.uses_folder_fixed_slot = true;
+                // 2. 记入本轮 used_slot_ids
+                used_slot_ids.insert(fixed_slot_id);
+                // 3. 同步登记到 folder.fixed_slot_subtask
+                {
+                    let mut folders_mut = self.folders.write().await;
+                    if let Some(folder_mut) = folders_mut.get_mut(folder_id) {
+                        folder_mut.fixed_slot_subtask = Some(task.id.clone());
+                    }
+                }
+                info!(
+                    "子任务 {} 使用文件夹 {} 的固定位 (直持有语义，slot_id={})",
+                    task.id, folder_id, fixed_slot_id
+                );
+            } else {
+                // 固定位已被别的子任务占着，退而使用借调位
+                // 修复：同时检查 borrowed_subtask_map 和已恢复任务的 slot_id，避免重复分配
+                let borrowed_slot_assigned = {
                     let folders_guard = self.folders.read().await;
-                    match folders_guard.get(folder_id) {
-                        Some(folder) => match folder.fixed_slot_id {
-                            Some(fixed_slot_id)
-                            if !used_slot_ids.contains(&fixed_slot_id)
-                                && folder.fixed_slot_subtask.is_none() =>
-                                {
-                                    Some(fixed_slot_id)
-                                }
-                            _ => None,
-                        },
-                        None => None,
+                    if let Some(folder) = folders_guard.get(folder_id) {
+                        // 检查是否有空闲的借调位（未被映射到子任务，且不在已占用槽位中）
+                        let mut found_slot = None;
+                        for &slot_id in &folder.borrowed_slot_ids {
+                            // 🔥 关键修复：既要检查 borrowed_subtask_map，也要检查 used_slot_ids
+                            let in_map = folder.borrowed_subtask_map.values().any(|&s| s == slot_id);
+                            let in_use = used_slot_ids.contains(&slot_id);
+                            if !in_map && !in_use {
+                                // 找到一个真正空闲的借调位
+                                found_slot = Some(slot_id);
+                                break;
+                            }
+                        }
+
+                        if let Some(slot_id) = found_slot {
+                            // 分配给此任务
+                            task.slot_id = Some(slot_id);
+                            task.is_borrowed_slot = true;
+                            drop(folders_guard);
+
+                            // 登记借调位映射
+                            self.register_subtask_borrowed_slot(folder_id, &task.id, slot_id).await;
+
+                            // 🔥 关键修复：将分配的槽位加入已使用集合，防止后续任务重复分配
+                            used_slot_ids.insert(slot_id);
+
+                            info!("子任务 {} 分配借调位: slot_id={}", task.id, slot_id);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
                     }
                 };
 
-                if let Some(fixed_slot_id) = fixed_slot_claim {
-                    // 1. 写入任务侧的"文件夹固定位直持有"语义
-                    task.slot_id = None;
-                    task.is_borrowed_slot = false;
-                    task.uses_folder_fixed_slot = true;
-                    // 2. 记入本轮 used_slot_ids
-                    used_slot_ids.insert(fixed_slot_id);
-                    // 3. 同步登记到 folder.fixed_slot_subtask
-                    {
-                        let mut folders_mut = self.folders.write().await;
-                        if let Some(folder_mut) = folders_mut.get_mut(folder_id) {
-                            folder_mut.fixed_slot_subtask = Some(task.id.clone());
-                        }
-                    }
-                    info!(
-                        "子任务 {} 使用文件夹 {} 的固定位 (直持有语义，slot_id={})",
-                        task.id, folder_id, fixed_slot_id
-                    );
-                } else {
-                    // 🔥 所有槽位都已占用，但仍然创建任务（不分配槽位）
-                    //    任务会进入等待队列，当有槽位释放时会被调度
+                if !borrowed_slot_assigned {
+                    // 拿不到槽位也照常建任务（进等待队列），保持原有阈值；
+                    // 对应文件还留在 pending_files 里，重启会被重新建出来，不会丢。
                     info!(
                         "子任务 {} 无空闲槽位，创建任务但不分配槽位（将进入等待队列）",
                         task.id
@@ -4073,7 +4264,7 @@ impl FolderDownloadManager {
                     let returned = aborted_remainder.len();
                     if returned > 0 {
                         info!(
-                            "文件夹 {} 中止补任务，归还 {} 个未处理文件到队列",
+                            "文件夹 {} 归还 {} 个未建任务的文件到 pending 队列（暂停/取消中止，或暂时没有空闲槽位）",
                             folder_id, returned
                         );
                         // 放回队首：pending_files 在扫描完成时按相对路径排过序，
@@ -4092,6 +4283,13 @@ impl FolderDownloadManager {
             "补充任务完成: 文件夹 {} 成功创建 {} 个任务, 跳过 {} 个已存在文件",
             folder_id, created_count, skipped_count
         );
+
+        // 🔥 归还这一轮下来用不上的借调位
+        //
+        // 借调发生在扫描之前（那时还不知道有几个文件），一律把空位借光。等补任务跑完，
+        // 实际需要多少已经清楚了，多借的必须还回去 —— 否则一个只含 1 个文件的文件夹
+        // 会一直占着 4 个借调位，同账号的其他文件夹全部饿死在等待队列。
+        self.release_surplus_borrowed_slots(folder_id).await;
 
         // 🔥 批次内全部命中跳过时不会有子任务完成事件来驱动终态检查，
         //    这里主动触发一次，否则文件夹会停在 downloading。
@@ -4305,8 +4503,412 @@ impl FolderDownloadManager {
                 .collect()
         };
 
-        // 选第一个有借调位的 folder（保留原始"取一个"语义）
-        let (folder_id, folder_owner_uid) = candidate_folders.first()?.clone();
+        if candidate_folders.is_empty() {
+            return None;
+        }
+
+        // 🔥 第一阶段：优先释放**完全空闲**的借调位（借来了但压根没有子任务在用）
+        //
+        // 借调发生在扫描之前，此时还不知道文件夹有几个文件，于是一律把空位借光。
+        // 一个只含 1 个文件的文件夹会借走 4 个位却只用 1 个，剩下 3 个白占着。
+        //
+        // 历史实现只有在 `borrowed_subtask_map` **完全为空**时才会走"直接释放空闲借调位"
+        // 分支；只要还有一个子任务占着借调位，它就转去暂停那个子任务，而明明空着的
+        // 其余借调位永远回收不掉 —— 同账号第二个文件夹因此一个槽位都拿不到。
+        for (folder_id, folder_owner_uid) in &candidate_folders {
+            if let Some(slot_id) = self
+                .release_idle_borrowed_slot(folder_id, *folder_owner_uid)
+                .await
+            {
+                return Some(slot_id);
+            }
+        }
+
+        // 🔥 第二阶段：借调位全都在用，只能暂停一个子任务把位置腾出来
+        //
+        // 逐个候选尝试：某个文件夹暂停失败（典型是子任务还在
+        // `prepare_for_scheduling` 里探测链接、状态还不是 Downloading，
+        // pause_task 会报"任务未在下载中"）时继续试下一个，
+        // 而不是像历史实现那样直接 `return None` 整体放弃。
+        for (folder_id, folder_owner_uid) in &candidate_folders {
+            if let Some(slot_id) = self
+                .reclaim_by_pausing_subtask(folder_id, *folder_owner_uid, owner_uid)
+                .await
+            {
+                return Some(slot_id);
+            }
+        }
+
+        None
+    }
+
+    /// 🔥 兜底：把跑在借调位上的子任务挪回文件夹自己空闲的固定位，腾出借调位
+    ///
+    /// **正常不该走到这里** —— 三条分配路径（新建补任务 ×2、恢复）都已经是
+    /// 「固定位优先、借调位兜底」，子任务不会在固定位空着时去占借调位。
+    /// 本方法只收拾分配之后才形成的错配：
+    ///
+    /// - 占着固定位的那个子任务先完成了，剩下的子任务还在借调位上跑 → 固定位空转
+    /// - 历史遗留 / 未来新增路径漏了固定位优先（这正是 2026-08-21 14:24 日志里
+    ///   恢复链路的表现：1 个文件的文件夹占着固定位 + 借调位两个槽，固定位没人用）
+    ///
+    /// 这类错配 [`release_surplus_borrowed_slots`](Self::release_surplus_borrowed_slots)
+    /// 救不了 —— 那个借调位**正在被使用**，按设计不能直接收走。
+    ///
+    /// 这里做的是纯记账搬迁，不打断正在下载的分片：固定位和借调位在 `task_slot_pool`
+    /// 里的 owner 都是 `folder_id`，槽位心跳不受影响；任务侧由
+    /// [`DownloadManager::update_task_slot`] 切换成「文件夹固定位直持有」语义。
+    async fn compact_folder_slots(&self, folder_id: &str) {
+        let (owner_uid, fixed_slot_id) = {
+            let folders_guard = self.folders.read().await;
+            let Some(folder) = folders_guard.get(folder_id) else {
+                return;
+            };
+            // 固定位已经有人用，或者压根没有固定位/借调位 → 无事可做
+            if folder.fixed_slot_subtask.is_some() || folder.borrowed_slot_ids.is_empty() {
+                return;
+            }
+            match folder.fixed_slot_id {
+                Some(fixed) => (folder.owner_uid, fixed),
+                None => return,
+            }
+        };
+
+        let Some(dm) = self.download_manager_for(owner_uid).await else {
+            return;
+        };
+
+        // 找一个正在用借调位的存活子任务
+        let candidate = dm
+            .get_tasks_by_group(folder_id)
+            .await
+            .into_iter()
+            .find(|t| {
+                t.is_borrowed_slot
+                    && t.slot_id.is_some()
+                    && !matches!(t.status, TaskStatus::Completed | TaskStatus::Failed)
+            });
+        let Some(task) = candidate else {
+            return;
+        };
+        let Some(borrowed_slot) = task.slot_id else {
+            return;
+        };
+
+        // 1. 先占住固定位，防止并发的补任务把它分给别人
+        {
+            let mut folders_guard = self.folders.write().await;
+            let Some(folder) = folders_guard.get_mut(folder_id) else {
+                return;
+            };
+            // 释放读锁到拿写锁之间可能已被占用，二次确认
+            if folder.fixed_slot_subtask.is_some() {
+                return;
+            }
+            folder.fixed_slot_subtask = Some(task.id.clone());
+        }
+
+        // 2. 任务侧切换到「文件夹固定位直持有」（slot_id=None, uses_folder_fixed_slot=true）
+        dm.update_task_slot(&task.id, fixed_slot_id, false).await;
+
+        // 3. 清掉借调位记账并归还给池子
+        {
+            let mut folders_guard = self.folders.write().await;
+            if let Some(folder) = folders_guard.get_mut(folder_id) {
+                folder.borrowed_subtask_map.remove(&task.id);
+                folder.borrowed_slot_ids.retain(|&s| s != borrowed_slot);
+            }
+        }
+        dm.task_slot_pool()
+            .release_borrowed_slot(folder_id, borrowed_slot)
+            .await;
+
+        info!(
+            "文件夹 {} 子任务 {} 从借调位 {} 挪回空闲的固定位 {}，借调位已归还",
+            folder_id, task.id, borrowed_slot, fixed_slot_id
+        );
+    }
+
+    /// 🔥 子任务已注册进持久化 → 把它对应的文件从 `pending_files` 摘掉
+    ///
+    /// 摘除时机之所以卡在"落盘"这一刻，是因为在此之前任务只活在内存里：
+    /// `add_task` / `add_task_paused` 都不落盘，只有 `start_task_internal` 走到
+    /// 注册持久化才算数。建任务时就摘掉的话，「已建任务、还没启动」的文件在重启后
+    /// 既不在 `pending_files`、也没有任务记录 —— 实测一个 8 文件的文件夹重启后
+    /// 只剩 2 个任务、0 待处理，另外 6 个文件永久丢失。
+    ///
+    /// 反过来，摘除推迟意味着这段时间里文件同时存在于 `pending_files` 和内存任务中，
+    /// 补任务侧靠 `fs_id` 去重保证不会重复建。
+    pub async fn drop_pending_file_after_persist(&self, folder_id: &str, fs_id: u64) {
+        let removed = {
+            let mut folders_guard = self.folders.write().await;
+            let Some(folder) = folders_guard.get_mut(folder_id) else {
+                return;
+            };
+            let before = folder.pending_files.len();
+            folder.pending_files.retain(|f| f.fs_id != fs_id);
+            before != folder.pending_files.len()
+        };
+
+        if !removed {
+            return;
+        }
+
+        debug!(
+            "文件夹 {} 子任务已落盘，从 pending_files 摘除 fs_id={}",
+            folder_id, fs_id
+        );
+        self.persist_folder(folder_id).await;
+    }
+
+    /// 🔥 归还文件夹用不上的借调位
+    ///
+    /// 借调位是在扫描之前一次性借光的，扫描后才知道文件夹到底有几个文件。
+    /// 这里按「还剩多少活要干」把多余的借调位还回池子：
+    ///
+    /// ```text
+    /// 还需要的槽位数 = 存活子任务数 + pending_files 剩余数
+    /// 可以还掉的     = 空闲借调位（没有子任务在用），且持有量超出所需的部分
+    /// ```
+    ///
+    /// 只还空闲的借调位，正在跑的子任务不受影响；固定位不在归还范围内。
+    async fn release_surplus_borrowed_slots(&self, folder_id: &str) {
+        let (folder_owner_uid, borrowed_slot_ids, pending_left) = {
+            let folders_guard = self.folders.read().await;
+            match folders_guard.get(folder_id) {
+                Some(f) if !f.borrowed_slot_ids.is_empty() => (
+                    f.owner_uid,
+                    f.borrowed_slot_ids.clone(),
+                    f.pending_files.len(),
+                ),
+                _ => return,
+            }
+        };
+
+        let Some(dm) = self.download_manager_for(folder_owner_uid).await else {
+            return;
+        };
+
+        let live_tasks = dm.get_tasks_by_group(folder_id).await;
+        let live_count = live_tasks
+            .iter()
+            .filter(|t| !matches!(t.status, TaskStatus::Completed | TaskStatus::Failed))
+            .count();
+
+        // 固定位算 1 个，剩下的才需要借调位来补
+        let needed_borrowed = (live_count + pending_left).saturating_sub(1);
+        if borrowed_slot_ids.len() <= needed_borrowed {
+            return;
+        }
+
+        let mut surplus = borrowed_slot_ids.len() - needed_borrowed;
+        let mut released = Vec::new();
+
+        while surplus > 0 {
+            match self
+                .release_idle_borrowed_slot(folder_id, folder_owner_uid)
+                .await
+            {
+                Some(slot_id) => {
+                    released.push(slot_id);
+                    surplus -= 1;
+                }
+                // 没有空闲借调位了（剩下的都在用），停手
+                None => break,
+            }
+        }
+
+        if !released.is_empty() {
+            info!(
+                "文件夹 {} 归还 {} 个用不上的借调位: {:?}（存活子任务 {}, 待下载 {}）",
+                folder_id,
+                released.len(),
+                released,
+                live_count,
+                pending_left
+            );
+            // 不在这里主动推等待队列：try_start_waiting_tasks -> reclaim -> 本方法
+            // 会构成 async 递归。归还的槽位由每秒一次的等待队列监控接手即可。
+        }
+    }
+
+    /// 🔥 找出一个「借来了但没有任何子任务在用」的借调位
+    ///
+    /// 判定空闲需要同时满足两个条件，缺一不可：
+    /// - 不在 `borrowed_subtask_map` 的映射里
+    /// - 没有该文件夹的存活子任务把它记在 `task.slot_id` 上
+    ///
+    /// 第二条是必需的：恢复链路上存在「子任务已占用借调位但 map 未登记」的情况，
+    /// 只看 map 会把正在下载的槽位当成空闲。
+    async fn find_idle_borrowed_slot(
+        &self,
+        folder_id: &str,
+        folder_owner_uid: crate::auth::Uid,
+    ) -> Option<usize> {
+        let dm = self.download_manager_for(folder_owner_uid).await?;
+
+        // 该文件夹存活子任务实际占用的借调槽位
+        let slots_in_use: std::collections::HashSet<usize> = dm
+            .get_tasks_by_group(folder_id)
+            .await
+            .iter()
+            .filter(|t| !matches!(t.status, TaskStatus::Completed | TaskStatus::Failed))
+            .filter_map(|t| if t.is_borrowed_slot { t.slot_id } else { None })
+            .collect();
+
+        let folders_guard = self.folders.read().await;
+        let folder = folders_guard.get(folder_id)?;
+        folder
+            .borrowed_slot_ids
+            .iter()
+            .copied()
+            .find(|slot_id| {
+                !folder.borrowed_subtask_map.values().any(|s| s == slot_id)
+                    && !slots_in_use.contains(slot_id)
+            })
+    }
+
+    /// 🔥 为排队中的文件夹子任务取得一个**借调位**
+    ///
+    /// 按「顶层任务保底 1 个固定位、剩余容量可借调、新任务进来时借调方要还」这个模型，
+    /// 子任务的并行度应该来自借调位，而不是去占不可归还的全局固定位。
+    ///
+    /// 取位顺序：
+    /// 1. 复用本文件夹**已有但空闲**的借调位 —— 等待队列此前只试过文件夹固定位，
+    ///    自己借来闲着的位反而没人用
+    /// 2. 池子里还有空闲槽 → 补借一个（借调只在文件夹创建/恢复那一刻发生一次，
+    ///    之后即使空出槽位也没有任何路径补借，排队子任务只能干等）
+    /// 3. 仍然没有 → 回收**别的**文件夹「借了没用」的借调位，再补借
+    ///
+    /// 成功时已登记 `borrowed_subtask_map`，调用方只需写任务侧的
+    /// `slot_id` / `is_borrowed_slot`。
+    pub async fn acquire_borrowed_slot_for_subtask(
+        &self,
+        folder_id: &str,
+        task_id: &str,
+    ) -> Option<usize> {
+        let (owner_uid, backup_config_id) = {
+            let folders_guard = self.folders.read().await;
+            let folder = folders_guard.get(folder_id)?;
+            if matches!(
+                folder.status,
+                FolderStatus::Paused | FolderStatus::Cancelled | FolderStatus::Failed
+            ) {
+                return None;
+            }
+            (folder.owner_uid, folder.backup_config_id.clone())
+        };
+
+        let dm = self.download_manager_for(owner_uid).await?;
+        let slot_pool = dm.task_slot_pool();
+        let priority = folder_slot_priority(backup_config_id.as_deref());
+        let is_normal = priority == crate::task_slot_pool::TaskPriority::Normal;
+
+        // 1. 先看本文件夹有没有借来却闲着的位
+        let mut slot_id = self.find_idle_borrowed_slot(folder_id, owner_uid).await;
+
+        // 2. 没有就从池子补借一个
+        if slot_id.is_none() {
+            let newly = if is_normal {
+                // Normal 可抢占备份任务的槽位；Backup 只用空闲槽
+                slot_pool.allocate_borrowed_slots(folder_id, 1).await.0
+            } else {
+                slot_pool
+                    .allocate_borrowed_slots_no_preempt(folder_id, 1)
+                    .await
+            };
+            if let Some(&sid) = newly.first() {
+                let mut folders_guard = self.folders.write().await;
+                if let Some(folder) = folders_guard.get_mut(folder_id) {
+                    folder.borrowed_slot_ids.push(sid);
+                }
+                slot_id = Some(sid);
+                info!("文件夹 {} 为排队子任务补借 1 个任务位: slot_id={}", folder_id, sid);
+            }
+        }
+
+        // 3. 池子也空了 → 回收别的文件夹闲置的借调位再补借
+        if slot_id.is_none() && is_normal {
+            let peers: Vec<(String, crate::auth::Uid)> = {
+                let folders_guard = self.folders.read().await;
+                folders_guard
+                    .iter()
+                    .filter(|(id, f)| {
+                        id.as_str() != folder_id
+                            && f.owner_uid == owner_uid
+                            && !f.borrowed_slot_ids.is_empty()
+                    })
+                    .map(|(id, f)| (id.clone(), f.owner_uid))
+                    .collect()
+            };
+
+            for (peer_id, peer_uid) in peers {
+                if let Some(freed) = self.release_idle_borrowed_slot(&peer_id, peer_uid).await {
+                    info!(
+                        "文件夹 {} 从文件夹 {} 回收空闲借调位 {}，转为自己的借调位",
+                        folder_id, peer_id, freed
+                    );
+                    let newly = slot_pool.allocate_borrowed_slots(folder_id, 1).await.0;
+                    if let Some(&sid) = newly.first() {
+                        let mut folders_guard = self.folders.write().await;
+                        if let Some(folder) = folders_guard.get_mut(folder_id) {
+                            folder.borrowed_slot_ids.push(sid);
+                        }
+                        slot_id = Some(sid);
+                    }
+                    break;
+                }
+            }
+        }
+
+        let sid = slot_id?;
+        self.register_subtask_borrowed_slot(folder_id, task_id, sid)
+            .await;
+        info!("排队子任务 {} 取得借调位: slot_id={}", task_id, sid);
+        Some(sid)
+    }
+
+    /// 🔥 释放一个「借来了但没有任何子任务在用」的借调位
+    async fn release_idle_borrowed_slot(
+        &self,
+        folder_id: &str,
+        folder_owner_uid: crate::auth::Uid,
+    ) -> Option<usize> {
+        let idle_slot = self
+            .find_idle_borrowed_slot(folder_id, folder_owner_uid)
+            .await?;
+        let dm = self.download_manager_for(folder_owner_uid).await?;
+
+        {
+            let mut folders_guard = self.folders.write().await;
+            if let Some(folder) = folders_guard.get_mut(folder_id) {
+                folder.borrowed_slot_ids.retain(|&id| id != idle_slot);
+            }
+        }
+        dm.task_slot_pool()
+            .release_borrowed_slot(folder_id, idle_slot)
+            .await;
+
+        info!(
+            "回收：直接释放空闲借调位 slot_id={}（文件夹 {} 借了没用）",
+            idle_slot, folder_id
+        );
+
+        // 🔥 释放槽位后不触发 try_start_waiting_tasks
+        // 因为这个槽位是要给新任务用的，不是给等待队列的
+        Some(idle_slot)
+    }
+
+    /// 🔥 暂停一个占着借调位的子任务，把该借调位腾出来
+    ///
+    /// 失败（没有可暂停的子任务 / 暂停被拒）时返回 `None`，由调用方去试下一个候选文件夹。
+    async fn reclaim_by_pausing_subtask(
+        &self,
+        folder_id: &str,
+        folder_owner_uid: crate::auth::Uid,
+        owner_uid: crate::auth::Uid,
+    ) -> Option<usize> {
+        let folder_id = folder_id.to_string();
         debug_assert_eq!(
             folder_owner_uid, owner_uid,
             "reclaim_borrowed_slot_for_owner: 候选 folder owner 与请求 owner 不一致"
@@ -4336,74 +4938,78 @@ impl FolderDownloadManager {
                 let tasks = dm.get_tasks_by_group(&folder_id).await;
                 let running_task = tasks.iter().find(|t| t.status == TaskStatus::Downloading);
 
-                if let Some(task) = running_task {
-                    info!(
-                        "borrowed_subtask_map 为空，从调度器找到正在运行的子任务: {}",
-                        task.id
-                    );
-                    task.id.clone()
-                } else {
-                    // 确实没有正在运行的子任务，直接释放一个借调位
-                    let borrowed_slots = slot_pool.get_borrowed_slots(&folder_id).await;
-                    if let Some(&slot_id) = borrowed_slots.first() {
-                        slot_pool.release_borrowed_slot(&folder_id, slot_id).await;
-
-                        // 更新文件夹的借调位记录
-                        {
-                            let mut folders_guard = self.folders.write().await;
-                            if let Some(folder) = folders_guard.get_mut(&folder_id) {
-                                folder.borrowed_slot_ids.retain(|&id| id != slot_id);
-                            }
-                        }
-
-                        info!("直接释放空闲借调位: slot_id={} from folder {}", slot_id, folder_id);
-
-                        // 🔥 修复：释放槽位后不触发 try_start_waiting_tasks
-                        // 因为这个槽位是要给新任务用的，不是给等待队列的
-                        // dm.try_start_waiting_tasks().await; // 已移除
-
-                        return Some(slot_id);
-                    }
-                    return None;
-                }
+                let task = running_task?;
+                info!(
+                    "borrowed_subtask_map 为空，从调度器找到正在运行的子任务: {}",
+                    task.id
+                );
+                task.id.clone()
             }
         };
 
-        info!("回收流程：暂停借调子任务 {}", task_id);
+        // 🔥 暂停**之前**先锁定这个子任务占的是哪个借调位
+        //
+        // `pause_task` 内部会走 `release_task_slot_by_kind` → `release_subtask_borrowed_slot`，
+        // 把 `borrowed_subtask_map` 里的映射清掉（只清映射，借调位仍归文件夹所有）。
+        // 等暂停完成后再去查映射就已经没有了 —— 历史实现在这时会退到
+        // `borrowed_slot_ids.first()` 盲选一个，实测（2026-08-21 14:46 日志）
+        // 暂停的是占着槽位 3 的子任务，却把槽位 1 释放了出去，而槽位 1 上的子任务
+        // 还在下载：它就此占着一个已经转让给别人的槽位，活跃任务数 6 > 槽位上限 5。
+        let target_slot: Option<usize> = {
+            let from_map = {
+                let folders_guard = self.folders.read().await;
+                folders_guard
+                    .get(&folder_id)
+                    .and_then(|f| f.borrowed_subtask_map.get(&task_id).copied())
+            };
+            match from_map {
+                Some(slot) => Some(slot),
+                // map 里没有（恢复链路可能没登记）→ 用任务自己记的借调位
+                None => dm
+                    .get_task(&task_id)
+                    .await
+                    .filter(|t| t.is_borrowed_slot)
+                    .and_then(|t| t.slot_id),
+            }
+        };
+
+        let Some(target_slot) = target_slot else {
+            warn!(
+                "子任务 {} 未持有可识别的借调位，跳过该候选（不再盲选 borrowed_slot_ids）",
+                task_id
+            );
+            return None;
+        };
+
+        info!(
+            "回收流程：暂停借调子任务 {}（持有借调位 {}）",
+            task_id, target_slot
+        );
 
         // 暂停子任务（skip_try_start_waiting=true，不触发等待队列启动）
         // 🔥 关键修复：回收借调槽位时，槽位是给新任务预留的，不应让等待队列抢占
         if let Err(e) = dm.pause_task(&task_id, true).await {
-            warn!("暂停任务失败: {}", e);
+            // 典型原因：子任务还卡在 prepare_for_scheduling（Locate + 链接探测）里，
+            // 状态还不是 Downloading。这不是错误，只是这个候选暂时腾不出位置，
+            // 交给调用方去试下一个文件夹。
+            warn!("暂停任务失败（跳过该候选）: {}, task_id: {}", e, task_id);
             return None;
         }
 
         // 等待任务暂停完成（所有运行中分片完成）
         Self::wait_for_task_paused(&dm, &task_id).await;
 
-        // 获取并释放借调位
-        let slot_id = {
+        // 🔥 释放的必须是上面锁定的那个槽位
+        //
+        // 这里**不能**再退回「从 borrowed_slot_ids 取第一个」：那个槽位很可能正被
+        // 同文件夹另一个还在下载的子任务使用，放出去就等于超发。
+        let slot_id = target_slot;
+        {
             let mut folders_guard = self.folders.write().await;
             let folder = folders_guard.get_mut(&folder_id)?;
-
-            // 优先从 borrowed_subtask_map 获取槽位
-            // 如果 map 中没有记录（恢复任务时可能未维护），则从 borrowed_slot_ids 取第一个
-            let slot_id = if let Some(slot_id) = folder.borrowed_subtask_map.remove(&task_id) {
-                slot_id
-            } else if let Some(&slot_id) = folder.borrowed_slot_ids.first() {
-                info!(
-                    "borrowed_subtask_map 中无记录，从 borrowed_slot_ids 取槽位: {}",
-                    slot_id
-                );
-                slot_id
-            } else {
-                warn!("无法获取借调位：borrowed_slot_ids 为空");
-                return None;
-            };
-
+            folder.borrowed_subtask_map.remove(&task_id);
             folder.borrowed_slot_ids.retain(|&id| id != slot_id);
-            slot_id
-        };
+        }
 
         // 释放到任务位池
         slot_pool.release_borrowed_slot(&folder_id, slot_id).await;
@@ -4472,6 +5078,101 @@ impl FolderDownloadManager {
     ///
     /// 返回 true 表示分配成功，false 表示已被占用。
     /// 同一时刻最多只有一个子任务能占用固定槽位。
+    /// 🔥 为「创建时没抢到固定位」的文件夹补发固定位（重试补偿）
+    ///
+    /// 设计上每个文件夹都应保底持有 1 个固定槽位（见创建路径的注释：
+    /// *"这确保了多个文件夹任务之间的公平性：每个文件夹至少能获得一个固定位"*），
+    /// 但那只是**创建时试一次**：抢不到就打一条
+    /// `无法获得固定任务位，将在有空位时重试` 的 warn 然后再也没人重试
+    /// —— [`try_allocate_fixed_slot_for_subtask`] 的注释里把这个缺口写成
+    /// "而且没有任何重试补偿"。
+    ///
+    /// 后果：另一个文件夹只要抢先把槽位借光，后来的文件夹就永远拿不到固定位，
+    /// 它的子任务全部堆在等待队列里空转（实测 2026-08-21 10:06 日志）。
+    ///
+    /// 本方法挂在等待队列监控上（每秒驱动一次），补上那次重试：
+    /// 先直接申请，拿不到就回收一个借调位再申请。
+    ///
+    /// 与创建路径保持一致的两条约束：
+    /// - 只有 Normal 优先级（用户手动发起）才触发回收；Backup（自动备份 / 分享同步）
+    ///   只用空闲槽，不去削减别人已有的并行度
+    /// - 已持有固定位、或文件夹已进入非活跃状态时直接返回，不做任何事
+    ///
+    /// # 返回
+    /// 文件夹当前是否持有固定槽位
+    pub async fn ensure_folder_fixed_slot(&self, folder_id: &str) -> bool {
+        let (owner_uid, backup_config_id) = {
+            let folders_guard = self.folders.read().await;
+            let Some(folder) = folders_guard.get(folder_id) else {
+                return false;
+            };
+            // 已经有固定位，无需补发
+            if folder.fixed_slot_id.is_some() {
+                return true;
+            }
+            // 非活跃状态的文件夹不占槽位
+            if matches!(
+                folder.status,
+                FolderStatus::Paused | FolderStatus::Cancelled | FolderStatus::Failed
+            ) {
+                return false;
+            }
+            (folder.owner_uid, folder.backup_config_id.clone())
+        };
+
+        let Some(dm) = self.download_manager_for(owner_uid).await else {
+            return false;
+        };
+        let slot_pool = dm.task_slot_pool();
+        let slot_priority = folder_slot_priority(backup_config_id.as_deref());
+
+        // 第一次尝试：直接申请
+        let mut allocated = slot_pool
+            .allocate_fixed_slot_with_priority(folder_id, true, slot_priority)
+            .await;
+
+        // 拿不到就回收一个借调位再试（仅 Normal 优先级）
+        if allocated.is_none() && slot_priority == crate::task_slot_pool::TaskPriority::Normal {
+            if let Some(reclaimed) = self.reclaim_borrowed_slot_for_owner(owner_uid).await {
+                info!(
+                    "文件夹 {} 补发固定位：回收到借调位 {}，重新申请",
+                    folder_id, reclaimed
+                );
+                allocated = slot_pool
+                    .allocate_fixed_slot_with_priority(folder_id, true, slot_priority)
+                    .await;
+            }
+        }
+
+        let Some((slot_id, preempted)) = allocated else {
+            return false;
+        };
+
+        {
+            let mut folders_guard = self.folders.write().await;
+            match folders_guard.get_mut(folder_id) {
+                Some(folder) => folder.fixed_slot_id = Some(slot_id),
+                None => {
+                    // 文件夹在申请过程中被删了，归还槽位避免泄漏
+                    drop(folders_guard);
+                    slot_pool.release_fixed_slot(folder_id).await;
+                    return false;
+                }
+            }
+        }
+
+        if let Some(preempted_id) = preempted {
+            info!("文件夹 {} 补发固定位时抢占了槽位持有者 {}", folder_id, preempted_id);
+            dm.handle_preempted_slot_owner(&preempted_id).await;
+        }
+
+        info!(
+            "✅ 文件夹 {} 补发固定任务位成功: slot_id={}（创建时未抢到）",
+            folder_id, slot_id
+        );
+        true
+    }
+
     pub async fn try_allocate_fixed_slot_for_subtask(
         &self,
         folder_id: &str,
@@ -4909,6 +5610,285 @@ mod tests {
             !fm.try_allocate_fixed_slot_for_subtask(&holder_id, "child-3").await,
             "固定位已被占用，不能重复发放给第二个子任务"
         );
+    }
+
+    /// 构造一个挂好 DownloadManager 的 FolderDownloadManager（走 legacy 单账号路径）
+    async fn fm_with_download_manager() -> (FolderDownloadManager, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = crate::auth::UserAuth {
+            uid: 123456789,
+            username: "test_user".to_string(),
+            nickname: None,
+            avatar_url: None,
+            vip_type: Some(2),
+            total_space: None,
+            used_space: None,
+            bduss: "mock_bduss".to_string(),
+            stoken: None,
+            ptoken: None,
+            baiduid: None,
+            passid: None,
+            cookies: None,
+            panpsc: None,
+            csrf_token: None,
+            bdstoken: None,
+            login_time: 0,
+            last_warmup_at: None,
+            custom_config: Default::default(),
+        };
+        let dm = Arc::new(
+            DownloadManager::new(auth, tmp.path().to_path_buf())
+                .await
+                .expect("构造测试 DownloadManager"),
+        );
+        let fm = FolderDownloadManager::new(tmp.path().to_path_buf());
+        fm.set_download_manager(dm).await;
+        (fm, tmp)
+    }
+
+    /// 回收借调位时，必须先释放**没人用**的那些，且绝不能碰正在用的
+    ///
+    /// 回归 2026-08-21 10:06 日志：文件夹借了 4 个位只用 1 个，另外 3 个空转；
+    /// 历史实现只有在 `borrowed_subtask_map` 完全为空时才走「直接释放空闲借调位」，
+    /// 于是这 3 个空位永远回收不掉，同账号第二个文件夹一个槽位都拿不到。
+    #[tokio::test]
+    async fn test_release_idle_borrowed_slot_skips_slots_in_use() {
+        let (fm, _tmp) = fm_with_download_manager().await;
+
+        let mut folder = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        folder.fixed_slot_id = Some(0);
+        folder.borrowed_slot_ids = vec![1, 2, 3, 4];
+        // 只有 1 号位真的有子任务在用
+        folder
+            .borrowed_subtask_map
+            .insert("subtask-on-slot-1".to_string(), 1);
+        let folder_id = folder.id.clone();
+        let owner_uid = folder.owner_uid;
+        {
+            let mut folders = fm.folders.write().await;
+            folders.insert(folder_id.clone(), folder);
+        }
+
+        // 连续回收：2/3/4 应被依次释放，1 号位始终保留
+        let mut released = Vec::new();
+        while let Some(slot) = fm.release_idle_borrowed_slot(&folder_id, owner_uid).await {
+            released.push(slot);
+            assert!(released.len() <= 4, "释放次数失控，可能把在用的位也放了");
+        }
+        released.sort();
+        assert_eq!(released, vec![2, 3, 4], "只应释放没人用的借调位");
+
+        let folders = fm.folders.read().await;
+        assert_eq!(
+            folders.get(&folder_id).unwrap().borrowed_slot_ids,
+            vec![1],
+            "正在被子任务使用的借调位必须保留"
+        );
+    }
+
+    /// 扫描后发现用不了这么多槽位时，多借的要还回去
+    ///
+    /// 借调发生在扫描之前（还不知道有几个文件），一律把空位借光；
+    /// 补任务跑完就该按「存活子任务 + 待下载文件」把多余的还掉。
+    #[tokio::test]
+    async fn test_release_surplus_borrowed_slots_trims_to_actual_need() {
+        let (fm, _tmp) = fm_with_download_manager().await;
+
+        let mut folder = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        folder.fixed_slot_id = Some(0);
+        folder.borrowed_slot_ids = vec![1, 2, 3, 4];
+        // 只有 1 个文件，扫描后 pending 已清空，也没有子任务占着借调位
+        folder.pending_files.clear();
+        let folder_id = folder.id.clone();
+        {
+            let mut folders = fm.folders.write().await;
+            folders.insert(folder_id.clone(), folder);
+        }
+
+        fm.release_surplus_borrowed_slots(&folder_id).await;
+
+        let folders = fm.folders.read().await;
+        assert!(
+            folders.get(&folder_id).unwrap().borrowed_slot_ids.is_empty(),
+            "只有 1 个文件的文件夹不该继续占着 4 个借调位（固定位已够用）"
+        );
+    }
+
+    /// 固定位已被占用时不做搬迁（否则会把两个子任务塞进同一个固定位）
+    #[tokio::test]
+    async fn test_compact_folder_slots_noop_when_fixed_slot_occupied() {
+        let (fm, _tmp) = fm_with_download_manager().await;
+
+        let mut folder = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        folder.fixed_slot_id = Some(1);
+        folder.fixed_slot_subtask = Some("someone-else".to_string());
+        folder.borrowed_slot_ids = vec![2];
+        folder.borrowed_subtask_map.insert("sub".to_string(), 2);
+        let folder_id = folder.id.clone();
+        {
+            let mut folders = fm.folders.write().await;
+            folders.insert(folder_id.clone(), folder);
+        }
+
+        fm.compact_folder_slots(&folder_id).await;
+
+        let folders = fm.folders.read().await;
+        let folder = folders.get(&folder_id).unwrap();
+        assert_eq!(folder.fixed_slot_subtask.as_deref(), Some("someone-else"));
+        assert_eq!(folder.borrowed_slot_ids, vec![2], "不该动借调位");
+        assert_eq!(folder.borrowed_subtask_map.get("sub"), Some(&2));
+    }
+
+    /// 没有子任务真的在用借调位时，不能凭空把固定位标成已占用
+    ///
+    /// 这条守住的是最危险的一种写坏：先占住 `fixed_slot_subtask` 再去找搬迁对象，
+    /// 找不到就必须原样退出，否则文件夹的固定位会被一个不存在的任务永久占住。
+    #[tokio::test]
+    async fn test_compact_folder_slots_noop_without_borrowed_subtask() {
+        let (fm, _tmp) = fm_with_download_manager().await;
+
+        let mut folder = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        folder.fixed_slot_id = Some(1);
+        folder.fixed_slot_subtask = None;
+        // 借调位记在文件夹上，但没有任何存活子任务在用
+        folder.borrowed_slot_ids = vec![2];
+        let folder_id = folder.id.clone();
+        {
+            let mut folders = fm.folders.write().await;
+            folders.insert(folder_id.clone(), folder);
+        }
+
+        fm.compact_folder_slots(&folder_id).await;
+
+        let folders = fm.folders.read().await;
+        let folder = folders.get(&folder_id).unwrap();
+        assert!(
+            folder.fixed_slot_subtask.is_none(),
+            "没找到搬迁对象就必须原样退出，不能把固定位标成已占用"
+        );
+        assert_eq!(folder.borrowed_slot_ids, vec![2]);
+    }
+
+    /// 排队子任务应先复用本文件夹「借来却闲着」的借调位
+    ///
+    /// 回归 2026-08-21 11:17 日志：等待队列里的文件夹子任务只试过文件夹**固定位**，
+    /// 自己借来闲着的位反而没人用，于是 3 个借调位空转、子任务每秒重试却起不来。
+    #[tokio::test]
+    async fn test_queued_subtask_reuses_own_idle_borrowed_slot() {
+        let (fm, _tmp) = fm_with_download_manager().await;
+
+        let mut folder = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        folder.fixed_slot_id = Some(0);
+        // 固定位已被同组第一个子任务占着
+        folder.fixed_slot_subtask = Some("subtask-on-fixed".to_string());
+        folder.borrowed_slot_ids = vec![1, 3, 4];
+        let folder_id = folder.id.clone();
+        {
+            let mut folders = fm.folders.write().await;
+            folders.insert(folder_id.clone(), folder);
+        }
+
+        let got = fm
+            .acquire_borrowed_slot_for_subtask(&folder_id, "queued-subtask")
+            .await;
+        assert!(
+            matches!(got, Some(1) | Some(3) | Some(4)),
+            "应复用已有的空闲借调位，实际 {got:?}"
+        );
+
+        // 已登记映射，后续调用不能把同一个位再发一次
+        let folders = fm.folders.read().await;
+        let folder = folders.get(&folder_id).unwrap();
+        assert_eq!(
+            folder.borrowed_subtask_map.get("queued-subtask"),
+            got.as_ref()
+        );
+        // 没有凭空多借
+        assert_eq!(folder.borrowed_slot_ids.len(), 3);
+    }
+
+    /// 同一个借调位不能同时发给两个排队子任务
+    #[tokio::test]
+    async fn test_borrowed_slot_not_handed_out_twice() {
+        let (fm, _tmp) = fm_with_download_manager().await;
+
+        let mut folder = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        folder.fixed_slot_id = Some(0);
+        folder.fixed_slot_subtask = Some("subtask-on-fixed".to_string());
+        folder.borrowed_slot_ids = vec![1];
+        let folder_id = folder.id.clone();
+        {
+            let mut folders = fm.folders.write().await;
+            folders.insert(folder_id.clone(), folder);
+        }
+
+        let first = fm
+            .acquire_borrowed_slot_for_subtask(&folder_id, "sub-1")
+            .await;
+        assert_eq!(first, Some(1));
+
+        // 池子是空的（测试里没有真正借到新槽），第二个子任务应拿不到
+        let second = fm
+            .acquire_borrowed_slot_for_subtask(&folder_id, "sub-2")
+            .await;
+        assert_ne!(second, Some(1), "同一个借调位不能重复发放");
+    }
+
+    /// 已暂停 / 已取消的文件夹不该去抢借调位
+    #[tokio::test]
+    async fn test_acquire_borrowed_slot_skips_inactive_folder() {
+        let (fm, _tmp) = fm_with_download_manager().await;
+
+        let mut folder = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        folder.status = FolderStatus::Cancelled;
+        folder.borrowed_slot_ids = vec![1, 2];
+        let folder_id = folder.id.clone();
+        {
+            let mut folders = fm.folders.write().await;
+            folders.insert(folder_id.clone(), folder);
+        }
+
+        assert_eq!(
+            fm.acquire_borrowed_slot_for_subtask(&folder_id, "sub").await,
+            None
+        );
+    }
+
+    /// 已暂停 / 已取消的文件夹不该去抢固定位
+    #[tokio::test]
+    async fn test_ensure_folder_fixed_slot_skips_inactive_folder() {
+        let (fm, _tmp) = fm_with_download_manager().await;
+
+        let mut folder = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        folder.fixed_slot_id = None;
+        folder.status = FolderStatus::Paused;
+        let folder_id = folder.id.clone();
+        {
+            let mut folders = fm.folders.write().await;
+            folders.insert(folder_id.clone(), folder);
+        }
+
+        assert!(!fm.ensure_folder_fixed_slot(&folder_id).await);
+        let folders = fm.folders.read().await;
+        assert!(folders.get(&folder_id).unwrap().fixed_slot_id.is_none());
+    }
+
+    /// 已持有固定位时直接返回 true，不重复申请
+    #[tokio::test]
+    async fn test_ensure_folder_fixed_slot_is_noop_when_already_held() {
+        let (fm, _tmp) = fm_with_download_manager().await;
+
+        let mut folder = FolderDownload::new("/a".into(), PathBuf::from("./a"));
+        folder.fixed_slot_id = Some(3);
+        let folder_id = folder.id.clone();
+        {
+            let mut folders = fm.folders.write().await;
+            folders.insert(folder_id.clone(), folder);
+        }
+
+        assert!(fm.ensure_folder_fixed_slot(&folder_id).await);
+        let folders = fm.folders.read().await;
+        assert_eq!(folders.get(&folder_id).unwrap().fixed_slot_id, Some(3));
     }
 
     /// 文件夹不存在时不发放（防御性路径，避免误判为「拿到了槽位」）

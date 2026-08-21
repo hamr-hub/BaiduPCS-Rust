@@ -102,7 +102,8 @@
       <el-breadcrumb separator="/">
         <el-breadcrumb-item
             v-for="(crumb, index) in breadcrumbs"
-            :key="index"
+            :key="crumb.path"
+            :class="{ 'is-last': index === breadcrumbs.length - 1 }"
             @click.stop="handleCrumbClick(crumb.path)"
         >
           <span class="crumb-item" :class="{ 'is-current': index === breadcrumbs.length - 1 }">
@@ -444,6 +445,15 @@ watch(() => props.currentPath, () => {
 .breadcrumb-overlay :deep(.el-breadcrumb) {
   font-size: 13px;
   white-space: nowrap;
+}
+
+/* 不依赖 :last-child 结构伪类控制分隔符，避免层级增删后 "/" 残留 display:none */
+.breadcrumb-overlay :deep(.el-breadcrumb__item:not(.is-last) .el-breadcrumb__separator) {
+  display: inline-block;
+}
+
+.breadcrumb-overlay :deep(.el-breadcrumb__item.is-last .el-breadcrumb__separator) {
+  display: none;
 }
 
 .crumb-item {

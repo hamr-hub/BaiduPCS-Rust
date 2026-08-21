@@ -11,13 +11,14 @@
       <!-- 路径面包屑 -->
       <div class="breadcrumb">
         <el-breadcrumb separator="/">
-          <el-breadcrumb-item @click="navigateTo('/')">
+          <el-breadcrumb-item :class="{ 'is-last': pathParts.length === 0 }" @click="navigateTo('/')">
             <el-icon><HomeFilled /></el-icon>
             <span>根目录</span>
           </el-breadcrumb-item>
           <el-breadcrumb-item
               v-for="(part, index) in pathParts"
-              :key="index"
+              :key="getPathUpTo(index)"
+              :class="{ 'is-last': index === pathParts.length - 1 }"
               @click="navigateTo(getPathUpTo(index))"
           >{{ part }}</el-breadcrumb-item>
         </el-breadcrumb>
@@ -333,6 +334,15 @@ defineExpose({ reload })
 
 .breadcrumb :deep(.el-breadcrumb__item) {
   cursor: pointer;
+}
+
+/* 不依赖 :last-child 结构伪类控制分隔符，避免层级增删后 "/" 残留 display:none */
+.breadcrumb :deep(.el-breadcrumb__item:not(.is-last) .el-breadcrumb__separator) {
+  display: inline-block;
+}
+
+.breadcrumb :deep(.el-breadcrumb__item.is-last .el-breadcrumb__separator) {
+  display: none;
 }
 
 .current-path {

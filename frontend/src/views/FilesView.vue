@@ -3,22 +3,20 @@
     <!-- 面包屑导航 -->
     <div class="breadcrumb-bar">
       <el-breadcrumb separator="/">
-        <el-breadcrumb-item
-            :class="{ 'is-last': pathParts.length === 0 }"
-            @click="navigateToDir('/')"
-        >
-          <el-icon>
-            <HomeFilled/>
-          </el-icon>
-          <span v-if="!isMobile">根目录</span>
+        <el-breadcrumb-item :class="{ 'is-last': pathParts.length === 0 }">
+          <span class="crumb-link" @click="navigateToDir('/')">
+            <el-icon>
+              <HomeFilled/>
+            </el-icon>
+            <span v-if="!isMobile">根目录</span>
+          </span>
         </el-breadcrumb-item>
         <el-breadcrumb-item
             v-for="(part, index) in pathParts"
             :key="getPathUpTo(index)"
             :class="{ 'is-last': index === pathParts.length - 1 }"
-            @click="navigateToDir(getPathUpTo(index))"
         >
-          {{ part }}
+          <span class="crumb-link" @click="navigateToDir(getPathUpTo(index))">{{ part }}</span>
         </el-breadcrumb-item>
       </el-breadcrumb>
 
@@ -1782,8 +1780,14 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
     display: none;
   }
 
+  // 点击热区放在层级文字上，分隔符不参与点击
+  .crumb-link {
+    display: inline-flex;
+    align-items: center;
+  }
+
   // 非当前层级的路径可点击跳转，给出手型指针与悬停高亮
-  :deep(.el-breadcrumb__item:not(.is-last) .el-breadcrumb__inner) {
+  :deep(.el-breadcrumb__item:not(.is-last)) .crumb-link {
     cursor: pointer;
 
     &:hover {

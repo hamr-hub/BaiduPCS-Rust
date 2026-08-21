@@ -148,7 +148,7 @@
           </div>
 
           <!-- 进行中子任务（内联展示，无需展开；转存段 / 下载段各自独立进度条） -->
-          <div v-else-if="subtasksOf(s.id).length" class="active-task-container">
+          <div v-else-if="topSubtasksOf(s.id).length" class="active-task-container">
             <div class="active-task-card">
               <div class="task-progress-header is-toggle" @click.stop="toggleSubtasks(s.id)">
                 <div class="task-status-info">
@@ -156,7 +156,7 @@
                   <el-icon v-if="isWaitingForSlot(s.id)" :size="16" class="status-icon text-gray-400"><Clock /></el-icon>
                   <el-icon v-else :size="16" class="status-icon text-blue-500"><Loading class="is-loading" /></el-icon>
                   <span class="task-status-text">
-                    {{ isWaitingForSlot(s.id) ? '等待中' : '进行中子任务' }}（{{ subtasksOf(s.id).length }}）
+                    {{ isWaitingForSlot(s.id) ? '等待中' : '进行中子任务' }}（{{ topSubtasksOf(s.id).length }}）
                   </span>
                 </div>
                 <el-icon :size="14" class="toggle-icon">
@@ -180,6 +180,43 @@
                       :show-text="false"
                       :status="subtaskProgressStatus(st.status)"
                   />
+
+                  <!-- 文件夹聚合行：展开后逐个显示它当前正在下载的子文件。
+                       只有已物化的那一批有进度（其余文件还在后端 pending 队列里），
+                       所以这里刻意用「正在下载 N 个文件」而不是「共 N 个文件」。 -->
+                  <template v-if="childrenOf(s.id, st.task_id).length">
+                    <div class="child-toggle" @click.stop="toggleChildren(st.task_id)">
+                      <el-icon :size="12" class="toggle-icon">
+                        <ArrowDown v-if="childrenExpanded(st.task_id)" />
+                        <ArrowRight v-else />
+                      </el-icon>
+                      <span>正在下载 {{ childrenOf(s.id, st.task_id).length }} 个文件</span>
+                    </div>
+                    <div v-if="childrenExpanded(st.task_id)" class="child-list">
+                      <div
+                          v-for="c in childrenCapped(s.id, st.task_id)"
+                          :key="c.task_id"
+                          class="subtask-item child-item"
+                      >
+                        <div class="subtask-head">
+                          <span class="file-name" :title="c.name">{{ c.name }}</span>
+                          <span class="subtask-stat">{{ subtaskStat(c) }}</span>
+                          <el-tag :type="subtaskStatusColor(c.status)" size="small">
+                            {{ subtaskStatusText(c.status) }}
+                          </el-tag>
+                        </div>
+                        <el-progress
+                            :percentage="clampPercent(c.progress)"
+                            :stroke-width="4"
+                            :show-text="false"
+                            :status="subtaskProgressStatus(c.status)"
+                        />
+                      </div>
+                      <div v-if="childrenOverflow(s.id, st.task_id) > 0" class="subtask-overflow">
+                        仅显示前 {{ CHILD_RENDER_CAP }} 个，另有 {{ childrenOverflow(s.id, st.task_id) }} 个在下载…
+                      </div>
+                    </div>
+                  </template>
                 </div>
                 <div v-if="subtasksOverflow(s.id) > 0" class="subtask-overflow">
                   仅显示前 {{ SUBTASK_RENDER_CAP }} 个，另有 {{ subtasksOverflow(s.id) }} 个进行中…
@@ -536,6 +573,31 @@ function subtasksOf(id: string): ShareSyncSubtask[] {
 }
 
 /**
+ * 顶层子任务行（转存段 / 单文件下载 / 文件夹聚合行），文件夹的子文件不算在内。
+ *
+ * 用它而不是裸的 `subtasksOf` 做计数和「等待槽位」判定：子文件行是同一批工作的
+ * 更细粒度视图，混进来会把「进行中子任务（1）」显示成（6），也会让
+ * `isWaitingForSlot` 把文件夹和它的子任务重复计一遍。
+ *
+ * **孤儿兜底**：父行不在列表里的子行提升为顶层。REST 快照由后端
+ * `drop_orphan_children` 保证自洽，但 WS 是增量的——父行到终态被 `upsertSubtask`
+ * 移除后，子行可能还在 map 里。不兜底的话这些行会从界面上凭空消失。
+ */
+function topSubtasksOf(id: string): ShareSyncSubtask[] {
+  const list = subtasksOf(id)
+  if (list.length === 0) return list
+  const ids = new Set(list.map(st => st.task_id))
+  return list.filter(st => !st.parent_task_id || !ids.has(st.parent_task_id))
+}
+
+/** 某个文件夹聚合行当前已物化的子文件行（按名称稳定排序，避免每帧乱跳） */
+function childrenOf(id: string, parentTaskId: string): ShareSyncSubtask[] {
+  return subtasksOf(id)
+      .filter(st => st.parent_task_id === parentTaskId)
+      .sort((a, b) => a.name.localeCompare(b.name))
+}
+
+/**
  * 转存段真正在干活的状态。
  *
  * 注意不含 `downloading`：转存任务在下载阶段会被标成 `TransferStatus::Downloading`，
@@ -557,7 +619,7 @@ const TRANSFER_ACTIVE = new Set(['checkingshare', 'transferring', 'cleaning'])
  * 有进展，只是进展不在下载段。
  */
 function isWaitingForSlot(id: string): boolean {
-  const list = subtasksOf(id).filter(st => !SUBTASK_TERMINAL.has(st.status))
+  const list = topSubtasksOf(id).filter(st => !SUBTASK_TERMINAL.has(st.status))
   if (list.some(st => st.kind === 'transfer' && TRANSFER_ACTIVE.has(st.status))) return false
   const downloads = list.filter(st => st.kind === 'download')
   return downloads.length > 0 && downloads.every(st => st.status === 'pending')
@@ -646,10 +708,37 @@ function toggleSubtasks(id: string) {
 // 展开时也只渲染前 N 行（避免上千个 el-progress 撑爆 DOM），其余用计数提示。
 const SUBTASK_RENDER_CAP = 200
 function subtasksCapped(id: string): ShareSyncSubtask[] {
-  return subtasksOf(id).slice(0, SUBTASK_RENDER_CAP)
+  return topSubtasksOf(id).slice(0, SUBTASK_RENDER_CAP)
 }
 function subtasksOverflow(id: string): number {
-  return Math.max(0, subtasksOf(id).length - SUBTASK_RENDER_CAP)
+  return Math.max(0, topSubtasksOf(id).length - SUBTASK_RENDER_CAP)
+}
+
+/**
+ * 文件夹子文件行的渲染上限。
+ *
+ * 正常情况下后端只会吐出「已物化」的那一批（约等于下载槽位数，个位数），这个上限
+ * 是防御性的：多文件夹并发 + 借调槽位时条数会涨，不设上限的话嵌套列表可能把卡片撑爆。
+ */
+const CHILD_RENDER_CAP = 50
+function childrenCapped(id: string, parentTaskId: string): ShareSyncSubtask[] {
+  return childrenOf(id, parentTaskId).slice(0, CHILD_RENDER_CAP)
+}
+function childrenOverflow(id: string, parentTaskId: string): number {
+  return Math.max(0, childrenOf(id, parentTaskId).length - CHILD_RENDER_CAP)
+}
+
+// 文件夹子文件列表默认折叠：一个订阅可能同时跑多个文件夹，全展开会很吵。
+// 按 `task_id`（folder:{id}）记忆展开态，与订阅级的 `expandedSubtasks` 相互独立。
+const expandedChildren = ref<Set<string>>(new Set())
+function childrenExpanded(parentTaskId: string): boolean {
+  return expandedChildren.value.has(parentTaskId)
+}
+function toggleChildren(parentTaskId: string) {
+  const next = new Set(expandedChildren.value)
+  if (next.has(parentTaskId)) next.delete(parentTaskId)
+  else next.add(parentTaskId)
+  expandedChildren.value = next
 }
 
 // 某订阅所属账号是否已登录（卡片级触发同步前置条件）
@@ -1527,6 +1616,12 @@ function upsertSubtask(sid: string, st: ShareSyncSubtask) {
   const idx = list.findIndex(x => x.task_id === st.task_id)
   if (SUBTASK_TERMINAL.has(st.status)) {
     if (idx >= 0) list.splice(idx, 1)
+    // 父行走了，它的子行必须跟着走：后端对终态文件夹不再吐子行（见
+    // `collect_subtasks_impl`），这些残留子行永远等不到下一帧更新，不清掉就会
+    // 以孤儿形态挂在卡片上不消失。
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].parent_task_id === st.task_id) list.splice(i, 1)
+    }
   } else if (idx >= 0) {
     list[idx] = st
   } else {
@@ -1632,6 +1727,7 @@ onMounted(async () => {
         progress: evt.progress,
         speed: evt.speed,
         eta_seconds: evt.eta_seconds ?? null,
+        parent_task_id: evt.parent_task_id ?? null,
         owner_uid: evt.owner_uid ?? 0,
       })
       return
@@ -1869,6 +1965,36 @@ onUnmounted(() => {
     min-width: 0;
   }
   .subtask-stat { font-size: 12px; color: #909399; flex-shrink: 0; }
+}
+
+// ===== 文件夹子文件进度（嵌套一层） =====
+// 文件夹聚合行下面的展开开关；点击不冒泡到订阅级的折叠开关。
+.child-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: #909399;
+  cursor: pointer;
+  user-select: none;
+  &:hover { color: #409eff; }
+  .toggle-icon { flex-shrink: 0; }
+}
+.child-list {
+  // 左侧竖线 + 缩进：一眼看出这些行从属于上面那个文件夹，而不是同级子任务
+  margin: 4px 0 2px 10px;
+  padding-left: 10px;
+  border-left: 2px solid #ebeef5;
+}
+.child-item {
+  padding: 6px 0;
+  border-bottom: none;
+  .subtask-head {
+    margin-bottom: 4px;
+    .file-name { font-size: 12px; color: #606266; }
+    .subtask-stat { font-size: 11px; }
+  }
 }
 
 // ===== 抓取（递归列目录）阶段进度 =====

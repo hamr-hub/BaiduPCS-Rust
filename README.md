@@ -797,6 +797,31 @@ open http://localhost:18888
 
 </details>
 
+### macOS 使用预编译包
+
+从 [Releases](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 下载对应架构的压缩包（Apple Silicon 选 `macos-arm64`，Intel 选 `macos-x86_64`）：
+
+```bash
+# 1. 解压（以 v2.2.0 为例）
+unzip BaiduPCS-Rust-v2.2.0-macos-arm64.zip
+cd BaiduPCS-Rust-v2.2.0-macos-arm64
+
+# 2. 解除 Gatekeeper 隔离标记（必需）
+xattr -dr com.apple.quarantine .
+
+# 3. 启动（必须在解压目录内运行）
+./baidu-netdisk-rust
+```
+
+然后浏览器访问 http://localhost:18888
+
+> ⚠️ **两个注意点**
+> - 预编译二进制未做 Apple 签名与公证，**跳过第 2 步会报「已损坏，无法打开」**。若仍被拦截，可在「系统设置 → 隐私与安全性」中点击「仍要打开」。
+> - 程序按**当前工作目录**读取 `config/app.toml`，因此必须 `cd` 进解压目录后再启动，不要把二进制单独拷到 `/usr/local/bin` 等位置。
+
+macOS 同样可以使用上面的 Docker 方式部署，配置与数据目录持久化更方便。
+
+
 ### 手动安装
 
 #### 前提条件

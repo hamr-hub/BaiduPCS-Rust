@@ -3,7 +3,10 @@
     <!-- 面包屑导航 -->
     <div class="breadcrumb-bar">
       <el-breadcrumb separator="/">
-        <el-breadcrumb-item @click="navigateToDir('')">
+        <el-breadcrumb-item
+            :class="{ 'is-last': pathParts.length === 0 }"
+            @click="navigateToDir('')"
+        >
           <el-icon>
             <HomeFilled/>
           </el-icon>
@@ -11,7 +14,8 @@
         </el-breadcrumb-item>
         <el-breadcrumb-item
             v-for="(part, index) in pathParts"
-            :key="index"
+            :key="getPathUpTo(index)"
+            :class="{ 'is-last': index === pathParts.length - 1 }"
             @click="navigateToDir(getPathUpTo(index))"
         >
           {{ part }}
@@ -326,8 +330,17 @@ export { Folder, Document, Refresh, HomeFilled, Loading, Delete } from '@element
   background: white;
   gap: 12px;
 
+  // 同 FilesView：不依赖 :last-child 结构伪类，避免层级增删后分隔符残留 display:none
+  :deep(.el-breadcrumb__item:not(.is-last) .el-breadcrumb__separator) {
+    display: inline-block;
+  }
+
+  :deep(.el-breadcrumb__item.is-last .el-breadcrumb__separator) {
+    display: none;
+  }
+
   // 非当前层级的路径可点击跳转，给出手型指针与悬停高亮
-  :deep(.el-breadcrumb__item:not(:last-child) .el-breadcrumb__inner) {
+  :deep(.el-breadcrumb__item:not(.is-last) .el-breadcrumb__inner) {
     cursor: pointer;
 
     &:hover {

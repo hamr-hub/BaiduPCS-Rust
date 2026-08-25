@@ -277,7 +277,15 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 ## 📋 最新版本
 
-### v2.2.1 (当前版本)
+### v2.2.2 (当前版本)
+
+**维护版本**：修复**5~10MB 文件必然下载失败**（自 `v2.1.2` 起的回归，建议所有用户升级）与**小文件进度条停在中途**。
+
+**问题修复：**
+- 🐛 **下载·5~10MB 文件必然 403**：`v2.1.2` 起 ≤10MB 的文件被一律压成单分片，Range 跨度超过百度单请求 5MB 硬限，5~10MB 的文件每个链接都返回 403（errno 31326），换链接重试都没用。现分片尺寸统一收口，小文件仍尽量单片，但同时受 5MB 硬限与会员等级上限裁剪（普通用户 4MB、SVIP 5MB），不会退回旧版 256KB/512KB 的请求碎片
+- 🐛 **下载·小文件进度条停在中途**：进度事件带 200ms 节流，收尾那一帧多半被丢掉，任务标完成时进度条却停在最后一次采样上（小文件尤其明显，肉眼可见地卡在 86% 之类）。现完成事件自带最终字节数，主列表与文件夹详情弹窗的子任务行统一推到 100%；老后端不带该字段时自动回退，新旧前后端可混搭
+
+### v2.2.1
 
 **维护版本**：在 `v2.2.0` 基础上聚焦**分享同步可观测性与自愈**、**下载槽位/调度正确性**，以及**路径栏交互**。
 
@@ -818,9 +826,9 @@ open http://localhost:18888
 从 [Releases](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 下载对应架构的压缩包（Apple Silicon 选 `macos-arm64`，Intel 选 `macos-x86_64`）：
 
 ```bash
-# 1. 解压（以 v2.2.1 为例）
-unzip BaiduPCS-Rust-v2.2.1-macos-arm64.zip
-cd BaiduPCS-Rust-v2.2.1-macos-arm64
+# 1. 解压（以 v2.2.2 为例）
+unzip BaiduPCS-Rust-v2.2.2-macos-arm64.zip
+cd BaiduPCS-Rust-v2.2.2-macos-arm64
 
 # 2. 解除 Gatekeeper 隔离标记（必需）
 xattr -dr com.apple.quarantine .

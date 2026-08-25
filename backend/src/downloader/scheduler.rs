@@ -1557,6 +1557,10 @@ impl ChunkScheduler {
             Completed {
                 group_id: Option<String>,
                 is_backup: bool,
+                /// mark_completed 已把 downloaded_size 推到 total_size，这里顺手带出去，
+                /// 免得消费方停在被节流丢掉的最后一帧进度上
+                downloaded_size: u64,
+                total_size: u64,
             },
             Failed {
                 group_id: Option<String>,
@@ -1594,13 +1598,15 @@ impl ChunkScheduler {
                 CompletionOutcome::Completed {
                     group_id: t.group_id.clone(),
                     is_backup: t.is_backup,
+                    downloaded_size: t.downloaded_size,
+                    total_size: t.total_size,
                 }
             };
             (outcome, owner_uid_raw)
         };
 
         // Stale 分支：跳过一切终态副作用，任务保持当前状态等用户恢复或新协程接手
-        let (group_id, is_backup, decrypt_error) = match outcome {
+        let (group_id, is_backup, decrypt_error, final_sizes) = match outcome {
             CompletionOutcome::Stale => {
                 info!(
                     "任务 {} 解密协程结束但已被暂停或被新协程接替（my_epoch={}），\
@@ -1615,12 +1621,14 @@ impl ChunkScheduler {
                 error_msg,
             } => {
                 error!("任务 {} 解密失败: {}", task_id, error_msg);
-                (group_id, is_backup, Some(error_msg))
+                (group_id, is_backup, Some(error_msg), (0, 0))
             }
             CompletionOutcome::Completed {
                 group_id,
                 is_backup,
-            } => (group_id, is_backup, None),
+                downloaded_size,
+                total_size,
+            } => (group_id, is_backup, None, (downloaded_size, total_size)),
         };
 
         // 发布任务事件
@@ -1643,6 +1651,8 @@ impl ChunkScheduler {
                         TaskEvent::Download(DownloadEvent::Completed {
                             task_id: task_id.to_string(),
                             completed_at: chrono::Utc::now().timestamp_millis(),
+                            downloaded_size: final_sizes.0,
+                            total_size: final_sizes.1,
                             group_id: group_id.clone(),
                             is_backup,
 

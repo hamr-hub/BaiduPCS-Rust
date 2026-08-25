@@ -53,6 +53,15 @@ export interface DownloadEventCompleted {
   event_type: 'completed'
   task_id: string
   completed_at: number
+  /**
+   * 完成时的最终字节数（= total_size）。
+   *
+   * progress 事件带 200ms 节流，收尾那一帧多半被丢掉，所以进度条要用这里的终值推到
+   * 100%，而不是停在最后一次采样上（小文件尤其明显，会卡在 86% 之类）。
+   * 老后端不带这两个字段，消费方需回退到 total_size。
+   */
+  downloaded_size?: number
+  total_size?: number
   group_id?: string
   owner_uid?: number
 }

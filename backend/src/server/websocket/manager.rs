@@ -971,6 +971,8 @@ mod tests {
         let event = TaskEvent::Download(DownloadEvent::Completed {
             task_id: "test-1".to_string(),
             completed_at: 0,
+            downloaded_size: 0,
+            total_size: 0,
             group_id: None,
             is_backup: false,
 

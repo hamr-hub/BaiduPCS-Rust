@@ -87,6 +87,15 @@ pub enum DownloadEvent {
     Completed {
         task_id: String,
         completed_at: i64,
+        /// 完成时的最终字节数（= `total_size`）
+        ///
+        /// 进度事件带 200ms 节流，收尾那一帧多半会被丢掉，所以完成事件必须自带终值，
+        /// 消费方才能把进度条推到 100%，而不是停在最后一次侥幸发出去的采样上
+        /// （小文件尤其明显：200ms 内下掉的量占比大，肉眼可见地卡在 86% 之类）。
+        #[serde(default)]
+        downloaded_size: u64,
+        #[serde(default)]
+        total_size: u64,
         group_id: Option<String>,
         /// 是否为自动备份任务
         #[serde(default)]
@@ -1405,6 +1414,8 @@ mod tests {
         let completed = DownloadEvent::Completed {
             task_id: "1".to_string(),
             completed_at: 0,
+            downloaded_size: 0,
+            total_size: 0,
             group_id: None,
             is_backup: false,
             owner_uid: None,

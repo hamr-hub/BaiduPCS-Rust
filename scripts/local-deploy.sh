@@ -127,6 +127,17 @@ case "$BACKEND_PROFILE" in
         BACKEND_BIN="$BACKEND_DIR/target/release/$BACKEND_BIN_NAME"
         BACKEND_CARGO_ARGS="build --release"
         ;;
+esac
+
+# 🔥 跟随 backend/.cargo/config.toml 里的 [build] target-dir 设置。
+# 本仓库维护者把 target-dir 重定向到仓外（如 `/home/hyx/codespace/.cargo-target/...`），
+# 不读 config 就只能找到空仓库内 target dir、报错 "未找到后端二进制"。
+# 用 `cargo metadata` 解析真实 target_directory —— 比静态读 .toml 更稳。
+CARGO_TARGET_DIR_RAW="$(cd "$BACKEND_DIR" && cargo metadata --no-deps --format-version=1 2>/dev/null \
+    | grep -oE '"target_directory":"[^"]*"' | head -1 | cut -d'"' -f4)"
+case "$BACKEND_PROFILE" in
+    debug)   : ;;
+    release) : ;;
     *)
         echo -e "${RED}未知后端构建 profile: $BACKEND_PROFILE${NC}"
         exit 1
@@ -138,6 +149,16 @@ log()   { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $*"; }
 ok()    { echo -e "${GREEN}✅ $*${NC}"; }
 warn()  { echo -e "${YELLOW}⚠️  $*${NC}"; }
 err()   { echo -e "${RED}❌ $*${NC}"; }
+
+# 🔥 跟随 backend/.cargo/config.toml 里的 [build] target-dir 重写 BACKEND_BIN。
+# 必须在 `log()` 定义之后 —— 否则引用未定义函数。
+if [ -n "$CARGO_TARGET_DIR_RAW" ]; then
+    case "$BACKEND_PROFILE" in
+        debug)   BACKEND_BIN="$CARGO_TARGET_DIR_RAW/debug/$BACKEND_BIN_NAME" ;;
+        release) BACKEND_BIN="$CARGO_TARGET_DIR_RAW/release/$BACKEND_BIN_NAME" ;;
+    esac
+    log "🔍 检测到 cargo target-dir 重定向: $CARGO_TARGET_DIR_RAW (BACKEND_BIN=$BACKEND_BIN)"
+fi
 
 is_running() {
     local pid_file="$1"

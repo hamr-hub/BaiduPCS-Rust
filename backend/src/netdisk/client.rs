@@ -4582,6 +4582,42 @@ impl NetdiskClient {
         let body = self.filemanager_post("rename", &filelist_json).await?;
         self.handle_filemanager_result(&body).await
     }
+
+    /// 拉取网盘根目录最近变动的文件（用于 `RecentWatcher` 做 diff）
+    ///
+    /// 🔥 关键背景：百度个人网盘**没有**服务端事件推送 webhook——
+    /// 一个文件被任何客户端上传/移动/重命名后，本应用只能主动轮询。
+    /// 这里的"recent"用最朴素的办法实现：列根目录 `/`，
+    /// 委托排序 `time desc` 给百度服务端，按 `top_n` 截取。
+    ///
+    /// 参数：
+    /// - `top_n`：最多取多少条（默认 100，watcher 一般用 50~200）
+    /// - `start`：分页起点（默认 0；百度分页偏移为 0 基）
+    ///
+    /// 注意：这是**根目录**列表。子目录里的变动**不会**被本接口发现。
+    /// 范围局限性是已知妥协 —— 要更深就得递归，递归会增加 N 倍的 QPS 风险。
+    /// 用户若要全网盘感知，应配置 share-sync 把关注目录挂上去，二分 + 增量都在那个路径里。
+    pub async fn list_recent_files(&self, top_n: u32, start: u32) -> Result<FileListResponse> {
+        // 单页 size 与 top_n 取较大者；start 处理分页
+        let page_size = top_n.max(200);
+        let resp = self
+            .get_file_list_ordered("/", 1, page_size, "time", true)
+            .await?;
+        // 偏移截取（手动展开：FileListResponse 没 derive Clone 不能 `..resp`）
+        let list: Vec<crate::netdisk::types::FileItem> = if start as usize >= resp.list.len() {
+            Vec::new()
+        } else {
+            let end = (start as usize + top_n as usize).min(resp.list.len());
+            resp.list[start as usize..end].to_vec()
+        };
+        Ok(FileListResponse {
+            errno: resp.errno,
+            errmsg: resp.errmsg,
+            list,
+            guid: resp.guid,
+            guid_info: resp.guid_info,
+        })
+    }
 }
 
 /// 校验文件名合法性（前后端共用规则）

@@ -1095,6 +1095,14 @@ pub enum TaskEvent {
     /// 分享同步事件
     #[serde(rename = "share_sync")]
     ShareSync(crate::share_sync::events::ShareSyncEvent),
+    /// 系统级事件（远端文件变动等非任务类通知）
+    ///
+    /// 🔥 与 `Download`/`Upload` 等以任务为中心的事件不同——本事件**没有** task_id 概念，
+    /// 而是带网盘对象标识 `fs_id`。`task_id()` 返回 `"system"`，方便客户端按 `category`=
+    /// `"system"` 路由到「网盘新文件」专用更新（如刷新文件列表、弹气泡）。`priority()`
+    /// 走 `High`：前端要在不打断用户操作的前提下立刻响应。
+    #[serde(rename = "system")]
+    System(SystemEvent),
 }
 
 impl TaskEvent {
@@ -1114,6 +1122,7 @@ impl TaskEvent {
             TaskEvent::Scan(e) => e.task_id(),
             TaskEvent::Account(_) => "account",
             TaskEvent::ShareSync(e) => e.subscription_id(),
+            TaskEvent::System(_) => "system",
         }
     }
 
@@ -1162,6 +1171,8 @@ impl TaskEvent {
             TaskEvent::Scan(e) => e.priority(),
             TaskEvent::Account(_) => EventPriority::High,
             TaskEvent::ShareSync(_) => EventPriority::Medium,
+            // 系统级远端文件变动：让前端在不打断用户操作的前提下尽快响应
+            TaskEvent::System(_) => EventPriority::High,
         }
     }
 
@@ -1177,6 +1188,7 @@ impl TaskEvent {
             TaskEvent::Scan(_) => "scan",
             TaskEvent::Account(_) => "account",
             TaskEvent::ShareSync(_) => "share_sync",
+            TaskEvent::System(_) => "system",
         }
     }
 
@@ -1192,6 +1204,7 @@ impl TaskEvent {
             TaskEvent::Scan(e) => e.event_type_name(),
             TaskEvent::Account(e) => e.event_type_name(),
             TaskEvent::ShareSync(e) => e.event_type_name(),
+            TaskEvent::System(e) => e.event_type_name(),
         }
     }
 
@@ -1258,6 +1271,8 @@ impl TaskEvent {
             TaskEvent::Scan(_) => false,
             TaskEvent::Account(_) => false,
             TaskEvent::ShareSync(_) => false,
+            // 系统级事件不属于"备份"语义，按下载/上传之外的杂类处理
+            TaskEvent::System(_) => false,
         }
     }
 }
@@ -1361,6 +1376,53 @@ impl BudgetEvent {
         match self {
             BudgetEvent::BudgetRecomputed { .. } => "budget_recomputed",
             BudgetEvent::UsageSnapshot { .. } => "usage_snapshot",
+        }
+    }
+}
+
+// ============================================================================
+// 系统级事件（远端文件变动通知，非任务型）
+// ============================================================================
+
+/// 系统级事件——不属于任何"任务"概念，由后台服务（如 `RecentWatcher`）发射。
+///
+/// 目前只有 "远端文件变动通知" 一种 variant，后续要扩（如 "账号风控提醒"、
+/// "存储空间不足" 等）也只在这加，主链路 `TaskEvent::task_id()` 返回 `"system"` 兜底不变。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event_type", rename_all = "snake_case")]
+pub enum SystemEvent {
+    /// 网盘远端出现新文件 / 已知文件 mtime 变化 / 之前未知的文件落库。
+    ///
+    /// 🔥 跟 `TaskEvent` 派生的下载/上传事件**没有任何关系**：本事件是「别人动了你的网盘」
+    /// —— 比如网页端、官方 App、朋友共享后通过分享转存来的文件、scp-cli 同步脚本等。
+    /// 用途：驱动前端文件列表「新着」徽标 + 自动 revalidate 当前目录缓存。
+    ///
+    /// 🔥 使用方要意识到 `RecentWatcher` 的实现局限性：
+    /// 1. 只扫根 `/` —— 子目录里的变化**不会被发现**
+    /// 2. 采用 fs_id 集合缓存，相同 fs_id 在 `RecentWatcher::same_fs_throttle` 窗口内不重报
+    /// 3. 不保证顺序（百度服务端排序），前端要按 `server_mtime` 自排
+    RemoteFileChanged {
+        /// 百度网盘 fs_id（同一文件稳定，去重主键）
+        fs_id: u64,
+        /// 网盘路径（百度服务端返回的 path，含 `/` 前缀）
+        path: String,
+        /// 文件名（与 path basename 一致；冗余字段，前端不必再 split）
+        filename: String,
+        /// 文件大小（目录条目固定 0）
+        size: u64,
+        /// 是否是目录（true=目录，false=文件）
+        is_dir: bool,
+        /// 服务器端修改时间（Unix 秒）—— 前端用它排序/决定是否要再拉详情
+        server_mtime: i64,
+        /// 所属账号 UID（多账号隔离场景，前端按它过滤是否属于"自己当前活跃"账号）
+        account_uid: u64,
+    },
+}
+
+impl SystemEvent {
+    pub fn event_type_name(&self) -> &'static str {
+        match self {
+            SystemEvent::RemoteFileChanged { .. } => "remote_file_changed",
         }
     }
 }

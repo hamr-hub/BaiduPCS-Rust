@@ -4,6 +4,7 @@ pub mod client;
 pub mod client_pool;
 pub mod cloud_dl;
 pub mod cloud_dl_monitor;
+pub mod recent_watcher;
 pub mod share;
 pub mod types;
 
@@ -15,6 +16,7 @@ pub use cloud_dl::{
     TaskListResponse,
 };
 pub use cloud_dl_monitor::{CloudDlEvent, CloudDlMonitor, PollingConfig, TaskProgressTracker};
+pub use recent_watcher::{RecentWatcher, RecentWatcherConfig};
 pub use types::*;
 
 // TODO: 后续实现

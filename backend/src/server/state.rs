@@ -13,7 +13,7 @@ use crate::downloader::budget_scheduler::{
 };
 use crate::downloader::{ChunkScheduler, DownloadManager, FolderDownloadManager};
 use crate::encryption::SnapshotManager;
-use crate::netdisk::{ClientPool, CloudDlMonitor, NetdiskClient};
+use crate::netdisk::{ClientPool, CloudDlMonitor, NetdiskClient, RecentWatcher, RecentWatcherConfig};
 use crate::persistence::{
     cleanup_completed_tasks, cleanup_invalid_tasks, create_pre_migration_backup,
     is_transient_sqlite_error, needs_pre_migration_backup, run_migration_matrix,
@@ -32,7 +32,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// 进入全局只读保护模式的原因（仅后端诊断用，以 `info` 级日志打印）。
 ///
@@ -146,6 +146,22 @@ pub struct AppState {
     /// 加这把锁后，并发只能一个进入临界区，另一个进锁后看到 `contains_key=true`
     /// 直接返回。
     pub cloud_dl_init_locks: Arc<tokio::sync::Mutex<HashMap<Uid, Arc<tokio::sync::Mutex<()>>>>>,
+
+    /// per-uid 网盘远端文件变动 watcher 池
+    ///
+    /// 🔥 与 `cloud_dl_monitors` 同构：账号切换 / 注销场景下不同账号独立持有 watcher
+    /// 避免 fs_id 缓存互相污染。**不需要 init lock** —— watcher start() 内部 AtomicBool
+    /// 自带"已在跑则跳过"的幂等保护，并发安全；start 后立刻登记到 DashMap。
+    pub recent_watchers: Arc<DashMap<Uid, Arc<RecentWatcher>>>,
+
+    /// RecentWatcher per-uid init lock
+    ///
+    /// 包住"`contains_key` 检查 + `ensure_client_for_uid` 等 await + `start()` +
+    /// `DashMap.insert`"序列，避免两个并发 init 各拿到空 client 都完成 start 后
+    /// 留下孤儿 watcher。`Arc<tokio::sync::Mutex<()>>` 而不是 `DashMap` 锁 —— 防止
+    /// 加锁期间再 spawn 别处同类互斥。
+    pub recent_watcher_init_locks: Arc<tokio::sync::Mutex<HashMap<Uid, Arc<tokio::sync::Mutex<()>>>>>,
+
     /// 🔥 代理故障回退管理器
     pub fallback_mgr: Arc<ProxyFallbackManager>,
     /// 🔥 扫描管理器（用户登录后创建）
@@ -436,6 +452,8 @@ impl AppState {
             cloud_dl_monitors: Arc::new(DashMap::new()),
             cloud_dl_ws_subscribers: Arc::new(DashMap::new()),
             cloud_dl_init_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            recent_watchers: Arc::new(DashMap::new()),
+            recent_watcher_init_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             fallback_mgr,
             scan_manager: Arc::new(RwLock::new(None)),
             budget_scheduler,
@@ -1572,6 +1590,124 @@ impl AppState {
             Some(uid) => self.init_cloud_dl_monitor_for(uid).await,
             None => warn!("init_cloud_dl_monitor: active_uid 为 None，跳过初始化"),
         }
+    }
+
+    /// 🔥 为指定账号初始化一个 `RecentWatcher`（per-uid watcher 池对每个 uid 最多一个）
+    ///
+    /// 整体流程：
+    /// 1. 取 per-uid init lock 防止并发重复 init
+    /// 2. `contains_key` 早退（同样 uid 已存在）
+    /// 3. `ensure_client_for_uid` 懒加载 NetdiskClient
+    /// 4. 构造 `RecentWatcher`，wire `ws_manager`
+    /// 5. `start()` 启动后台 task（start 内部 AtomicBool 自带幂等）
+    /// 6. 插入 `recent_watchers` DashMap
+    ///
+    /// 失败路径：client 拿不到 / lock 拿不到 → `warn!` + 直接返回，不留半截状态。
+    pub async fn init_recent_watcher_for(&self, uid: Uid) {
+        // 1) per-uid init lock
+        let init_lock = {
+            let mut locks = self.recent_watcher_init_locks.lock().await;
+            locks
+                .entry(uid)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _init_guard = init_lock.lock().await;
+
+        // 2) 早退
+        if self.recent_watchers.contains_key(&uid) {
+            debug!("RecentWatcher uid={} 已存在，跳过重复初始化", uid.raw());
+            return;
+        }
+
+        // 3) 懒加载 client
+        if let Err(e) = self.ensure_client_for_uid(uid).await {
+            warn!(
+                "RecentWatcher uid={} ensure_client_for_uid 失败: {}",
+                uid.raw(),
+                e
+            );
+            return;
+        }
+        let client_opt: Option<NetdiskClient> = {
+            let pool = self.client_pool.read().await;
+            pool.get_client(uid).map(|arc| (*arc).clone())
+        };
+        let client = match client_opt {
+            Some(c) => Arc::new(c),
+            None => {
+                warn!(
+                    "RecentWatcher uid={} client_pool 缺失，初始化中止",
+                    uid.raw()
+                );
+                return;
+            }
+        };
+
+        // 4) 构造 + wire ws_manager
+        let ws_slot: Arc<RwLock<Option<Arc<WebSocketManager>>>> =
+            Arc::new(RwLock::new(Some(Arc::clone(&self.ws_manager))));
+        let watcher = Arc::new(RecentWatcher::with_config(
+            uid,
+            client,
+            ws_slot,
+            RecentWatcherConfig::default(),
+        ));
+
+        // 5) 先登记到 DashMap，登记后再 start —— start() 会消费 self（Arc）
+        //    以 move 进 async block，未登记就 start 失败时观察不到 watcher。
+        self.recent_watchers.insert(uid, watcher.clone());
+
+        // 6) 启动后台 task（start 内部 AtomicBool 幂等；迁 Arc 进 tokio::spawn）
+        watcher.start();
+        info!("RecentWatcher uid={} 已 start 并登记", uid.raw());
+    }
+
+    /// 初始化活跃账号的 RecentWatcher（兼容 legacy 调用点，与 `init_cloud_dl_monitor` 对偶）
+    pub async fn init_recent_watcher(&self) {
+        let active = *self.active_uid.read().await;
+        match active {
+            Some(uid) => self.init_recent_watcher_for(uid).await,
+            None => warn!("init_recent_watcher: active_uid 为 None，跳过初始化"),
+        }
+    }
+
+    /// 按 UID 取 watcher（前端 / 其他模块按需查）
+    pub fn recent_watcher_for(&self, uid: Uid) -> Option<Arc<RecentWatcher>> {
+        self.recent_watchers
+            .get(&uid)
+            .map(|r| Arc::clone(r.value()))
+    }
+
+    /// 取活跃账号的 watcher（None 表示未初始化）
+    pub async fn recent_watcher_for_active(&self) -> Option<Arc<RecentWatcher>> {
+        let uid = (*self.active_uid.read().await)?;
+        self.recent_watcher_for(uid)
+    }
+
+    /// 🔥 注销账号时**主动停止**该 uid 的 watcher（避免泄漏后台 task）
+    ///
+    /// 与 `CloudDlMonitor` 不同：cloud_dl monitor 的客户端生命周期由 `client_pool`
+    /// 持有，账号注销会触发 client 失效，monitor 下一轮拉取会自然失败但仍在跑（这
+    /// 是已知妥协，hot-reload 频繁场景不致命）。
+    /// RecentWatcher 则影响"远端文件变动 UI 提醒"——账号下线后立刻停掉，前端不
+    /// 会再收到不存在的账号的新文件通知，体验更干净。
+    pub async fn stop_recent_watcher_for(&self, uid: Uid) {
+        if let Some((_, watcher)) = self.recent_watchers.remove(&uid) {
+            watcher.stop();
+            info!("RecentWatcher uid={} 已 stop 并从池中移除", uid.raw());
+            // 清理 init lock —— 否则这张 dead-lock entry 永远占内存
+            let mut locks = self.recent_watcher_init_locks.lock().await;
+            locks.remove(&uid);
+        }
+    }
+
+    /// 遍历所有已存在的 watcher（shutdown / 调试用）
+    pub fn iter_recent_watchers(&self) -> Vec<(Uid, Arc<RecentWatcher>)> {
+        self.recent_watchers
+            .iter()
+            .map(|r| (*r.key(), Arc::clone(r.value())))
+            .collect()
     }
 
     /// 获取活跃账号的 `CloudDlMonitor`（返回 `None` 表示未初始化）

@@ -627,6 +627,33 @@ export interface AccountEventListChanged {
 
 export type AccountEvent = AccountEventSwitched | AccountEventListChanged
 
+/**
+ * 系统级事件（远端文件变动通知）—— 后端 `RecentWatcher` 主动推送。
+ *
+ * 当前只有"远端新文件"一种 variant。后续扩（如账号风控提醒、网盘空间不足）
+ * 在这加；`TaskEventSystem` 是 union 入口，前端按 `event_type` 分发。
+ */
+export interface SystemEventRemoteFileChanged {
+  /** 'remote_file_changed' 远端文件 / 目录被改 / 被新建（recent watcher 探测到 fs_id 首次入缓存） */
+  event_type: 'remote_file_changed'
+  /** 网盘对象唯一 ID —— 与 `list` 接口返回的 `fs_id` 对齐 */
+  fs_id: number
+  /** 网盘路径（含 `/` 前缀） */
+  path: string
+  /** basename —— 与 `path` 末段一致，前端不必再 split */
+  filename: string
+  /** 文件大小；目录条目固定为 0 */
+  size: number
+  /** 是否是目录（true=目录，false=文件） */
+  is_dir: boolean
+  /** 服务端 mtime（Unix 秒）—— 前端按它排序，决定要不要拉详情 */
+  server_mtime: number
+  /** 所属账号 UID —— 多账号场景前端按它过滤是否属于"当前活跃"账号 */
+  account_uid: number
+}
+
+export type SystemEvent = SystemEventRemoteFileChanged
+
 // ============ 多账号资源配额事件 (BudgetEvent) ============
 
 /**
@@ -706,6 +733,11 @@ export interface TaskEventBudget {
   event: BudgetEvent
 }
 
+export interface TaskEventSystem {
+  category: 'system'
+  event: SystemEvent
+}
+
 export type TaskEvent =
     | TaskEventDownload
     | TaskEventFolder
@@ -715,6 +747,7 @@ export type TaskEvent =
     | TaskEventCloudDl
     | TaskEventAccount
     | TaskEventBudget
+    | TaskEventSystem
 
 // ============ 带时间戳的事件 ============
 

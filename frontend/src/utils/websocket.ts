@@ -15,6 +15,7 @@ import type {
   CloudDlEvent,
   AccountEvent,
   BudgetEvent,
+  SystemEvent,
   TimestampedEvent,
 } from '@/types/events'
 
@@ -30,6 +31,7 @@ type BackupEventCallback = (event: BackupEvent) => void
 type CloudDlEventCallback = (event: CloudDlEvent) => void
 type AccountEventCallback = (event: AccountEvent) => void
 type BudgetEventCallback = (event: BudgetEvent) => void
+type SystemEventCallback = (event: SystemEvent) => void
 type SnapshotCallback = (snapshot: WsServerSnapshot) => void
 type ConnectionStateCallback = (state: ConnectionState) => void
 
@@ -57,6 +59,7 @@ class WebSocketClient {
   private cloudDlListeners: Set<CloudDlEventCallback> = new Set()
   private accountListeners: Set<AccountEventCallback> = new Set()
   private budgetListeners: Set<BudgetEventCallback> = new Set()
+  private systemListeners: Set<SystemEventCallback> = new Set()
   private snapshotListeners: Set<SnapshotCallback> = new Set()
   private connectionStateListeners: Set<ConnectionStateCallback> = new Set()
 
@@ -288,6 +291,14 @@ class WebSocketClient {
         // 订阅方：仅 BudgetPanel.vue 通过 stores/budget.ts 订阅。
         this.budgetListeners.forEach((cb) => cb(event.event as BudgetEvent))
         break
+      case 'system':
+        // 系统级事件（如 `RecentWatcher` 推送的远端文件变动通知）。
+        // 后端 TaskEvent::System 不属于任何 task 概念，订阅方按需 `subscribe(['system'])`
+        // 后通过本路由收到回调。订阅方：FilesView 弹"新着"小气泡 + 自动 revalidate 列表。
+        // ⚠️ TS 推断要求 `as unknown as SystemEvent`：union 类型在 narrow 到具体类型时
+        // 需要 unknown 中介 cast（其他 case 是因为 union 里有匹配度高的 variant）。
+        this.systemListeners.forEach((cb) => cb(event.event as unknown as SystemEvent))
+        break
       case 'share_sync':
         document.dispatchEvent(
             new CustomEvent('baidu-netdisk:share-sync', { detail: event.event })
@@ -448,6 +459,17 @@ class WebSocketClient {
   public onBudgetEvent(callback: BudgetEventCallback): () => void {
     this.budgetListeners.add(callback)
     return () => this.budgetListeners.delete(callback)
+  }
+
+  /**
+   * 订阅系统级事件（如 `RecentWatcher` 推送的远端文件变动通知）。
+   *
+   * 调用方需自行 `subscribe(['system'])` 才会真正在服务端注册兴趣过滤；
+   * 本函数仅注册客户端回调路由。订阅方：FilesView 弹"新着"小气泡。
+   */
+  public onSystemEvent(callback: SystemEventCallback): () => void {
+    this.systemListeners.add(callback)
+    return () => this.systemListeners.delete(callback)
   }
 
   /**

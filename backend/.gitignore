@@ -1,1 +1,3 @@
 /target
+# rustc / cargo 配置缓存目录（每次编译重新生成，跟代码无关）
+/.cargo/

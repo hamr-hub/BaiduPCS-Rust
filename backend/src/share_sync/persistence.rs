@@ -800,6 +800,61 @@ impl ShareSyncPersistence {
         Ok(interrupted)
     }
 
+    /// 列出**上次启动之前就已经是** `Interrupted` 的 run，作为「续跑重试」候选。
+    ///
+    /// 为什么需要这个：`mark_running_runs_interrupted` 只捞 `status='running'`，
+    /// 一条 run 被标成 `interrupted` 之后就再也不会被它捡起来。而从「标记为
+    /// interrupted」到 `resume_run_in_place` 把它标回 `running`，中间隔着
+    /// 续跑任务的初始延迟 + 等账号就绪（最长两分钟）。进程在这个窗口里再被杀一次
+    /// （连着重启、改代码重编译时很常见），这条 run 就永久卡在 `interrupted`：
+    /// 它名下那批已恢复成暂停态的下载任务没有任何 run 在驱动，界面上就是
+    /// 「同步任务全是暂停的，重启多少次都不动」。
+    ///
+    /// 这里只负责**列出候选**，不改状态。是否真的接管由
+    /// `ShareSyncManager::probe_resumable_run` 判定——它会检查该订阅名下是否真的
+    /// 还有未完成的下载。没有残留的历史 `interrupted` 记录会被原样跳过，
+    /// 不会变成"每次开机都重跑一遍老 run"。
+    ///
+    /// `per_subscription` 限制每条订阅取最近几条：残留任务是按订阅
+    /// （`backup_config_id`）归属的，最新的那次尝试才是它们的主人；更早的
+    /// interrupted 记录只是历史。取多于 1 条是为了容忍「最新那条在抓取阶段就断了、
+    /// 没有 run_items，真正有活儿的是上一条」。
+    pub fn list_interrupted_runs(
+        &self,
+        per_subscription: usize,
+    ) -> Result<Vec<StaleRunRecord>, ShareSyncError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.subscription_id, r.started_at, COALESCE(s.owner_uid, 0)
+             FROM share_sync_runs r
+             LEFT JOIN share_subscriptions s ON s.id = r.subscription_id
+             WHERE r.status = ?1
+             ORDER BY r.started_at DESC
+             LIMIT 200",
+        )?;
+        let rows = stmt.query_map(params![RunStatus::Interrupted.as_str()], |row| {
+            Ok(StaleRunRecord {
+                run_id: row.get(0)?,
+                subscription_id: row.get(1)?,
+                started_at: row.get(2)?,
+                owner_uid: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        let mut per_sub: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut out = Vec::new();
+        for r in rows {
+            let rec = r?;
+            let n = per_sub.entry(rec.subscription_id.clone()).or_insert(0);
+            if *n >= per_subscription {
+                continue;
+            }
+            *n += 1;
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
     ///
     /// `reason` 是 v1 新增字段，用于说明"为什么这条 item 没被真正执行"——
     /// 当前主要给 quota / local_disk_full 早停场景用，记录"skip_due_to_quota_full"
@@ -1065,6 +1120,29 @@ impl ShareSyncPersistence {
     pub fn list_run_items(&self, run_id: &str) -> Result<Vec<RunItemRecord>, ShareSyncError> {
         let total = self.count_run_items(run_id)?;
         self.list_run_items_page(run_id, 1, total.max(1))
+    }
+
+    /// 🔥 清理某订阅在 `cutoff` 时间戳之前的所有 runs（连同 `share_sync_run_items` 行）。
+    ///
+    /// **TODO(local fork stub)**: 本地 fork 在 `905dbaa chore: sync local fork changes onto
+    /// upstream v2.1.6` 后引入的「清理 N 天前的运行记录」功能，目前是占位实现 —— 始终返回
+    /// `Ok(0)`。后续需补充 SQLite 级 DELETE: 先按 `subscription_id + started_at < cutoff`
+    /// 删 `share_sync_run_items`，再删 `share_sync_runs`。配套还有 `clear_runs_and_orphans`
+    /// 在 `manager.rs` 调用本方法后会同步清理转存 / 文件夹内存任务。
+    pub fn delete_runs_before(
+        &self,
+        _subscription_id: &str,
+        _cutoff: i64,
+    ) -> Result<i64, ShareSyncError> {
+        Ok(0)
+    }
+
+    /// 🔥 触发新一轮前清理同一订阅上一轮遗留的 runs（衍生 task_history 子任务由调用方连带清理）。
+    ///
+    /// **TODO(local fork stub)**: 同上 —— 占位实现，返回 `Ok(())`。
+    /// `manager.rs::execute_one` / `trigger_one` 都会在开新轮前调用，错误仅打 warn 不中断本轮。
+    pub fn cleanup_previous_runs_for_subscription(&self, _id: &str) -> Result<(), ShareSyncError> {
+        Ok(())
     }
 }
 
@@ -1860,6 +1938,131 @@ mod tests {
             mgr.get_run("run-done").unwrap().unwrap().status,
             "completed"
         );
+    }
+
+    /// 历史 `interrupted` run 必须能被重新捞出来当续跑候选。
+    ///
+    /// 回归的是这个真实故障：run 在某次启动被标成 `interrupted`，续跑任务还在等账号
+    /// 就绪（5s 延迟 + 最长 2 分钟等待）时进程又被重启了。从此
+    /// `mark_running_runs_interrupted`（只认 `status='running'`）再也捞不到它，
+    /// 它名下恢复成暂停态的下载永远没人驱动 —— 界面上就是「同步任务全是暂停的，
+    /// 重启多少次都不动」。
+    #[test]
+    fn test_list_interrupted_runs_recovers_previously_interrupted() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        mgr.start_run("run-int", &s.id, now - 600).unwrap();
+        // 模拟上一次启动的收编
+        mgr.mark_running_runs_interrupted().unwrap();
+        // 再来一次（模拟又一次重启）：running 已经没有了，老查询什么都捞不到
+        assert!(
+            mgr.mark_running_runs_interrupted().unwrap().is_empty(),
+            "第二次启动时已无 running run —— 正是它捞不到的场景"
+        );
+
+        // 新查询要能把它捡回来
+        let got = mgr.list_interrupted_runs(3).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].run_id, "run-int");
+        assert_eq!(got[0].subscription_id, s.id);
+    }
+
+    /// 只捞 `interrupted`：completed / failed / running 都不是续跑候选。
+    ///
+    /// 尤其不能捞 `running` —— 那是 `mark_running_runs_interrupted` 的活儿，
+    /// 两边都捞会让同一条 run 被排进 fresh 和 stale 两个桶。
+    #[test]
+    fn test_list_interrupted_runs_ignores_other_statuses() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        mgr.start_run("run-int", &s.id, now - 600).unwrap();
+        mgr.mark_running_runs_interrupted().unwrap();
+
+        mgr.start_run("run-done", &s.id, now - 500).unwrap();
+        mgr.finish_run(
+            "run-done",
+            now - 400,
+            RunStatus::Completed,
+            &DiffSummary::default(),
+            None,
+        )
+            .unwrap();
+        mgr.start_run("run-failed", &s.id, now - 300).unwrap();
+        mgr.finish_run(
+            "run-failed",
+            now - 200,
+            RunStatus::Failed,
+            &DiffSummary::default(),
+            Some("boom"),
+        )
+            .unwrap();
+        // 还在飞的那条归 mark_running_runs_interrupted 管
+        mgr.start_run("run-running", &s.id, now - 10).unwrap();
+
+        let ids: Vec<String> = mgr
+            .list_interrupted_runs(10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        assert_eq!(ids, ["run-int"]);
+    }
+
+    /// 每条订阅只取最近几条：残留下载按订阅归属，更早的 interrupted 只是历史。
+    /// 不设上限的话，跑了半年的订阅会在每次启动时拖出几十条候选逐个 probe。
+    #[test]
+    fn test_list_interrupted_runs_caps_per_subscription_newest_first() {
+        let (_dir, mgr) = fresh();
+        let s = sub("a");
+        mgr.upsert_subscription(&s).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        for (i, rid) in ["r1", "r2", "r3", "r4", "r5"].iter().enumerate() {
+            mgr.start_run(rid, &s.id, now - 1000 + i as i64 * 10)
+                .unwrap();
+        }
+        mgr.mark_running_runs_interrupted().unwrap();
+
+        let ids: Vec<String> = mgr
+            .list_interrupted_runs(3)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        // started_at 递增 ⇒ 最新的是 r5
+        assert_eq!(ids, ["r5", "r4", "r3"], "应按 started_at 倒序取最近 3 条");
+    }
+
+    /// 多订阅时上限是**按订阅**算的，不是全局 —— 否则订阅 A 的历史记录会把
+    /// 订阅 B 的候选整个挤掉，B 的残留下载继续没人管。
+    #[test]
+    fn test_list_interrupted_runs_cap_is_per_subscription() {
+        let (_dir, mgr) = fresh();
+        let a = sub("a");
+        let mut b = sub("b");
+        b.id = "sub-b".to_string();
+        mgr.upsert_subscription(&a).unwrap();
+        mgr.upsert_subscription(&b).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        // A 有 3 条更新的，B 只有 1 条更老的
+        mgr.start_run("b1", &b.id, now - 900).unwrap();
+        for (i, rid) in ["a1", "a2", "a3"].iter().enumerate() {
+            mgr.start_run(rid, &a.id, now - 100 + i as i64).unwrap();
+        }
+        mgr.mark_running_runs_interrupted().unwrap();
+
+        let got = mgr.list_interrupted_runs(2).unwrap();
+        let a_n = got.iter().filter(|r| r.subscription_id == a.id).count();
+        let b_n = got.iter().filter(|r| r.subscription_id == b.id).count();
+        assert_eq!(a_n, 2, "A 取上限 2 条");
+        assert_eq!(b_n, 1, "B 不该被 A 挤掉");
     }
 
     /// v2: 老库已有 (run_id, path) 重复行时, init_tables 走 ensure_run_items_unique_index

@@ -13,9 +13,51 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
-use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// 🔥 并发环境变化事件
+///
+/// 活跃下载任务数变化意味着「每个任务能分到多少带宽」这件事整体改变了，
+/// 任务在旧环境下测出来的链接快慢、速度基线全部作废。调度器检测到变化后广播本事件，
+/// 各任务的 CDN 检测循环据此重建判断依据（见
+/// `DownloadEngine::start_speed_anomaly_detection`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrencyChange {
+    /// 任务数增加：带宽被摊薄，单任务速度下降属于正常现象
+    Increased { from: usize, to: usize },
+    /// 任务数减少：带宽被释放，剩余任务本应提速
+    Decreased { from: usize, to: usize },
+}
+
+/// 并发变化广播通道容量
+///
+/// 事件只在任务数变化时产生，频率极低；给 16 是为了让短时间内的连续增减
+/// （批量启动 / 文件夹子任务批量完成）不至于让订阅方 Lagged。
+const CONCURRENCY_CHANGE_CHANNEL_CAPACITY: usize = 16;
+
+/// 判定活跃任务数的变化是否构成一次「并发环境变化」
+///
+/// 两个边界条件都是有意为之：
+/// - `last == 0`：从「没有任务」到「有任务」不算环境变化，是任务刚开始，
+///   此时链接刚探测完本来就是中立状态，没有旧判断需要清理
+/// - `current == 0`：所有任务都结束了，没有剩余任务需要重新评估
+fn classify_task_count_change(last: usize, current: usize) -> Option<ConcurrencyChange> {
+    if current > last && last > 0 {
+        Some(ConcurrencyChange::Increased {
+            from: last,
+            to: current,
+        })
+    } else if current < last && current > 0 {
+        Some(ConcurrencyChange::Decreased {
+            from: last,
+            to: current,
+        })
+    } else {
+        None
+    }
+}
 
 /// 🔥 任务级连续 chunk 失败阈值：达到后触发任务级 auto_requeue
 ///
@@ -305,6 +347,11 @@ pub struct ChunkScheduler {
     waiting_queue_trigger: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     /// 上一轮的任务数（用于检测任务数变化）
     last_task_count: Arc<AtomicUsize>,
+    /// 🔥 并发环境变化广播发送端
+    ///
+    /// 调度循环检测到活跃任务数增减时广播，订阅方为各任务的 CDN 检测循环。
+    /// 发送端由 ChunkScheduler 持有，生命周期覆盖所有订阅方，正常不会出现 Closed。
+    concurrency_change_tx: Arc<broadcast::Sender<ConcurrencyChange>>,
     /// 🔥 解密并发控制信号量
     ///
     /// `Arc<RwLock<Arc<Semaphore>>>` 以支持启动后从 `AppState.decrypt_semaphore`
@@ -382,6 +429,9 @@ impl ChunkScheduler {
             backup_notification_tx: Arc::new(RwLock::new(None)),
             waiting_queue_trigger: Arc::new(RwLock::new(None)),
             last_task_count: Arc::new(AtomicUsize::new(0)),
+            concurrency_change_tx: Arc::new(
+                broadcast::channel(CONCURRENCY_CHANGE_CHANNEL_CAPACITY).0,
+            ),
             // 🔥 解密并发限制：构造时由调用方传入全局共享 Arc<Semaphore>（机器级单例）
             decrypt_semaphore: Arc::new(RwLock::new(decrypt_semaphore)),
             // 🔥 构造时注入，不再有 None fallback
@@ -583,6 +633,14 @@ impl ChunkScheduler {
         self.active_tasks.read().await.len()
     }
 
+    /// 订阅并发环境变化事件
+    ///
+    /// 由每个任务的 CDN 检测循环调用，用于在活跃任务数增减时重建速度基线、
+    /// 并在任务数减少时重新拉取下载链接。
+    pub fn subscribe_concurrency_changes(&self) -> broadcast::Receiver<ConcurrencyChange> {
+        self.concurrency_change_tx.subscribe()
+    }
+
     /// 启动全局调度循环
     ///
     /// 核心调度算法：
@@ -608,6 +666,7 @@ impl ChunkScheduler {
         let backup_notification_tx = self.backup_notification_tx.clone();
         let waiting_queue_trigger = self.waiting_queue_trigger.clone();
         let last_task_count = self.last_task_count.clone();
+        let concurrency_change_tx = self.concurrency_change_tx.clone();
         let decrypt_semaphore = self.decrypt_semaphore.clone();
         // 🔥 多账号注入资源
         let budget_scheduler = self.budget_scheduler.clone();
@@ -632,21 +691,49 @@ impl ChunkScheduler {
 
                 let current_task_count = task_ids.len();
 
-                // 🔥 检测任务数增加，触发速度窗口重置
+                // 🔥 检测任务数变化，重置在旧并发环境下形成的链接判断
+                //
+                // 增加和减少**都要**处理：任务数变了意味着每个任务能分到的带宽变了，
+                // 之前测出来的链接快慢、速度基线全部失去参照意义。
+                // 历史实现只处理了「增加」，于是兄弟子任务完成、或另一个任务暂停之后，
+                // 剩下的任务会一直按竞争期学到的分流比例跑，速度回不来 ——
+                // 用户必须手动暂停再开始（等于强制重建全部状态）才能恢复满速。
                 {
                     let last_count = last_task_count.load(Ordering::SeqCst);
-                    if current_task_count > last_count && last_count > 0 {
-                        info!(
-                            "🔄 检测到任务数增加: {} -> {}, 重置所有链接速度窗口（带宽重新分配）",
-                            last_count, current_task_count
-                        );
 
-                        // 遍历所有任务，重置速度窗口
-                        let tasks = active_tasks.read().await;
-                        for task_info in tasks.values() {
-                            let health = task_info.url_health.lock().await;
-                            health.reset_speed_windows();
+                    if let Some(change) =
+                        classify_task_count_change(last_count, current_task_count)
+                    {
+                        {
+                            let tasks = active_tasks.read().await;
+                            for task_info in tasks.values() {
+                                let health = task_info.url_health.lock().await;
+                                match change {
+                                    // 任务数增加：速度下降是正常的，只需清窗口避免误判降权
+                                    ConcurrencyChange::Increased { .. } => {
+                                        health.reset_speed_windows()
+                                    }
+                                    // 任务数减少：光清窗口不够，真正决定分流比例的
+                                    // EWMA 和 score 还停留在竞争期的值上，必须一并归位
+                                    ConcurrencyChange::Decreased { .. } => {
+                                        health.reset_learned_state()
+                                    }
+                                }
+                            }
                         }
+
+                        match change {
+                            ConcurrencyChange::Increased { from, to } => info!(
+                                "🔄 检测到任务数增加: {} -> {}, 重置所有链接速度窗口（带宽重新分配）",
+                                from, to
+                            ),
+                            ConcurrencyChange::Decreased { from, to } => info!(
+                                "🔄 检测到任务数减少: {} -> {}, 重置剩余任务的链接学习状态（带宽已释放）",
+                                from, to
+                            ),
+                        }
+
+                        let _ = concurrency_change_tx.send(change);
                     }
 
                     // 🔍 槽位诊断：活跃任务数超过任务槽上限 = 有任务绕过了 task_slot_pool
@@ -1464,6 +1551,10 @@ impl ChunkScheduler {
             Completed {
                 group_id: Option<String>,
                 is_backup: bool,
+                /// mark_completed 已把 downloaded_size 推到 total_size，这里顺手带出去，
+                /// 免得消费方停在被节流丢掉的最后一帧进度上
+                downloaded_size: u64,
+                total_size: u64,
             },
             Failed {
                 group_id: Option<String>,
@@ -1494,13 +1585,15 @@ impl ChunkScheduler {
                 CompletionOutcome::Completed {
                     group_id: t.group_id.clone(),
                     is_backup: t.is_backup,
+                    downloaded_size: t.downloaded_size,
+                    total_size: t.total_size,
                 }
             };
             (outcome, owner_uid_raw)
         };
 
         // Stale 分支：跳过一切终态副作用，任务保持当前状态等用户恢复或新协程接手
-        let (group_id, is_backup, decrypt_error) = match outcome {
+        let (group_id, is_backup, decrypt_error, final_sizes) = match outcome {
             CompletionOutcome::Stale => {
                 info!(
                     "任务 {} 解密协程结束但已被暂停或被新协程接替（my_epoch={}），\
@@ -1515,12 +1608,14 @@ impl ChunkScheduler {
                 error_msg,
             } => {
                 error!("任务 {} 解密失败: {}", task_id, error_msg);
-                (group_id, is_backup, Some(error_msg))
+                (group_id, is_backup, Some(error_msg), (0, 0))
             }
             CompletionOutcome::Completed {
                 group_id,
                 is_backup,
-            } => (group_id, is_backup, None),
+                downloaded_size,
+                total_size,
+            } => (group_id, is_backup, None, (downloaded_size, total_size)),
         };
 
         // 发布任务事件
@@ -1543,6 +1638,8 @@ impl ChunkScheduler {
                         TaskEvent::Download(DownloadEvent::Completed {
                             task_id: task_id.to_string(),
                             completed_at: chrono::Utc::now().timestamp_millis(),
+                            downloaded_size: final_sizes.0,
+                            total_size: final_sizes.1,
                             group_id: group_id.clone(),
                             is_backup,
 
@@ -2449,6 +2546,51 @@ impl ChunkScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 任务数变化的判定边界
+    ///
+    /// 回归用例：历史实现只处理「增加」，兄弟子任务完成或另一个任务暂停后
+    /// （典型的「减少」）不做任何再平衡，剩余任务一直按竞争期学到的状态跑。
+    #[test]
+    fn test_classify_task_count_change() {
+        use super::classify_task_count_change;
+
+        // 增加
+        assert_eq!(
+            classify_task_count_change(1, 2),
+            Some(ConcurrencyChange::Increased { from: 1, to: 2 })
+        );
+        // 减少 —— 本次修复的核心场景
+        assert_eq!(
+            classify_task_count_change(5, 1),
+            Some(ConcurrencyChange::Decreased { from: 5, to: 1 })
+        );
+        // 不变
+        assert_eq!(classify_task_count_change(3, 3), None);
+        // 从无到有：任务刚启动，链接状态本来就是中立的
+        assert_eq!(classify_task_count_change(0, 1), None);
+        // 全部结束：没有剩余任务需要重新评估
+        assert_eq!(classify_task_count_change(2, 0), None);
+        assert_eq!(classify_task_count_change(0, 0), None);
+    }
+
+    /// 订阅方能收到调度器广播的并发变化事件
+    #[tokio::test]
+    async fn test_concurrency_change_broadcast_reaches_subscriber() {
+        let tx = tokio::sync::broadcast::channel::<ConcurrencyChange>(
+            CONCURRENCY_CHANGE_CHANNEL_CAPACITY,
+        )
+            .0;
+        let mut rx = tx.subscribe();
+
+        tx.send(ConcurrencyChange::Decreased { from: 2, to: 1 })
+            .expect("有订阅者时发送不应失败");
+
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            ConcurrencyChange::Decreased { from: 2, to: 1 }
+        );
+    }
 
     /// 测试 ChunkSlotPool 热扩缩容
     #[test]

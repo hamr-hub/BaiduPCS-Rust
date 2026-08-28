@@ -365,9 +365,19 @@ impl WebSocketManager {
 
     /// 获取节流 key
     ///
-    /// 返回 `event_type:task_id`，避免同一任务的不同事件类型互相覆盖
+    /// 返回 `event_type:task_id[:subkey]`，避免同一任务的不同事件类型互相覆盖。
+    ///
+    /// `pending_events` 是 `throttle_key -> PendingEvent` 的 **Map**，同键覆盖 ——
+    /// 对普通进度事件这正是想要的（一个任务只保留最新一帧）。但有些事件的
+    /// `task_id()` 是**一组**子项的共同归属（分享同步的 `item_progress` 返回的是
+    /// subscription_id），这时同一订阅的 N 个子任务会挤在一个 key 上，
+    /// 一个 flush 窗口只活下来最后一条，其余子任务的进度条在前端永远不动。
+    /// `throttle_subkey()` 给这类事件补上子项维度，让它们各自排队、各自节流。
     fn get_throttle_key(event: &TaskEvent) -> String {
-        format!("{}:{}", event.event_type(), event.task_id())
+        match event.throttle_subkey() {
+            Some(sub) => format!("{}:{}:{}", event.event_type(), event.task_id(), sub),
+            None => format!("{}:{}", event.event_type(), event.task_id()),
+        }
     }
 
     /// 获取动态批量处理数量
@@ -860,6 +870,81 @@ mod tests {
     use super::*;
     use crate::server::events::DownloadEvent;
 
+    fn share_sync_item_progress(subscription_id: &str, task_id: &str) -> TaskEvent {
+        TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemProgress {
+            run_id: "run-1".into(),
+            subscription_id: subscription_id.into(),
+            task_id: task_id.into(),
+            name: "a.mkv".into(),
+            kind: "download".into(),
+            status: "downloading".into(),
+            downloaded: 1,
+            total: 100,
+            progress: 1.0,
+            speed: 10,
+            eta_seconds: None,
+            parent_task_id: None,
+            owner_uid: 1,
+        })
+    }
+
+    /// 同一订阅的不同子任务必须落在**不同**的节流 key 上。
+    ///
+    /// 回归的是这个真实故障：`pending_events` 是 `throttle_key -> PendingEvent` 的 Map，
+    /// 而 `TaskEvent::task_id()` 对分享同步返回 subscription_id。两者相乘的结果是
+    /// 一次广播里那个订阅的 N 个子任务全挤在一个 key 上互相覆盖，一个 flush 窗口
+    /// 只活下来最后一条 —— 后端每秒推 N 条，前端每秒只收到 1 条，
+    /// 除了运气好的那一行，其余进度条永远停在原地。
+    #[test]
+    fn test_throttle_key_separates_share_sync_subtasks() {
+        let sub = "sub-1";
+        let a = WebSocketManager::get_throttle_key(&share_sync_item_progress(sub, "dl-1"));
+        let b = WebSocketManager::get_throttle_key(&share_sync_item_progress(sub, "dl-2"));
+        let folder =
+            WebSocketManager::get_throttle_key(&share_sync_item_progress(sub, "folder:f1"));
+        assert_ne!(a, b, "同订阅不同子任务不能共用 key，否则互相覆盖");
+        assert_ne!(a, folder);
+        assert_ne!(b, folder);
+    }
+
+    /// 同一个子任务的连续两帧仍要落在同一个 key 上 —— 覆盖旧帧正是节流想要的效果，
+    /// 丢了这个性质会让每帧都单独排队，队列被一个高频任务撑爆。
+    #[test]
+    fn test_throttle_key_stable_for_same_subtask() {
+        let k1 = WebSocketManager::get_throttle_key(&share_sync_item_progress("sub-1", "dl-1"));
+        let k2 = WebSocketManager::get_throttle_key(&share_sync_item_progress("sub-1", "dl-1"));
+        assert_eq!(k1, k2);
+    }
+
+    /// 不同订阅之间本来就靠 task_id 分开，加了 subkey 也不能串味。
+    #[test]
+    fn test_throttle_key_separates_subscriptions() {
+        let a = WebSocketManager::get_throttle_key(&share_sync_item_progress("sub-1", "dl-1"));
+        let b = WebSocketManager::get_throttle_key(&share_sync_item_progress("sub-2", "dl-1"));
+        assert_ne!(a, b);
+    }
+
+    /// 没有 subkey 的事件维持原样：`event_type:task_id`，同任务同类型继续覆盖。
+    /// 普通下载进度就该是这个行为，别被这次改动带偏。
+    #[test]
+    fn test_throttle_key_unchanged_without_subkey() {
+        let e = TaskEvent::Download(DownloadEvent::Progress {
+            task_id: "t-1".into(),
+            downloaded_size: 1,
+            total_size: 2,
+            speed: 3,
+            progress: 50.0,
+            group_id: None,
+            is_backup: false,
+            owner_uid: None,
+        });
+        assert!(e.throttle_subkey().is_none());
+        assert_eq!(
+            WebSocketManager::get_throttle_key(&e),
+            format!("{}:{}", e.event_type(), e.task_id())
+        );
+    }
+
     #[tokio::test]
     async fn test_register_unregister() {
         let manager = WebSocketManager::new();
@@ -898,6 +983,8 @@ mod tests {
         let event = TaskEvent::Download(DownloadEvent::Completed {
             task_id: "test-1".to_string(),
             completed_at: 0,
+            downloaded_size: 0,
+            total_size: 0,
             group_id: None,
             is_backup: false,
 

@@ -87,6 +87,15 @@ pub enum DownloadEvent {
     Completed {
         task_id: String,
         completed_at: i64,
+        /// 完成时的最终字节数（= `total_size`）
+        ///
+        /// 进度事件带 200ms 节流，收尾那一帧多半会被丢掉，所以完成事件必须自带终值，
+        /// 消费方才能把进度条推到 100%，而不是停在最后一次侥幸发出去的采样上
+        /// （小文件尤其明显：200ms 内下掉的量占比大，肉眼可见地卡在 86% 之类）。
+        #[serde(default)]
+        downloaded_size: u64,
+        #[serde(default)]
+        total_size: u64,
         group_id: Option<String>,
         /// 是否为自动备份任务
         #[serde(default)]
@@ -1108,6 +1117,31 @@ impl TaskEvent {
         }
     }
 
+    /// 节流细分键：同一个 `task_id` 下需要**各自独立节流**的子项标识。
+    ///
+    /// WebSocket 的待发送队列是 `throttle_key -> PendingEvent` 的 **Map**，同键后到的
+    /// 事件会**覆盖**先到的（见 `websocket/manager.rs` 的 `get_throttle_key`）。
+    /// 而 `TaskEvent::task_id()` 对分享同步返回的是 **subscription_id** ——
+    /// 于是一次广播里那一订阅的所有子任务行（转存段、文件夹、文件夹里的各个子文件）
+    /// 共用同一个 key，一个 flush 窗口只有**最后一条**能活下来。
+    ///
+    /// 症状就是：后端每秒老老实实推 N 条 `item_progress`，前端每秒只收到 1 条，
+    /// 除了运气好的那一行，其余的进度条永远停在原地不动。
+    /// （实测日志：61 秒内 62 条 `item_progress` 发送记录，不管有几个子任务都是 1 条/秒。）
+    ///
+    /// 返回 `Some(子项 id)` 的事件按「任务 + 子项」独立排队与节流；
+    /// 返回 `None` 的维持原样（按任务粒度覆盖，这正是普通进度事件想要的行为）。
+    pub fn throttle_subkey(&self) -> Option<&str> {
+        match self {
+            // 分享同步子任务进度：task_id 是订阅 id，真正的子项是底层任务 id
+            TaskEvent::ShareSync(crate::share_sync::events::ShareSyncEvent::ItemProgress {
+                                     task_id,
+                                     ..
+                                 }) => Some(task_id),
+            _ => None,
+        }
+    }
+
     /// 获取任务 ID 字符串（用于 CloudDl 等使用数字 ID 的事件）
     pub fn task_id_string(&self) -> String {
         match self {
@@ -1389,6 +1423,8 @@ mod tests {
         let completed = DownloadEvent::Completed {
             task_id: "1".to_string(),
             completed_at: 0,
+            downloaded_size: 0,
+            total_size: 0,
             group_id: None,
             is_backup: false,
             owner_uid: None,

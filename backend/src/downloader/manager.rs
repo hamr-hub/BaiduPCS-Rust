@@ -1,11 +1,9 @@
 use crate::auth::UserAuth;
 use crate::autobackup::events::BackupTransferNotification;
-use crate::common::{
-    ProxyConfig, RefreshCoordinator, RefreshCoordinatorConfig, SpeedAnomalyConfig, StagnationConfig,
-};
+use crate::common::{ProxyConfig, RefreshCoordinator};
 use crate::downloader::{
-    calculate_task_max_chunks, ChunkScheduler, DownloadEngine, DownloadTask, FolderDownloadManager,
-    TaskScheduleInfo, TaskStatus,
+    calculate_task_max_chunks, ChunkScheduler, DownloadEngine, DownloadTask,
+    FolderDownloadManager, TaskScheduleInfo, TaskStatus, UrlHealthManager,
 };
 use crate::persistence::{DownloadRecoveryInfo, PersistenceManager, TaskMetadata};
 use crate::server::events::{DownloadEvent, ProgressThrottler, TaskEvent};
@@ -111,6 +109,11 @@ pub struct DownloadManager {
     requeue_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<AutoRequeueRequest>>>>,
     /// 🔥 多账号：该管理器所属的账号 UID（`Uid(0)` 表示遗留单账号场景）
     owner_uid: crate::auth::Uid,
+    /// 🔥 应用配置（用于按账号设置做路径/限速决策；账号级别的运行时上下文）
+    ///
+    /// 由于账号可动态创建/删除，`AppConfig` 通过 `Arc<RwLock<Option<Arc<RwLock<...>>>>>
+    /// 间接持有，初始化时为 `None`，由 `set_app_config` 在账号/配置就绪后注入。
+    app_config: Arc<RwLock<Option<Arc<RwLock<crate::config::AppConfig>>>>>,
 }
 
 impl DownloadManager {
@@ -252,6 +255,8 @@ impl DownloadManager {
             requeue_rx: Arc::new(Mutex::new(Some(requeue_rx))),
             // 🔥 多账号归属（从 user_auth.uid 提取）
             owner_uid: crate::auth::Uid::new(user_auth.uid),
+            // 🔥 应用配置（账号/配置就绪后由 set_app_config 注入；先 None）
+            app_config: Arc::new(RwLock::new(None)),
         };
 
         // 🔥 设置槽位超时释放处理器
@@ -589,6 +594,8 @@ impl DownloadManager {
                     reason: "文件已存在".to_string(),
 
                     owner_uid: Some(effective_uid.raw()),
+                    // 单文件 / 共享 manager 上下文下，跳过事件不带 group_id
+                    group_id: None,
                 })
                 .await;
 
@@ -1471,6 +1478,94 @@ impl DownloadManager {
         });
     }
 
+    /// 🔥 启动一个任务的 CDN 链接检测循环
+    ///
+    /// 三条循环共用同一个 `RefreshCoordinator`，保证同一时刻只有一个刷新在跑：
+    /// 1. **速度异常检测** —— 全局速度相对基线大幅下降时换链接；同时订阅并发环境变化，
+    ///    任务数增减时重建基线，任务数减少时主动刷新（把用户手动「暂停再开始」自动化）
+    /// 2. **线程停滞检测** —— 大面积线程接近零速时换链接
+    /// 3. **定时刷新** —— 每 N 分钟强制换一批链接
+    ///
+    /// 参数全部来自配置 `[download.cdn_refresh]`。此前三个调用点各自散落地
+    /// 用 `XxxConfig::default()` 硬编码，且**从未启动过定时刷新**
+    /// （`start_periodic_refresh` 的唯一调用方是没有调用者的旧 `DownloadEngine::download`），
+    /// 导致 `refresh_interval_minutes` 配了也不生效。
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_cdn_detection_loops(
+        engine: Arc<DownloadEngine>,
+        remote_path: String,
+        total_size: u64,
+        url_health: Arc<Mutex<UrlHealthManager>>,
+        chunk_scheduler: Arc<ChunkScheduler>,
+        download_client: reqwest::Client,
+        cancellation_token: CancellationToken,
+        app_config: Arc<RwLock<Option<Arc<RwLock<crate::config::AppConfig>>>>>,
+        task_id: &str,
+    ) {
+        // 读取配置快照（拿不到全局配置时退回默认值）
+        let cdn_config = {
+            let cfg_opt = app_config.read().await.clone();
+            match cfg_opt {
+                Some(cfg) => cfg.read().await.download.cdn_refresh.clone(),
+                None => crate::config::CdnRefreshConfig::default(),
+            }
+        };
+
+        if !cdn_config.enabled {
+            info!(
+                "任务 {} 未启动 CDN 链接检测（download.cdn_refresh.enabled = false）",
+                task_id
+            );
+            return;
+        }
+
+        // 每个任务独立一个协调器，防止三条循环并发刷新同一个任务
+        let refresh_coordinator = Arc::new(RefreshCoordinator::new(
+            cdn_config.to_refresh_coordinator_config(),
+        ));
+
+        let _speed_anomaly_handle = DownloadEngine::start_speed_anomaly_detection(
+            engine.clone(),
+            remote_path.clone(),
+            total_size,
+            url_health.clone(),
+            chunk_scheduler.clone(),
+            download_client.clone(),
+            refresh_coordinator.clone(),
+            cancellation_token.clone(),
+            cdn_config.to_speed_anomaly_config(),
+            chunk_scheduler.subscribe_concurrency_changes(),
+        );
+
+        let _stagnation_handle = DownloadEngine::start_stagnation_detection(
+            engine.clone(),
+            remote_path.clone(),
+            total_size,
+            url_health.clone(),
+            download_client.clone(),
+            chunk_scheduler,
+            refresh_coordinator.clone(),
+            cancellation_token.clone(),
+            cdn_config.to_stagnation_config(),
+        );
+
+        let _periodic_refresh_handle = DownloadEngine::start_periodic_refresh(
+            engine,
+            remote_path,
+            total_size,
+            url_health,
+            download_client,
+            refresh_coordinator,
+            cancellation_token,
+            cdn_config.refresh_interval_minutes,
+        );
+
+        info!(
+            "📈 任务 {} CDN链接检测已启动（速度异常 + 线程停滞 + 每 {} 分钟定时刷新）",
+            task_id, cdn_config.refresh_interval_minutes
+        );
+    }
+
     /// 内部方法：真正启动一个任务
     ///
     /// 该方法会检查任务是否有槽位，有槽位才启动探测
@@ -1540,6 +1635,8 @@ impl DownloadManager {
         let requeue_tx_clone = self.requeue_tx.clone();
         // 🔥 文件夹管理器引用（scheduler 中分片下载需要）
         let folder_manager_arc_clone = self.folder_manager.clone();
+        // 🔥 CDN 检测循环需要读取 [download.cdn_refresh] 配置
+        let app_config_arc = self.app_config.clone();
         // 不再 capture self.owner_uid。
         // 共享 manager 设计下 self.owner_uid 不可靠（同一个 Arc 服务多个账号）。
         // 事件归属一律读 `task.owner_uid`（已在下方 prepare 后从 task 读出 task_owner_uid）。
@@ -1728,6 +1825,15 @@ impl DownloadManager {
                         ) {
                             warn!("注册任务到持久化管理器失败: {}", e);
                         } else {
+                            // 🔥 任务已落盘 → 通知 folder_manager 把对应文件从
+                            //    pending_files 摘掉。在此之前摘掉会导致重启丢文件
+                            //    （建出来但没启动的任务不落盘）。
+                            if let Some(ref gid) = group_id {
+                                if let Some(ref fm) = folder_manager_clone_for_schedule {
+                                    fm.drop_pending_file_after_persist(gid, fs_id).await;
+                                }
+                            }
+
                             info!(
                                 "任务 {} 已注册到持久化管理器 ({} 个分片, is_backup={}, transfer_task_id={:?}, owner_uid={})",
                                 task_id_clone, total_chunks, is_backup, transfer_task_id, task_owner_uid.raw()
@@ -1782,6 +1888,7 @@ impl DownloadManager {
                     let client_for_detection = client.read().unwrap().clone();
                     let cancellation_token_for_detection = cancellation_token.clone();
                     let chunk_scheduler_for_detection = chunk_scheduler.clone();
+                    let app_config_for_detection = app_config_arc.clone();
 
                     // 🔥 获取任务的槽位信息
                     let (slot_id, is_borrowed_slot) = {
@@ -1879,42 +1986,18 @@ impl DownloadManager {
                                 }
                             }
 
-                            // 创建刷新协调器（每个任务独立一个，防止并发刷新）
-                            let refresh_coordinator = Arc::new(RefreshCoordinator::new(
-                                RefreshCoordinatorConfig::default(),
-                            ));
-
-                            // 启动速度异常检测循环
-                            let _speed_anomaly_handle =
-                                DownloadEngine::start_speed_anomaly_detection(
-                                    engine.clone(),
-                                    remote_path.clone(),
-                                    total_size,
-                                    url_health_for_detection.clone(),
-                                    Arc::new(chunk_scheduler_for_detection.clone()),
-                                    client_for_detection.clone(),
-                                    refresh_coordinator.clone(),
-                                    cancellation_token_for_detection.clone(),
-                                    SpeedAnomalyConfig::default(),
-                                );
-
-                            // 启动线程停滞检测循环
-                            let _stagnation_handle = DownloadEngine::start_stagnation_detection(
+                            Self::spawn_cdn_detection_loops(
                                 engine.clone(),
                                 remote_path,
                                 total_size,
                                 url_health_for_detection,
-                                client_for_detection,
                                 Arc::new(chunk_scheduler_for_detection),
-                                refresh_coordinator,
+                                client_for_detection,
                                 cancellation_token_for_detection,
-                                StagnationConfig::default(),
-                            );
-
-                            info!(
-                                "📈 任务 {} CDN链接检测已启动（速度异常+线程停滞）",
-                                task_id_clone
-                            );
+                                app_config_for_detection,
+                                &task_id_clone,
+                            )
+                                .await;
                         }
                         Err(e) => {
                             let error_msg = e.to_string();
@@ -1966,6 +2049,40 @@ impl DownloadManager {
         });
 
         Ok(())
+    }
+
+    /// 🔥 回收一个「借了没用」的文件夹借调位，供等待队列里的任务使用
+    ///
+    /// 文件夹的借调位是在扫描之前一次性借光的，实际用不了那么多；这些空位不会自己
+    /// 变回空闲槽，必须有人来要。返回是否真的回收到了一个。
+    ///
+    /// 备份任务不调用本方法（Backup 语义是只用空闲槽，不削减别人的并行度）。
+    async fn try_reclaim_idle_borrowed_slot(&self, task_id: &str) -> bool {
+        let Some(fm) = self.folder_manager.read().await.clone() else {
+            return false;
+        };
+        if self
+            .task_slot_pool
+            .find_folder_with_borrowed_slots()
+            .await
+            .is_none()
+        {
+            return false;
+        }
+
+        // Box::pin 打断 async 递归：调用方 try_start_waiting_tasks -> reclaim
+        //   -> pause_task -> try_start_waiting_tasks 构成静态调用环
+        //   （运行时靠 skip_try_start_waiting 参数不会真的转回来，但类型层面成环）
+        match Box::pin(fm.reclaim_borrowed_slot_for_owner(self.owner_uid())).await {
+            Some(slot_id) => {
+                info!(
+                    "等待队列任务 {} 无空闲槽位，回收文件夹空闲借调位 {} 后重试",
+                    task_id, slot_id
+                );
+                true
+            }
+            None => false,
+        }
     }
 
     /// 尝试从等待队列启动任务
@@ -2059,8 +2176,29 @@ impl DownloadManager {
                     //    其他任务必须有全局空槽才能分配。
                     //    对于只能走全局槽位的任务，若 available_slots==0，放回队头并跳出：
                     //    避免对文件夹任务造成连锁阻塞。
-                    let available_slots = self.task_slot_pool.available_slots().await;
-                    let can_try_folder_fixed_slot = needs_slot && is_folder_subtask && !is_backup;
+let mut available_slots = self.task_slot_pool.available_slots().await;
+                    let can_try_folder_fixed_slot =
+                        needs_slot && is_folder_subtask && !is_backup;
+
+                    // 🔥 「每个任务保底一个固定槽位」不变式：等待队列重试路径也要能回收借调位
+                    //
+                    // 此前只有 `start_task` / `resume_task` 这两条**用户当场触发**的路径
+                    // 会在拿不到槽位时回收文件夹借调位。任务一旦落进等待队列，后续每秒
+                    // 一次的重试就只是干等 `available_slots > 0` —— 而借调位是被文件夹
+                    // 长期持有的，不会自己变成空闲槽。结果就是：某个文件夹把槽位借光后，
+                    // 排队的普通文件任务永远起不来。
+                    //
+                    // 备份任务不参与回收（与固定位申请的优先级规则一致）：Backup 语义是
+                    // 只用空闲槽，不去削减别人已有的并行度。
+                    if needs_slot
+                        && !can_try_folder_fixed_slot
+                        && available_slots == 0
+                        && !is_backup
+                        && self.try_reclaim_idle_borrowed_slot(&id).await
+                    {
+                        available_slots = self.task_slot_pool.available_slots().await;
+                    }
+
                     if needs_slot && !can_try_folder_fixed_slot && available_slots == 0 {
                         // 必须走全局槽位但 pool 已空 → 放回队尾并跳过
                         // 若本轮此 id 已经因同一原因被放回过，说明队列里所有此类任务都过不去，跳出
@@ -2078,10 +2216,17 @@ impl DownloadManager {
 
                     // 🔥 文件夹子任务优先占用同组的文件夹固定槽位
                     let mut used_folder_fixed_slot = false;
+                    let mut used_folder_borrowed_slot = false;
                     if needs_slot && is_folder_subtask && !is_backup {
                         if let Some(ref folder_id) = try_start_group_id {
                             let folder_mgr = self.folder_manager.read().await.clone();
                             if let Some(fm) = folder_mgr {
+                                // 🔥 文件夹创建时可能没抢到固定位（那条路径只试一次、失败
+                                //    就再没人重试）。这里先补发一次，否则它的子任务会一直
+                                //    因为「文件夹未持有固定槽位」而回落到等待队列空转。
+                                // 同上，Box::pin 打断静态递归环
+                                Box::pin(fm.ensure_folder_fixed_slot(folder_id)).await;
+
                                 if fm.try_allocate_fixed_slot_for_subtask(folder_id, &id).await {
                                     if let Some(task) = self.tasks.read().await.get(&id).cloned() {
                                         let mut t = task.lock().await;
@@ -2101,12 +2246,37 @@ impl DownloadManager {
                                         "⚡ 文件夹子任务 {} 占用文件夹 {} 的固定槽位，已刷新槽位时间戳",
                                         id, folder_id
                                     );
+                                } else if let Some(slot_id) = Box::pin(
+                                    fm.acquire_borrowed_slot_for_subtask(folder_id, &id),
+                                )
+                                    .await
+                                {
+                                    // 🔥 固定位已被同组另一个子任务占着 → 走借调位
+                                    //
+                                    // 顶层任务保底 1 个固定位，剩余容量以借调形式供子任务并行；
+                                    // 借调位可以被新任务要回去（正在下载的子任务会先暂停、
+                                    // 等分片跑完再归还），所以并行度是可回收的。
+                                    // 让子任务去占全局固定位则相反 —— 那是不可归还的容量，
+                                    // 会把后来的顶层任务挡在门外。
+                                    if let Some(task) = self.tasks.read().await.get(&id).cloned() {
+                                        let mut t = task.lock().await;
+                                        t.slot_id = Some(slot_id);
+                                        t.is_borrowed_slot = true;
+                                        t.uses_folder_fixed_slot = false;
+                                    }
+                                    used_folder_borrowed_slot = true;
+                                    // 借调位在 task_slot_pool 中 owner=folder_id，按 folder_id touch
+                                    self.task_slot_pool.touch_slot(folder_id).await;
+                                    info!(
+                                        "⚡ 文件夹子任务 {} 取得文件夹 {} 的借调位 {}，已刷新槽位时间戳",
+                                        id, folder_id, slot_id
+                                    );
                                 }
                             }
                         }
                     }
 
-                    if needs_slot && !used_folder_fixed_slot {
+                    if needs_slot && !used_folder_fixed_slot && !used_folder_borrowed_slot {
                         // 🔥 根据任务类型选择不同的槽位分配方法
                         if is_backup {
                             // 备份任务：只能使用空闲槽位
@@ -2139,10 +2309,28 @@ impl DownloadManager {
                                 "普通任务"
                             };
 
-                            let result = self
+                            let mut result = self
                                 .task_slot_pool
                                 .allocate_fixed_slot_with_priority(&id, false, priority)
                                 .await;
+
+                            // 🔥 顶层任务（非文件夹子任务）拿不到固定位时，
+                            //    先回收一个「借了没用」的文件夹借调位再试一次。
+                            //
+                            //    这正是「新任务进来，借调方要还」这条规则的落点：顶层任务
+                            //    保底 1 个固定位的优先级高于任何文件夹的借调并行度。
+                            //
+                            //    文件夹子任务**不**走这里 —— 它们上面已经走过借调位路径，
+                            //    再去占不可归还的全局固定位会把后来的顶层任务挡在门外。
+                            if result.is_none()
+                                && !is_folder_subtask
+                                && self.try_reclaim_idle_borrowed_slot(&id).await
+                            {
+                                result = self
+                                    .task_slot_pool
+                                    .allocate_fixed_slot_with_priority(&id, false, priority)
+                                    .await;
+                            }
 
                             match result {
                                 Some((sid, preempted_task_id)) => {
@@ -2228,6 +2416,8 @@ impl DownloadManager {
         // 🔥 auto_requeue 发送端和文件夹管理器引用
         let requeue_tx_for_monitor = self.requeue_tx.clone();
         let folder_manager_arc_for_monitor = self.folder_manager.clone();
+        // 🔥 CDN 检测循环需要读取 [download.cdn_refresh] 配置
+        let app_config_arc = self.app_config.clone();
         // 不再 capture self.owner_uid。
         // 共享 manager 设计下 self.owner_uid 不可靠（同一个 Arc 服务多个账号）。
         // 事件归属一律读 `task.owner_uid`（已在内层 spawn 后从 task 读出 task_owner_uid）。
@@ -2410,10 +2600,7 @@ impl DownloadManager {
                                             }
                                         } else {
                                             // 分配失败，使用优先级方法放回队列
-                                            warn!(
-                                                "后台监控：无法为任务 {} 分配槽位，放回等待队列",
-                                                id
-                                            );
+                                            debug!("后台监控：无法为任务 {} 分配槽位，放回等待队列", id);
                                             Self::add_to_queue_by_priority(
                                                 &waiting_queue,
                                                 &tasks,
@@ -2454,6 +2641,7 @@ impl DownloadManager {
                                 let requeue_tx_cloned_monitor = requeue_tx_for_monitor.clone();
                                 let folder_manager_arc_clone =
                                     folder_manager_arc_for_monitor.clone();
+                                let app_config_arc_clone = app_config_arc.clone();
 
                                 tokio::spawn(async move {
                                     // 获取 WebSocket 管理器和文件夹进度发送器
@@ -2723,6 +2911,8 @@ impl DownloadManager {
                                                 cancellation_token.clone();
                                             let chunk_scheduler_for_detection =
                                                 chunk_scheduler_clone.clone();
+                                            let app_config_for_detection =
+                                                app_config_arc_clone.clone();
 
                                             // 🔥 获取任务的槽位信息
                                             let (slot_id, is_borrowed_slot) = {
@@ -2834,40 +3024,18 @@ impl DownloadManager {
                                                         }
                                                     }
 
-                                                    // 创建刷新协调器
-                                                    let refresh_coordinator =
-                                                        Arc::new(RefreshCoordinator::new(
-                                                            RefreshCoordinatorConfig::default(),
-                                                        ));
-
-                                                    // 启动速度异常检测循环
-                                                    let _speed_anomaly_handle = DownloadEngine::start_speed_anomaly_detection(
+                                                    Self::spawn_cdn_detection_loops(
                                                         engine_clone.clone(),
-                                                        remote_path.clone(),
+                                                        remote_path,
                                                         total_size,
-                                                        url_health_for_detection.clone(),
-                                                        Arc::new(chunk_scheduler_for_detection.clone()),
-                                                        client_for_detection.clone(),
-                                                        refresh_coordinator.clone(),
-                                                        cancellation_token_for_detection.clone(),
-                                                        SpeedAnomalyConfig::default(),
-                                                    );
-
-                                                    // 启动线程停滞检测循环
-                                                    let _stagnation_handle =
-                                                        DownloadEngine::start_stagnation_detection(
-                                                            engine_clone.clone(),
-                                                            remote_path,
-                                                            total_size,
-                                                            url_health_for_detection,
-                                                            client_for_detection,
-                                                            Arc::new(chunk_scheduler_for_detection),
-                                                            refresh_coordinator,
-                                                            cancellation_token_for_detection,
-                                                            StagnationConfig::default(),
-                                                        );
-
-                                                    info!("📈 后台任务 {} CDN链接检测已启动（速度异常+线程停滞）", id_clone);
+                                                        url_health_for_detection,
+                                                        Arc::new(chunk_scheduler_for_detection),
+                                                        client_for_detection,
+                                                        cancellation_token_for_detection,
+                                                        app_config_for_detection,
+                                                        &id_clone,
+                                                    )
+                                                        .await;
                                                 }
                                                 Err(e) => {
                                                     let error_msg = e.to_string();
@@ -3074,6 +3242,8 @@ impl DownloadManager {
         // 🔥 auto_requeue 发送端和文件夹管理器引用
         let requeue_tx_for_trigger = self.requeue_tx.clone();
         let folder_manager_arc_for_trigger = self.folder_manager.clone();
+        // 🔥 CDN 检测循环需要读取 [download.cdn_refresh] 配置
+        let app_config_arc = self.app_config.clone();
         // 不再 capture self.owner_uid。
         // 共享 manager 设计下 self.owner_uid 不可靠（同一个 Arc 服务多个账号）。
         // 事件归属一律读 `task.owner_uid`（已在内层 spawn 后从 task 读出 task_owner_uid）。
@@ -3294,6 +3464,7 @@ impl DownloadManager {
                                 let requeue_tx_cloned_trigger = requeue_tx_for_trigger.clone();
                                 let folder_manager_arc_clone_trig =
                                     folder_manager_arc_for_trigger.clone();
+                                let app_config_arc_clone = app_config_arc.clone();
 
                                 tokio::spawn(async move {
                                     // 获取 WebSocket 管理器和文件夹进度发送器
@@ -3562,6 +3733,8 @@ impl DownloadManager {
                                                 cancellation_token.clone();
                                             let chunk_scheduler_for_detection =
                                                 chunk_scheduler_clone.clone();
+                                            let app_config_for_detection =
+                                                app_config_arc_clone.clone();
 
                                             // 🔥 获取任务的槽位信息
                                             let (slot_id, is_borrowed_slot) = {
@@ -3671,40 +3844,18 @@ impl DownloadManager {
                                                         }
                                                     }
 
-                                                    let refresh_coordinator =
-                                                        Arc::new(RefreshCoordinator::new(
-                                                            RefreshCoordinatorConfig::default(),
-                                                        ));
-
-                                                    let _speed_anomaly_handle = DownloadEngine::start_speed_anomaly_detection(
+                                                    Self::spawn_cdn_detection_loops(
                                                         engine_clone.clone(),
-                                                        remote_path.clone(),
+                                                        remote_path,
                                                         total_size,
-                                                        url_health_for_detection.clone(),
-                                                        Arc::new(chunk_scheduler_for_detection.clone()),
-                                                        client_for_detection.clone(),
-                                                        refresh_coordinator.clone(),
-                                                        cancellation_token_for_detection.clone(),
-                                                        SpeedAnomalyConfig::default(),
-                                                    );
-
-                                                    let _stagnation_handle =
-                                                        DownloadEngine::start_stagnation_detection(
-                                                            engine_clone.clone(),
-                                                            remote_path,
-                                                            total_size,
-                                                            url_health_for_detection,
-                                                            client_for_detection,
-                                                            Arc::new(chunk_scheduler_for_detection),
-                                                            refresh_coordinator,
-                                                            cancellation_token_for_detection,
-                                                            StagnationConfig::default(),
-                                                        );
-
-                                                    info!(
-                                                        "📈 0延迟任务 {} CDN链接检测已启动",
-                                                        id_clone
-                                                    );
+                                                        url_health_for_detection,
+                                                        Arc::new(chunk_scheduler_for_detection),
+                                                        client_for_detection,
+                                                        cancellation_token_for_detection,
+                                                        app_config_for_detection,
+                                                        &id_clone,
+                                                    )
+                                                        .await;
                                                 }
                                                 Err(e) => {
                                                     error!("0延迟启动：注册任务失败: {}", e);
@@ -5919,6 +6070,8 @@ impl DownloadManager {
                     // 用调用方传入的 owner_uid，
                     // 不再用共享 manager 的 self.owner_uid（共享 manager 下不可靠）
                     owner_uid: Some(owner_uid.raw()),
+                    // 备份下载不挂在文件夹下载 group 下，跳过事件不带 group_id
+                    group_id: None,
                 })
                 .await;
 
@@ -6038,6 +6191,8 @@ impl DownloadManager {
             is_backup: metadata.is_backup,
             backup_config_id: metadata.backup_config_id.clone(),
             start_retry_count: 0,
+            // 🔥 auto_requeue 退回次数（历史任务不参与退回）
+            requeue_count: 0,
             // 解密字段（历史任务默认无解密）
             is_encrypted: false,
             decrypt_progress: 0.0,
@@ -6732,6 +6887,39 @@ impl DownloadManager {
         (memory_count, history_count)
     }
 
+    /// 删除某个转存任务派生出的全部下载子任务（仅内存，下载文件保留）。
+    ///
+    /// 分享同步在一轮 run 内可能对同一批文件反复提交转存（瞬时错误重试、配额二分、
+    /// 「目标已存在同名」回退分享直下）。被放弃的那次提交如果已经走到下载阶段，
+    /// 它派生的下载子任务不会随之消失 —— 于是同一个文件在「进行中子任务」里出现
+    /// 两条（旧的停在 paused，新的是 pending），即 issue #148。
+    ///
+    /// 这里按 `transfer_task_id` 精确清掉被放弃那一支，不影响其它并行提交。
+    /// 返回清理的任务数。
+    pub async fn delete_tasks_for_transfer(&self, transfer_task_id: &str) -> usize {
+        let target_ids: Vec<String> = {
+            let tasks = self.tasks.read().await;
+            let mut ids = Vec::new();
+            for (id, task) in tasks.iter() {
+                let t = task.lock().await;
+                if t.transfer_task_id.as_deref() == Some(transfer_task_id) {
+                    ids.push(id.clone());
+                }
+            }
+            ids
+        };
+
+        let count = target_ids.len();
+        if !target_ids.is_empty() {
+            let (success, failed) = self.batch_delete_tasks(&target_ids, false).await;
+            info!(
+                "delete_tasks_for_transfer: transfer={} batch_delete 完成: 成功={}, 失败={}",
+                transfer_task_id, success, failed
+            );
+        }
+        count
+    }
+
     /// 获取下载目录
     pub async fn download_dir(&self) -> PathBuf {
         self.download_dir.read().await.clone()
@@ -7321,6 +7509,34 @@ impl DownloadManager {
     /// 设置文件夹下载管理器引用（用于回收借调槽位）
     pub async fn set_folder_manager(&self, folder_manager: Arc<FolderDownloadManager>) {
         *self.folder_manager.write().await = Some(folder_manager);
+    }
+
+    /// 🔥 注入全局配置（用于「内部发起的下载」按设置页策略回退，见 `resolve_conflict_strategy`）
+    ///
+    /// 调用方未显式指定冲突策略时（离线下载转本地下载、转存后自动下载都传 `None`），
+    /// 不能硬编码成 `Overwrite`——用户在设置页选「跳过」就得真跳过。
+    /// `app_config` 持有 `Option`，构造期为 `None`，本方法在运行时注入。
+    pub async fn set_app_config(&self, config: Arc<RwLock<crate::config::AppConfig>>) {
+        *self.app_config.write().await = Some(config);
+    }
+
+    /// 🔥 处理被「全局 fixed slot 抢占」的槽位原持有者
+    ///
+    /// 当普通任务 / 文件夹 / 备份在 `allocate_fixed_slot_with_priority` 抢占到了别人的
+    /// 槽位时，本方法被调用来让原持有者释放该槽位 → 进入 `Paused` 状态或回退到借调位。
+    /// `owner_id` 可能是：
+    /// 1. 文件夹组 ID → 调用 `folder_manager.pause_folder(id)`
+    /// 2. 单文件任务 ID → `pause_preempted_task` + `add_preempted_backup_to_queue`
+    /// 3. 自动备份任务 ID → 同上
+    ///
+    /// **TODO(local fork stub)**: 当前实现为空操作 —— 既不暂停也不回退，借调方只能靠
+    /// 「借调位空闲超时」自然回收。upstream komorebiCarry/main 完整版见其
+    /// `manager.rs:4507` 前后 ~80 行（含 `pause_preempted_task` / `add_preempted_backup_to_queue`
+    /// 私有方法）。合并进来后即可接通完整链路：顶层任务保底一个固定位的优先级高于文件夹
+    /// 借调并行度，被抢占的文件夹会立刻 `Paused` 让位。
+    pub async fn handle_preempted_slot_owner(&self, owner_id: &str) {
+        // stub: 当前直接吞掉，不影响主流程编译/运行；后续接入完整实现
+        let _ = owner_id;
     }
 }
 

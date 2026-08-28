@@ -13,10 +13,28 @@ use tracing::{debug, info, warn};
 /// 默认分片大小: 5MB
 pub const DEFAULT_CHUNK_SIZE: u64 = 5 * 1024 * 1024;
 
+/// 百度网盘单个 Range 请求硬上限：5MB
+///
+/// 跨度超过 5MB 的 Range 会被 CDN 直接拒掉：HTTP 403 + errno 31326
+/// (`user is not authorized, hitcode:104`)，与链接是否有效无关。
+///
+/// 会员等级还有一层更严的上限（见 `VipType::max_chunk_size_mb`），两道闸统一在
+/// [`DownloadConfig::calculate_adaptive_chunk_size`] 收口——分片尺寸只在那里决定，
+/// `ChunkManager` 不再自作主张改写调用方给的尺寸。
+///
+/// [`DownloadConfig::calculate_adaptive_chunk_size`]: crate::config::DownloadConfig::calculate_adaptive_chunk_size
+pub const MAX_RANGE_REQUEST_SIZE: u64 = 5 * 1024 * 1024;
+
 /// 小文件单分片阈值：10MB
 ///
 /// 大量 1MB 左右的小文件如果按 256KB/512KB 拆分，会放大 HTTP Range 请求数、
-/// 调度开销和日志量。小文件直接单分片下载，失败仍走原有 chunk 重试与链接切换。
+/// 调度开销和日志量。小文件尽量单分片下载，失败仍走原有 chunk 重试与链接切换。
+///
+/// 这只是「尽量少拆」的意愿，是否真能一片装下由
+/// [`DownloadConfig::calculate_adaptive_chunk_size`] 连同 [`MAX_RANGE_REQUEST_SIZE`]
+/// 和会员等级上限一起裁决——5~10MB 的文件仍会被拆成两片。
+///
+/// [`DownloadConfig::calculate_adaptive_chunk_size`]: crate::config::DownloadConfig::calculate_adaptive_chunk_size
 pub const SMALL_FILE_SINGLE_CHUNK_THRESHOLD: u64 = 10 * 1024 * 1024;
 
 /// 🔥 分片失败处理动作
@@ -361,13 +379,15 @@ pub struct ChunkManager {
 
 impl ChunkManager {
     /// 创建新的分片管理器（必须传 `owner_uid`）
+    ///
+    /// 纯切分：给多大就切多大，不对 `chunk_size` 做任何策略性改写。
+    /// 尺寸该受哪些上限约束（百度 5MB Range 硬限、会员等级限制、小文件尽量单片）
+    /// 一律由 [`DownloadConfig::calculate_adaptive_chunk_size`] 决定后传进来——
+    /// 这里再叠一层覆盖，只会把那边算好的结果悄悄推翻。
+    ///
+    /// [`DownloadConfig::calculate_adaptive_chunk_size`]: crate::config::DownloadConfig::calculate_adaptive_chunk_size
     pub fn new(total_size: u64, chunk_size: u64, owner_uid: Uid) -> Self {
-        let effective_chunk_size =
-            if total_size > 0 && total_size <= SMALL_FILE_SINGLE_CHUNK_THRESHOLD {
-                total_size
-            } else {
-                chunk_size.max(1)
-            };
+        let effective_chunk_size = chunk_size.max(1);
         let chunks = Self::calculate_chunks(total_size, effective_chunk_size, owner_uid);
         info!(
             "创建分片管理器: uid={}, 文件大小={} bytes, 分片数量={}",
@@ -649,11 +669,66 @@ mod tests {
         assert_eq!(manager.progress(), 0.0);
     }
 
+    /// 回归：5~10MB 的文件曾被 ChunkManager 压成单分片，Range 跨度超过百度 5MB
+    /// 上限，每个链接都返回 403 (errno 31326)，小文件永远下不下来（见 59a865a / PR #121）。
+    ///
+    /// 单测 `calculate_adaptive_chunk_size` 拦不住这个 bug——当年那版它返回的 512KB
+    /// 本身是合规的，是 ChunkManager 事后把它覆盖掉了。所以这里必须端到端地走
+    /// 「算尺寸 → 切分片」两步，直接对最终发出去的 Range 跨度下断言。
+    #[test]
+    fn test_real_ranges_never_exceed_baidu_limit() {
+        use crate::config::{DownloadConfig, VipType};
+
+        const MB: u64 = 1024 * 1024;
+        let sizes = [
+            1,
+            1024,
+            MB,
+            MAX_RANGE_REQUEST_SIZE - 1,
+            MAX_RANGE_REQUEST_SIZE,
+            MAX_RANGE_REQUEST_SIZE + 1,
+            6_582_272, // 实测触发 403 的尺寸（约 6.28MB）
+            SMALL_FILE_SINGLE_CHUNK_THRESHOLD,
+            SMALL_FILE_SINGLE_CHUNK_THRESHOLD + 1,
+            30 * MB,
+            300 * MB,
+            2048 * MB,
+        ];
+
+        for vip in [VipType::Normal, VipType::Vip, VipType::Svip] {
+            for total_size in sizes {
+                let chunk_size = DownloadConfig::calculate_adaptive_chunk_size(total_size, vip);
+                let manager = ChunkManager::new(total_size, chunk_size, Uid::default());
+
+                // 分片必须完整覆盖文件，且没有任何一片越过 5MB
+                assert_eq!(
+                    manager.chunks.iter().map(|c| c.size()).sum::<u64>(),
+                    total_size,
+                    "total_size={total_size} vip={vip:?} 分片未完整覆盖文件"
+                );
+                for chunk in &manager.chunks {
+                    assert!(
+                        chunk.size() <= MAX_RANGE_REQUEST_SIZE,
+                        "total_size={total_size} vip={vip:?} 分片 #{} 跨度 {} 越过 5MB 上限，这个 Range 会被百度以 403 拒掉",
+                        chunk.index,
+                        chunk.size()
+                    );
+                }
+            }
+        }
+
+        // 6.28MB 的文件按等级顶格切成两片，而不是退回 512KB 的碎片
+        let chunk_size = DownloadConfig::calculate_adaptive_chunk_size(6_582_272, VipType::Svip);
+        let manager = ChunkManager::new(6_582_272, chunk_size, Uid::default());
+        assert_eq!(manager.chunk_count(), 2);
+        assert_eq!(manager.chunks[0].range, 0..MAX_RANGE_REQUEST_SIZE);
+        assert_eq!(manager.chunks[1].range, MAX_RANGE_REQUEST_SIZE..6_582_272);
+    }
+
     #[test]
     fn test_chunk_calculation() {
-        // 🔥 尺寸必须大于 SMALL_FILE_SINGLE_CHUNK_THRESHOLD（10MB）：
-        //    小于等于该阈值的文件会被有意压成单分片（见 ChunkManager::new），
-        //    用字节级的小尺寸构造用例会永远得到 chunk_count() == 1。
+        // 用 10MB 作单位纯粹是沿用历史写法（早先 ChunkManager 会把小文件压成单片，
+        // 用例必须避开那个阈值）。现在切分是纯函数，尺寸任取，保持原样以免改动语义。
         const UNIT: u64 = SMALL_FILE_SINGLE_CHUNK_THRESHOLD; // 每片 10MB
 
         // 测试完整分片：100MB / 10MB = 10 片
@@ -671,7 +746,7 @@ mod tests {
 
     #[test]
     fn test_progress_calculation() {
-        // 同上：需超过小文件单分片阈值，否则只会得到 1 个分片
+        // 同上：沿用 10MB 单位
         const UNIT: u64 = SMALL_FILE_SINGLE_CHUNK_THRESHOLD; // 每片 10MB
         let mut manager = ChunkManager::new(UNIT * 10, UNIT, Uid::default());
         assert_eq!(manager.progress(), 0.0);
@@ -694,7 +769,7 @@ mod tests {
 
     #[test]
     fn test_next_pending() {
-        // 同上：需超过小文件单分片阈值，否则只会得到 1 个分片
+        // 同上：沿用 10MB 单位
         const UNIT: u64 = SMALL_FILE_SINGLE_CHUNK_THRESHOLD; // 每片 10MB
         let mut manager = ChunkManager::new(UNIT * 3, UNIT, Uid::default());
 

@@ -17,6 +17,8 @@ pub use path_validator::{PathValidationResult, PathValidator};
 pub use crate::web_auth::{AuthMode, WebAuthConfig};
 
 use crate::common::ProxyConfig;
+// 分片尺寸的两道上限常量与下载分片实现同源，避免两处各写一个 5MB / 10MB
+use crate::downloader::chunk::{MAX_RANGE_REQUEST_SIZE, SMALL_FILE_SINGLE_CHUNK_THRESHOLD};
 
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1088,29 +1090,39 @@ impl DownloadConfig {
 
     /// 根据文件大小和 VIP 等级计算最优分片大小(字节)
     ///
+    /// 这里是分片尺寸的**唯一决策点**：`ChunkManager` 只负责按给定尺寸切，
+    /// 不再叠加自己的策略。历史教训见下方「小文件」一节。
+    ///
     /// 自适应策略:
-    /// - < 5MB: 256KB
-    /// - 5-10MB: 512KB
+    /// - <= 10MB: 整个文件一片（小文件尽量少发请求，见下）
     /// - 10-50MB: 1MB
     /// - 50-100MB: 2MB
     /// - 100-500MB: 4MB
     /// - >= 500MB: 5MB
     ///
-    /// ⚠️ 重要:百度网盘限制单个 Range 请求最大 5MB,超过会返回 403 Forbidden
+    /// 小文件:
+    /// 大量 1MB 左右的小文件如果按 256KB/512KB 拆分，会放大 HTTP Range 请求数、
+    /// 调度开销和日志量，所以 <= [`SMALL_FILE_SINGLE_CHUNK_THRESHOLD`] 的文件
+    /// 优先整片下载——但这只是意愿，最终仍要过下面两道闸。
     ///
-    /// 同时根据 VIP 等级限制最大分片大小:
-    /// - 普通用户:最高 4MB
-    /// - 普通会员:最高 5MB
-    /// - SVIP:最高 5MB
+    /// ⚠️ 两道硬约束（顺序无关，取最小）:
+    /// 1. 百度限制单个 Range 请求最大 [`MAX_RANGE_REQUEST_SIZE`]（5MB），
+    ///    超过直接 403 Forbidden + errno 31326，与链接是否有效无关；
+    /// 2. VIP 等级上限（见 [`VipType::max_chunk_size_mb`]）：
+    ///    普通用户 / 普通会员最高 4MB，SVIP 最高 5MB。
+    ///
+    /// 所以 6.3MB 的文件不会真的走单片：普通用户切成 4MB + 2.3MB，
+    /// SVIP 切成 5MB + 1.3MB。曾经有过绕开这两道闸的单片实现，
+    /// 结果 5~10MB 的文件每个链接都拿 403，永远下不下来。
     pub fn calculate_adaptive_chunk_size(file_size_bytes: u64, vip_type: VipType) -> u64 {
         const KB: u64 = 1024;
         const MB: u64 = 1024 * KB;
 
         // 根据文件大小计算基础分片大小
-        let base_chunk_size = if file_size_bytes < 5 * MB {
-            256 * KB // < 5MB → 256KB
-        } else if file_size_bytes < 10 * MB {
-            512 * KB // 5-10MB → 512KB
+        let base_chunk_size = if file_size_bytes > 0
+            && file_size_bytes <= SMALL_FILE_SINGLE_CHUNK_THRESHOLD
+        {
+            file_size_bytes // <= 10MB → 尽量单分片（仍受下方两道上限裁剪）
         } else if file_size_bytes < 50 * MB {
             MB // 10-50MB → 1MB
         } else if file_size_bytes < 100 * MB {
@@ -1125,7 +1137,10 @@ impl DownloadConfig {
         let max_allowed = vip_type.max_chunk_size_mb() * MB;
 
         // 返回较小的值（确保不超过 VIP 限制和百度的 5MB 硬限制）
-        base_chunk_size.min(max_allowed).min(5 * MB)
+        base_chunk_size
+            .min(max_allowed)
+            .min(MAX_RANGE_REQUEST_SIZE)
+            .max(1)
     }
 
     /// 根据 VIP 类型获取推荐配置
@@ -1435,6 +1450,90 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.server.port, 18888); // 默认端口 18888
         assert_eq!(config.download.max_global_threads, 15); // SVIP 默认
+    }
+
+    /// 回归：5~10MB 的文件曾被压成单分片，Range 跨度超过百度 5MB 上限，
+    /// 每个链接都返回 403 (errno 31326)，小文件永远下不下来。
+    /// 引入于 59a865a（PR #121），当时绕开了本函数直接在 ChunkManager 里改写尺寸。
+    #[test]
+    fn test_adaptive_chunk_size_never_exceeds_hard_limits() {
+        const MB: u64 = 1024 * 1024;
+
+        // 实测触发 403 的尺寸：6582272 字节（约 6.28MB）
+        for vip in [VipType::Normal, VipType::Vip, VipType::Svip] {
+            let size = DownloadConfig::calculate_adaptive_chunk_size(6_582_272, vip);
+            assert!(
+                size <= MAX_RANGE_REQUEST_SIZE,
+                "{vip:?}: 分片 {size} 越过百度 5MB Range 上限"
+            );
+            assert!(
+                size <= vip.max_chunk_size_mb() * MB,
+                "{vip:?}: 分片 {size} 越过该等级上限 {}MB",
+                vip.max_chunk_size_mb()
+            );
+        }
+
+        // 边界与常见尺寸全覆盖，任何等级都不得越过两道闸
+        let sizes = [
+            0,
+            1,
+            1024,
+            MAX_RANGE_REQUEST_SIZE - 1,
+            MAX_RANGE_REQUEST_SIZE,
+            MAX_RANGE_REQUEST_SIZE + 1,
+            SMALL_FILE_SINGLE_CHUNK_THRESHOLD - 1,
+            SMALL_FILE_SINGLE_CHUNK_THRESHOLD,
+            SMALL_FILE_SINGLE_CHUNK_THRESHOLD + 1,
+            30 * MB,
+            80 * MB,
+            300 * MB,
+            2048 * MB,
+        ];
+        for vip in [VipType::Normal, VipType::Vip, VipType::Svip] {
+            for size in sizes {
+                let chunk = DownloadConfig::calculate_adaptive_chunk_size(size, vip);
+                assert!(
+                    chunk >= 1 && chunk <= MAX_RANGE_REQUEST_SIZE.min(vip.max_chunk_size_mb() * MB),
+                    "file_size={size} vip={vip:?} 算出非法分片尺寸 {chunk}"
+                );
+            }
+        }
+    }
+
+    /// 上限之内的小文件仍保持单分片，避免退回 256KB/512KB 的请求放大
+    /// （这是 PR #121 的原始诉求，修 403 时不能顺手把它废掉）。
+    #[test]
+    fn test_adaptive_chunk_size_keeps_small_file_single_chunk() {
+        const MB: u64 = 1024 * 1024;
+
+        // 1MB / 3MB 整片装得下，任何等级都应当一片到底
+        for vip in [VipType::Normal, VipType::Vip, VipType::Svip] {
+            assert_eq!(DownloadConfig::calculate_adaptive_chunk_size(MB, vip), MB);
+            assert_eq!(
+                DownloadConfig::calculate_adaptive_chunk_size(3 * MB, vip),
+                3 * MB
+            );
+        }
+
+        // 装不下的按各自等级顶格切：普通用户 4MB，SVIP 5MB
+        assert_eq!(
+            DownloadConfig::calculate_adaptive_chunk_size(6_582_272, VipType::Normal),
+            4 * MB
+        );
+        assert_eq!(
+            DownloadConfig::calculate_adaptive_chunk_size(6_582_272, VipType::Svip),
+            5 * MB
+        );
+
+        // 大文件不受小文件分支影响，仍走原有阶梯
+        assert_eq!(
+            DownloadConfig::calculate_adaptive_chunk_size(30 * MB, VipType::Svip),
+            MB
+        );
+        assert_eq!(
+            DownloadConfig::calculate_adaptive_chunk_size(80 * MB, VipType::Svip),
+            2 * MB
+        );
     }
 
     #[tokio::test]

@@ -3,18 +3,20 @@
     <!-- 面包屑导航 -->
     <div class="breadcrumb-bar">
       <el-breadcrumb separator="/">
-        <el-breadcrumb-item @click="navigateToDir('/')">
-          <el-icon>
-            <HomeFilled/>
-          </el-icon>
-          <span v-if="!isMobile">根目录</span>
+        <el-breadcrumb-item :class="{ 'is-last': pathParts.length === 0 }">
+          <span class="crumb-link" @click="navigateToDir('/')">
+            <el-icon>
+              <HomeFilled/>
+            </el-icon>
+            <span v-if="!isMobile">根目录</span>
+          </span>
         </el-breadcrumb-item>
         <el-breadcrumb-item
             v-for="(part, index) in pathParts"
-            :key="index"
-            @click="navigateToDir(getPathUpTo(index))"
+            :key="getPathUpTo(index)"
+            :class="{ 'is-last': index === pathParts.length - 1 }"
         >
-          {{ part }}
+          <span class="crumb-link" @click="navigateToDir(getPathUpTo(index))">{{ part }}</span>
         </el-breadcrumb-item>
       </el-breadcrumb>
 
@@ -1715,6 +1717,32 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
+  }
+
+  // Element Plus 用 :last-child 结构伪类控制分隔符与当前层级样式，而路径栏的层级
+  // 是原地增删的；部分浏览器不会重算该伪类，旧的"最后一级"会残留 display:none，
+  // 表现为中间的 "/" 连同外边距一起消失（issue #149）。这里改用显式 is-last 类判断。
+  :deep(.el-breadcrumb__item:not(.is-last) .el-breadcrumb__separator) {
+    display: inline-block;
+  }
+
+  :deep(.el-breadcrumb__item.is-last .el-breadcrumb__separator) {
+    display: none;
+  }
+
+  // 点击热区放在层级文字上，分隔符不参与点击
+  .crumb-link {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  // 非当前层级的路径可点击跳转，给出手型指针与悬停高亮
+  :deep(.el-breadcrumb__item:not(.is-last)) .crumb-link {
+    cursor: pointer;
+
+    &:hover {
+      color: var(--el-color-primary);
+    }
   }
 
   .toolbar-buttons {

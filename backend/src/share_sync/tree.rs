@@ -241,6 +241,8 @@ pub fn nodes_to_items(tree: &Tree, indices: &[usize]) -> Vec<ShareSnapshotItem> 
                 size: n.size,
                 name: n.name.clone(),
                 is_dir: n.is_dir,
+                // 默认 false；`execution_diff_with_directory_ancestors` 后续会把占位目录标 true。
+                subtree_pruned: false,
             })
         })
         .collect()

@@ -4591,6 +4591,46 @@ let share_root = derive_share_root(task_share_root_path.as_deref(), &filtered_fi
         (memory_count, history_count)
     }
 
+    /// 丢弃一个转存任务：取消并移除它本身，**连带清掉它派生的下载子任务**。
+    ///
+    /// 用于分享同步放弃某次提交后重新提交的场景（瞬时错误重试、配额二分、
+    /// 「目标已存在同名」回退分享直下）。此前只是不再理会被放弃的 task_id：
+    /// 它若已经走到下载阶段，派生出的下载子任务会一直留着，与重新提交那一支
+    /// 叠成同一个文件两条子任务（issue #148）。
+    ///
+    /// 只清理任务记录，不删已下载的本地文件。返回 `(下载子任务数, 文件夹子任务数)`。
+    pub async fn discard_task(&self, task_id: &str) -> (usize, usize) {
+        // 🔥 顺序要紧：**先移除转存任务，再收下载段**。
+        //
+        // `remove_task` 会 cancel 该任务的 cancellation_token —— 它正是 `start_auto_download`
+        // 这个「下载子任务生产者」的停止信号。反过来先清下载段的话，仍在跑的
+        // start_auto_download 会在清理之后继续 `create_backup_task`，新建出来的那批
+        // 就漏网了，等于没清。
+        //
+        // 生产者观察到取消需要一点时间，因此仍有极小的漏网窗口；兜底是每轮 run 开始
+        // 前的 `sweep_residual_subtasks`（见 share_sync/manager.rs），下一轮会收干净。
+        if let Err(e) = self.remove_task(task_id).await {
+            warn!("discard_task: 移除转存任务 {} 失败: {}", task_id, e);
+        }
+
+        let dl_count = match self.download_manager_handle().await {
+            Some(dm) => dm.delete_tasks_for_transfer(task_id).await,
+            None => 0,
+        };
+        let folder_count = match self.folder_download_manager_handle().await {
+            Some(fdm) => fdm.delete_folders_for_transfer(task_id).await,
+            None => 0,
+        };
+
+        if dl_count > 0 || folder_count > 0 {
+            info!(
+                "discard_task: task={} 已丢弃（下载子任务={}, 文件夹子任务={}）",
+                task_id, dl_count, folder_count
+            );
+        }
+        (dl_count, folder_count)
+    }
+
     /// 获取配置
     pub async fn get_config(&self) -> TransferConfig {
         self.config.read().await.clone()

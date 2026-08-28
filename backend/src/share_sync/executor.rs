@@ -164,6 +164,16 @@ pub trait ExecutorHooks: Send + Sync {
         timeout: Duration,
     ) -> Result<(), ShareSyncError>;
 
+    /// 放弃一个已提交的转存任务：取消它本身 + 清掉它派生的下载子任务。
+    ///
+    /// 执行器在「同一批内容重新提交」之前必须调用它（瞬时错误重试、配额二分、
+    /// 「目标已存在同名」回退分享直下）。否则被放弃那一支若已经走到下载阶段，
+    /// 它的下载子任务会一直留着，与新提交那一支在「进行中子任务」里叠成同一个
+    /// 文件两条（旧的 paused / 新的 pending），即 issue #148。
+    ///
+    /// 默认实现为空：mock 不建真实任务，无需清理。
+    async fn discard_task(&self, _task_id: &str) {}
+
     /// 删除网盘上的文件（按路径）
     async fn delete_netdisk(
         &self,
@@ -1319,6 +1329,24 @@ impl<'a> ShareSyncExecutor<'a> {
         .await
     }
 
+    /// 收走一次「已提交但被放弃」的转存任务（连带它派生的下载子任务）。
+    ///
+    /// `slot` 被 `take()` 清空，保证同一个 task_id 只收一次。`reason` 只进日志，
+    /// 用来在事后区分是重试、回退还是判终态触发的收尾。
+    ///
+    /// 为什么必须收：执行器对同一批内容重新提交前若不清理上一支，两支的下载子任务
+    /// 会同时挂在「进行中子任务」里 —— 旧的停在 paused、新的是 pending，用户看到
+    /// 的就是同一个文件两条重复项（issue #148）。
+    async fn discard_abandoned(&self, slot: &mut Option<String>, run_id: &str, reason: &str) {
+        if let Some(task_id) = slot.take() {
+            info!(
+                "share_sync_discard_abandoned: run_id={} task_id={} reason={}",
+                run_id, task_id, reason
+            );
+            self.hooks.discard_task(&task_id).await;
+        }
+    }
+
     /// 提交一组节点(可能是 1 个目录、N 个散文件、混合)的 transfer
     ///
     /// 这是阶段 4 二分递归的核心。
@@ -1465,6 +1493,10 @@ impl<'a> ShareSyncExecutor<'a> {
                 .unwrap_or(1000);
 
         let mut attempt: u32 = 0;
+        // 最近一次**已提交但被放弃**的转存任务。重新提交同一批内容之前必须先把它
+        // 连同派生的下载子任务收走（`discard_task`），否则两支会在「进行中子任务」
+        // 里叠成同一个文件两条（旧的 paused / 新的 pending），即 issue #148。
+        let mut abandoned_task_id: Option<String> = None;
         let mut final_err: ShareSyncError = loop {
             let submit_result: Result<String, ShareSyncError> = match target {
                 SyncTarget::Netdisk(t) => {
@@ -1555,6 +1587,8 @@ impl<'a> ShareSyncExecutor<'a> {
                                 "share_sync_wait_failed: run_id={} depth={} first_path={} task_id={} err={}",
                                 run_id, depth, first_path, task_id, e
                             );
+                            // 这一支到此为止。记下来，等确定要重试 / 回退 / 判终态时统一收走。
+                            abandoned_task_id = Some(task_id);
                             e
                         }
                     }
@@ -1574,6 +1608,8 @@ impl<'a> ShareSyncExecutor<'a> {
                     "share_sync_transient_retry: run_id={} depth={} first_path={} attempt={}/{} backoff_ms={} err={}",
                     run_id, depth, first_path, attempt + 1, transient_max_retries, backoff, attempt_err
                 );
+                self.discard_abandoned(&mut abandoned_task_id, run_id, "transient_retry")
+                    .await;
                 if backoff > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                 }
@@ -1582,6 +1618,11 @@ impl<'a> ShareSyncExecutor<'a> {
             }
             break attempt_err;
         };
+
+        // 重试已放弃，这一支不会再有人驱动它了。下面无论走 already-exists 回退、
+        // 二分拆小还是直接判终态，都会对同一批内容另起炉灶，先把它收走。
+        self.discard_abandoned(&mut abandoned_task_id, run_id, "attempts_exhausted")
+            .await;
 
         // 「目标位置已存在同名」优雅继续（不判失败）:
         // 网盘目标里已经有这份内容,所以不应整批判失败。
@@ -1651,10 +1692,19 @@ impl<'a> ShareSyncExecutor<'a> {
                                     None,
                                 );
                             }
-                            self.hooks
+                            match self
+                                .hooks
                                 .wait_transfer_task(&task_id, true, TASK_WAIT_TIMEOUT)
                                 .await
-                                .map(|()| task_id)
+                            {
+                                Ok(()) => Ok(task_id),
+                                Err(e) => {
+                                    // 回退这一支也没成:它可能已经建出下载子任务,
+                                    // 下面二分拆小会对同一批内容再提一遍,先记下来收走。
+                                    abandoned_task_id = Some(task_id);
+                                    Err(e)
+                                }
+                            }
                         }
                         Err(e) => Err(e),
                     };
@@ -1684,6 +1734,12 @@ impl<'a> ShareSyncExecutor<'a> {
                                 "share_sync_already_exists_local_fallback_failed: run_id={} depth={} first_path={} err={}",
                                 run_id, depth, first_path, e
                             );
+                            self.discard_abandoned(
+                                &mut abandoned_task_id,
+                                run_id,
+                                "already_exists_local_fallback_failed",
+                            )
+                                .await;
                             final_err = e;
                         }
                     }
@@ -2782,6 +2838,8 @@ mod tests {
         // 记录每次下载（单文件 + 整批）携带的「转存网盘中转目录」，None=分享直下。
         // 用于断言「网盘+本地」合并腿确实把文件转存到网盘目录再下载。
         download_netdisk_dirs: Mutex<Vec<Option<String>>>,
+        // issue #148：记录被 `discard_task` 收走的 task_id，断言重新提交前确实清理过。
+        discarded: Mutex<Vec<String>>,
     }
     #[async_trait]
     impl ExecutorHooks for MockHooks {
@@ -2861,6 +2919,9 @@ mod tests {
                 return Err(err);
             }
             Ok(())
+        }
+        async fn discard_task(&self, task_id: &str) {
+            self.discarded.lock().unwrap().push(task_id.to_string());
         }
         async fn delete_netdisk(&self, _t: &str, paths: &[String]) -> Result<(), ShareSyncError> {
             self.netdisk_deletes
@@ -3609,6 +3670,117 @@ mod tests {
         let items = pm.list_run_items(&outcome.run_id).unwrap();
         assert!(!items.is_empty());
         assert!(items.iter().all(|i| i.status == "completed"));
+    }
+
+    /// issue #148 回归：**瞬时错误重试**重新提交前，必须先收走上一次提交的任务。
+    ///
+    /// 之前是直接 `continue` 重提：上一支若已经走到下载阶段，它派生的下载子任务
+    /// 不会消失，与新提交那一支在「进行中子任务」里叠成同一个文件两条
+    /// （旧的 paused / 新的 pending）—— 用户看到的就是重复任务项。
+    #[tokio::test]
+    async fn test_transient_retry_discards_previous_submission() {
+        let dir = tempdir().unwrap();
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let mut s = sub();
+        s.targets = vec![SyncTarget::Local(LocalTarget {
+            local_path: db_dir.join("local"),
+            conflict_strategy: None,
+            mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+        })];
+        let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let prev = ShareSnapshot::with_items(&s.id, vec![]);
+        pm.save_snapshot(&prev).unwrap();
+        let curr = ShareSnapshot::with_items(
+            &s.id,
+            vec![
+                ShareSnapshotItem::new("/d", "d", 10, 0, true),
+                item("/d/a.mp4", 11, 1),
+                item("/d/b.mp4", 12, 1),
+            ],
+        );
+        let diff = diff_snapshots(Some(&prev), &curr);
+        let hooks = MockHooks::default();
+        // 提交成功（拿到 bdl-1），等待阶段抛「超时」→ Transient → 退避后重试。
+        // 第二次提交(bdl-2)不注入错误 → 成功。
+        hooks.wait_errors.lock().unwrap().insert(
+            "bdl-1".to_string(),
+            ShareSyncError::DownloadError("等待任务完成超时: task_id=bdl-1".into()),
+        );
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+        let outcome = ex
+            .apply_with_run_id_tree("rt".into(), &captured(), &diff)
+            .await;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(
+            hooks.batch_downloads.lock().unwrap().len(),
+            2,
+            "应当重试提交了第二次"
+        );
+        assert_eq!(
+            *hooks.discarded.lock().unwrap(),
+            vec!["bdl-1".to_string()],
+            "重试前必须先收走被放弃的 bdl-1，否则它的下载子任务会与 bdl-2 重复"
+        );
+    }
+
+    /// issue #148 回归：**已存在同名回退分享直下**时，被放弃的那次提交同样要收走。
+    ///
+    /// 这条路径在真实日志里最常见（`share_sync_already_exists_local`）：转存到网盘
+    /// 目标撞同名 → 改走分享直下补本地副本。若上一支已建出下载子任务而不清理，
+    /// 就会和回退这一支叠成重复项。
+    #[tokio::test]
+    async fn test_already_exists_fallback_discards_previous_submission() {
+        let dir = tempdir().unwrap();
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let mut s = sub();
+        s.targets = vec![
+            SyncTarget::Netdisk(NetdiskTarget {
+                remote_path: "/同步".into(),
+                save_fs_id: 0,
+                conflict_strategy: None,
+            }),
+            SyncTarget::Local(LocalTarget {
+                local_path: db_dir.join("local"),
+                conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+            }),
+        ];
+        let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+        let prev = ShareSnapshot::with_items(&s.id, vec![]);
+        pm.save_snapshot(&prev).unwrap();
+        let curr = ShareSnapshot::with_items(
+            &s.id,
+            vec![
+                ShareSnapshotItem::new("/d", "d", 10, 0, true),
+                item("/d/a.csv", 11, 1),
+            ],
+        );
+        let diff = diff_snapshots(Some(&prev), &curr);
+        let hooks = MockHooks::default();
+        // 提交成功（bdl-1），等待阶段抛「已存在同名」→ 走本地腿分享直下回退。
+        hooks.wait_errors.lock().unwrap().insert(
+            "bdl-1".to_string(),
+            ShareSyncError::TransferError("目标位置已存在同名文件: a.csv".into()),
+        );
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+        let outcome = ex
+            .apply_with_run_id_tree("rt".into(), &captured(), &diff)
+            .await;
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+        assert_eq!(
+            *hooks.discarded.lock().unwrap(),
+            vec!["bdl-1".to_string()],
+            "回退重提前必须先收走被放弃的 bdl-1"
+        );
+        let dirs = hooks.download_netdisk_dirs.lock().unwrap();
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[1], None, "回退那次必须是分享直下(netdisk_dir=None)");
     }
 
     #[test]

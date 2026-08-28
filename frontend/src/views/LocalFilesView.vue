@@ -3,18 +3,20 @@
     <!-- 面包屑导航 -->
     <div class="breadcrumb-bar">
       <el-breadcrumb separator="/">
-        <el-breadcrumb-item @click="navigateToDir('')">
-          <el-icon>
-            <HomeFilled/>
-          </el-icon>
-          <span v-if="!isMobile">下载目录</span>
+        <el-breadcrumb-item :class="{ 'is-last': pathParts.length === 0 }">
+          <span class="crumb-link" @click="navigateToDir('')">
+            <el-icon>
+              <HomeFilled/>
+            </el-icon>
+            <span v-if="!isMobile">下载目录</span>
+          </span>
         </el-breadcrumb-item>
         <el-breadcrumb-item
             v-for="(part, index) in pathParts"
-            :key="index"
-            @click="navigateToDir(getPathUpTo(index))"
+            :key="getPathUpTo(index)"
+            :class="{ 'is-last': index === pathParts.length - 1 }"
         >
-          {{ part }}
+          <span class="crumb-link" @click="navigateToDir(getPathUpTo(index))">{{ part }}</span>
         </el-breadcrumb-item>
       </el-breadcrumb>
 
@@ -153,17 +155,23 @@ const fileListRef = ref<HTMLElement | null>(null)
 const selectedFiles = ref<FileEntry[]>([])
 const batchDeleting = ref(false)
 
+// 本地路径的分隔符随系统而定：Windows 是 \，类 Unix 是 /，两种都要能拆
+const PATH_SEPARATOR_RE = /[\\/]/
+
 const pathParts = computed(() => {
   if (!currentPath.value || currentPath.value === rootPath.value) return []
   const relative = currentPath.value.startsWith(rootPath.value)
       ? currentPath.value.slice(rootPath.value.length)
       : currentPath.value
-  return relative.split('/').filter(p => p)
+  return relative.split(PATH_SEPARATOR_RE).filter(p => p)
 })
 
 function getPathUpTo(index: number): string {
   const parts = pathParts.value.slice(0, index + 1)
-  return rootPath.value + '/' + parts.join('/')
+  // 沿用根目录自身的分隔符，避免在 Windows 下拼出 D:\root/a/b 这种混合路径
+  const separator = rootPath.value.includes('\\') ? '\\' : '/'
+  const root = rootPath.value.replace(/[\\/]+$/, '')
+  return root + separator + parts.join(separator)
 }
 
 async function loadFiles(path: string, append: boolean = false) {
@@ -301,6 +309,30 @@ export { Folder, Document, Refresh, HomeFilled, Loading, Delete } from '@element
   border-bottom: 1px solid #e0e0e0;
   background: white;
   gap: 12px;
+
+  // 同 FilesView：不依赖 :last-child 结构伪类，避免层级增删后分隔符残留 display:none
+  :deep(.el-breadcrumb__item:not(.is-last) .el-breadcrumb__separator) {
+    display: inline-block;
+  }
+
+  :deep(.el-breadcrumb__item.is-last .el-breadcrumb__separator) {
+    display: none;
+  }
+
+  // 点击热区放在层级文字上，分隔符不参与点击
+  .crumb-link {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  // 非当前层级的路径可点击跳转，给出手型指针与悬停高亮
+  :deep(.el-breadcrumb__item:not(.is-last)) .crumb-link {
+    cursor: pointer;
+
+    &:hover {
+      color: var(--el-color-primary);
+    }
+  }
 
   .toolbar-buttons {
     display: flex;

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::fs::OpenOptions;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -38,6 +38,12 @@ const SPEED_WINDOW_SIZE: usize = 7;
 /// 只有窗口积累了这么多样本，才开始使用窗口 median 进行 score 判定
 /// 避免前期数据不足导致误判
 const MIN_WINDOW_SAMPLES: usize = 5;
+
+/// 加权链接选择用的黄金比例常数（≈ 2^64 / φ）
+///
+/// 用于把 `chunk_index` 映射成权重空间里的低差异（low-discrepancy）位置，
+/// 见 [`UrlHealthManager::get_url_hybrid`]。
+const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// 下载临时文件后缀
 /// 下载过程中使用此后缀，完成后 rename 去掉后缀
@@ -278,6 +284,14 @@ pub struct UrlHealthManager {
     /// 用于 score 判定，避免早期高速持续影响后期判定
     /// 注意：VecDeque 需要互斥访问，但每个 URL 的窗口独立
     url_recent_speeds: Arc<DashMap<String, StdMutex<VecDeque<f64>>>>,
+    /// 🔥 CDN 节点身份 -> 该节点当前生效的 URL
+    ///
+    /// 百度每次 Locate 返回的链接主机、路径、节点编号都不变，只有 `sign` / `time` /
+    /// `r` / `dp-logid` 这些签名参数会变。按完整 URL 字符串去重会把每次刷新拿到的
+    /// 链接全部当成"新节点"，链接池无限膨胀，同一个物理节点还会占据多个权重槽位、
+    /// 稀释加权分流。这张表按 [`stable_url_identity`](Self::stable_url_identity)
+    /// 算出的稳定身份索引，刷新时用于识别"同一节点的新签名"。
+    url_identity: Arc<DashMap<String, String>>,
 
     // 🔥 简单类型 → 原子操作
     /// 全局平均速度（KB/s），用于判断慢速（存储为 f64.to_bits()）
@@ -301,6 +315,7 @@ impl UrlHealthManager {
         let url_scores = Arc::new(DashMap::new());
         let cooldown_secs = Arc::new(DashMap::new());
         let url_recent_speeds = Arc::new(DashMap::new());
+        let url_identity = Arc::new(DashMap::new());
         let mut total_speed = 0.0;
 
         for (url, speed) in urls.iter().zip(speeds.iter()) {
@@ -317,6 +332,7 @@ impl UrlHealthManager {
             cooldown_secs.insert(url.clone(), 10);
             // 🔥 初始化短期速度窗口为空 StdMutex<VecDeque>
             url_recent_speeds.insert(url.clone(), StdMutex::new(VecDeque::new()));
+            url_identity.insert(Self::stable_url_identity(url), url.clone());
             total_speed += speed;
         }
 
@@ -340,30 +356,49 @@ impl UrlHealthManager {
             url_avg_speeds,
             url_sample_counts,
             url_recent_speeds,
+            url_identity,
         }
     }
 
+    /// 🔥 计算一条下载链接的「CDN 节点身份」
+    ///
+    /// 稳定部分：主机名 + 路径（文件哈希）+ `to=` 参数（百度 PCS 的节点编号，
+    /// 同一主机会以不同 `to` 值出现多条链接）。
+    /// 易变部分：`sign` / `time` / `r` / `dp-logid` 等签名参数，每次 Locate 都不同。
+    ///
+    /// scheme 一并剥掉：同一个节点可能同时以 http 和 https 出现。
+    fn stable_url_identity(url: &str) -> String {
+        let without_scheme = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .unwrap_or(url);
+
+        let (host_and_path, query) = match without_scheme.split_once('?') {
+            Some((hp, q)) => (hp, Some(q)),
+            None => (without_scheme, None),
+        };
+
+        let node = query
+            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("to=")))
+            .unwrap_or("");
+
+        format!("{host_and_path}#to={node}")
+    }
+
     /// 获取可用的链接数量（权重>0的链接，包括原始和动态添加的）
+    ///
+    /// `weights` 表本身就同时收录原始链接和 [`add_refreshed_urls`](Self::add_refreshed_urls)
+    /// 动态加入的链接，直接数它即可。
+    ///
+    /// 历史实现数完 `weights` 之后又把 `additional_urls` 单独数了一遍，刷新来的链接
+    /// 被计入两次 —— 实测 5 条原始 + 5 条刷新报成 15。这个虚高的数字会让
+    /// [`get_warm_url`](Self::get_warm_url)、[`try_restore_links`](Self::try_restore_links)
+    /// 的「链接不足 5 条」判断提前失效，本该做的链接自愈被跳过。
     pub fn available_count(&self) -> usize {
-        let original_count = self
-            .weights
+        self.weights
             .iter()
             .filter(|entry| *entry.value() > 0)
-            .count();
-
-        // 计算动态添加链接中可用的数量
-        let additional_count = self
-            .additional_urls
-            .iter()
-            .filter(|entry| {
-                self.weights
-                    .get(entry.key())
-                    .map(|w| *w > 0)
-                    .unwrap_or(false)
-            })
-            .count();
-
-        original_count + additional_count
+            .count()
     }
 
     /// 根据索引获取可用链接（跳过权重=0的链接）
@@ -462,8 +497,25 @@ impl UrlHealthManager {
                 .map(|(url, _)| url.clone());
         }
 
-        // 使用 chunk_index 计算在权重空间的位置
-        let position = (chunk_index as f64 % total_weight).abs();
+        // 🔥 用黄金比例序列把 chunk_index 映射到权重空间的 [0, total_weight)
+        //
+        // 旧实现是 `position = chunk_index % total_weight`，把「分片序号」直接当成
+        // 「权重坐标」用 —— 两者量纲完全不同：权重是 KB/s 量级（EWMA 预热后单条链接
+        // 就有几千），而同一时刻在跑的十几个分片，chunk_index 只相差几十。结果这十几个
+        // 分片的 position 全部落在**第一条链接**的权重区间里，任务的所有连接都压在同一个
+        // CDN 节点上，要下完上千个分片才会挪到下一条链接。
+        //
+        // 现在先把 chunk_index 过一遍 Weyl 序列（乘黄金比例取小数部分）得到 [0,1) 的
+        // 低差异位置，再乘 total_weight。两个性质：
+        // - 相邻 chunk_index 的位置相距约 0.618（模 1），必然落到不同链接 → 并发分片散开
+        // - 低差异序列，长期占比仍严格收敛到各链接的权重比例 → 加权语义不变
+        // - 与 total_weight 的绝对量级无关，彻底消除上面的量纲错配
+        //
+        // 取高 53 位再除以 2^53：f64 能精确表示 53 位整数，保证 frac 严格落在 [0, 1)，
+        // 不会因为浮点进位取到 1.0 而漏出下面的累加循环。
+        let frac = ((chunk_index as u64).wrapping_mul(GOLDEN_RATIO_U64) >> 11) as f64
+            / (1u64 << 53) as f64;
+        let position = frac * total_weight;
 
         let mut accumulated = 0.0;
         for (url, weight) in &available {
@@ -495,7 +547,9 @@ impl UrlHealthManager {
         let mut disabled: Vec<(&String, i32)> = self
             .all_urls
             .iter()
-            .filter(|url| self.weights.get(*url).map(|w| *w == 0).unwrap_or(true))
+            // 注意 unwrap_or(false)：weights 里没有条目 = 该 URL 已退休（换签名被替换），
+            // 不是"被禁用待恢复"，不能拿去探测
+            .filter(|url| self.weights.get(*url).map(|w| *w == 0).unwrap_or(false))
             .map(|url| {
                 let score = self.url_scores.get(url).map(|s| *s).unwrap_or(0);
                 (url, score)
@@ -549,6 +603,14 @@ impl UrlHealthManager {
         };
 
         let url_string = url.to_string();
+
+        // 🔥 链接已退休（换签名后被替换）：此时可能还有分片正用着旧签名跑完最后一段。
+        // 这些结果不能再记账 —— 下面几处用的都是 `entry().or_insert()`，会把已经摘干净
+        // 的旧 URL 重新插回各张表，留下永远不会被选中、也不会被清理的僵尸条目。
+        if !self.weights.contains_key(&url_string) {
+            debug!("跳过已退休链接的速度记账: {} ({:.2} KB/s)", url, speed_kbps);
+            return speed_kbps;
+        }
 
         // 2. 🔥 先用旧窗口计算阈值（在加入新速度之前）
         // 阈值 = 该链接历史窗口median * 0.6
@@ -771,7 +833,10 @@ impl UrlHealthManager {
         let mut candidates: Vec<(String, std::time::Instant)> = Vec::new();
 
         for url in &self.all_urls {
-            let weight = self.weights.get(url).map(|w| *w).unwrap_or(0);
+            // 没有 weights 条目 = 已退休（换签名被替换），不是待恢复的降权链接
+            let Some(weight) = self.weights.get(url).map(|w| *w) else {
+                continue;
+            };
             if weight == 0 {
                 if let Some(probe_time_ref) = self.next_probe_time.get(url) {
                     let probe_time = *probe_time_ref;
@@ -811,6 +876,56 @@ impl UrlHealthManager {
             }
         }
         info!("🔄 已重置所有链接的速度窗口（任务数变化，带宽重新分配）");
+    }
+
+    /// 🔥 清空「在旧并发环境下学到的」链接判断，回到刚探测完的中立状态
+    ///
+    /// [`reset_speed_windows`](Self::reset_speed_windows) 只清短期窗口，而真正决定
+    /// [`get_url_hybrid`](Self::get_url_hybrid) 分流比例的是 `url_avg_speeds`（EWMA）
+    /// 和 `url_scores` —— 这两个在并发任务退出后仍然停留在被压低的值上，导致剩下的任务
+    /// 继续按「竞争期测出来的相对快慢」分配分片。
+    ///
+    /// 调用时机：ChunkScheduler 检测到活跃任务数**减少**（兄弟子任务完成 / 另一个任务
+    /// 暂停或结束），此时带宽格局已变，之前学到的东西全部作废。
+    ///
+    /// 只处理当前可用（weight > 0）的链接：已被降权的链接交给
+    /// [`try_restore_links`](Self::try_restore_links) 的探测流程，避免在这里把真正失效
+    /// 的链接（403/404/挂死）无条件复活。
+    pub fn reset_learned_state(&self) {
+        let mut reset_count = 0usize;
+
+        // 原始链接 + 刷新期间动态添加的链接
+        let mut urls: Vec<String> = self.all_urls.clone();
+        urls.extend(self.additional_urls.iter().map(|e| e.key().clone()));
+
+        for url in &urls {
+            if self.weights.get(url).map(|w| *w == 0).unwrap_or(true) {
+                continue;
+            }
+
+            // score 回到中立值，不再带着竞争期的加减分
+            self.url_scores.insert(url.clone(), 50);
+
+            // EWMA 回落到探测速度，采样计数清零（下次 record 会直接赋值而非混合）
+            if let Some(probe_speed) = self.url_speeds.get(url).map(|v| *v) {
+                self.url_avg_speeds.insert(url.clone(), probe_speed);
+            }
+            self.url_sample_counts.insert(url.clone(), 0);
+
+            // 短期窗口清空，重新进入前期保护期
+            if let Some(window_entry) = self.url_recent_speeds.get(url) {
+                if let Ok(mut window) = window_entry.value().try_lock() {
+                    window.clear();
+                }
+            }
+
+            reset_count += 1;
+        }
+
+        info!(
+            "🔄 已重置 {} 条可用链接的学习状态（score/EWMA/窗口），并发环境已变化",
+            reset_count
+        );
     }
 
     /// 处理探测失败 (指数退避)
@@ -929,15 +1044,28 @@ impl UrlHealthManager {
     /// * `new_speeds` - 对应的探测速度 (KB/s)
     pub fn add_refreshed_urls(&self, new_urls: Vec<String>, new_speeds: Vec<f64>) {
         for (url, speed) in new_urls.iter().zip(new_speeds.iter()) {
-            // 检查是否已存在（在原始列表或已添加列表中）
-            if self.all_urls.contains(url) || self.additional_urls.contains_key(url) {
-                // 更新速度
-                self.url_speeds.insert(url.clone(), *speed);
-                debug!("更新已存在链接速度: {} ({:.2} KB/s)", url, speed);
-                continue;
+            let identity = Self::stable_url_identity(url);
+            let known = self.url_identity.get(&identity).map(|e| e.value().clone());
+
+            match known {
+                // 同一节点、URL 字符串也没变：只刷新探测速度
+                Some(ref existing) if existing == url => {
+                    self.url_speeds.insert(url.clone(), *speed);
+                    debug!("更新已存在链接速度: {} ({:.2} KB/s)", url, speed);
+                    continue;
+                }
+                // 同一节点的新签名 URL：换用新的、退休旧的，健康状态整体搬过去。
+                // 这正是定时刷新存在的意义 —— 赶在旧签名 expires 之前换上新的，
+                // 同时不让链接池因为签名变化而膨胀。
+                Some(stale) => {
+                    self.adopt_resigned_url(&stale, url, *speed);
+                    self.url_identity.insert(identity, url.clone());
+                    continue;
+                }
+                None => {}
             }
 
-            // 新链接：初始化所有状态（与 new() 方法完全一致）
+            // 真正的新节点：初始化所有状态（与 new() 方法完全一致）
             self.additional_urls.insert(url.clone(), true);
             self.weights.insert(url.clone(), 1);
             self.url_speeds.insert(url.clone(), *speed);
@@ -950,8 +1078,61 @@ impl UrlHealthManager {
             self.url_recent_speeds
                 .insert(url.clone(), StdMutex::new(VecDeque::with_capacity(50)));
 
+            self.url_identity.insert(identity, url.clone());
+
             info!("🔗 添加新下载链接: {} (速度: {:.2} KB/s)", url, speed);
         }
+    }
+
+    /// 🔥 同一 CDN 节点换签名：启用新 URL，退休旧 URL，健康状态原样继承
+    ///
+    /// 物理节点没变，之前学到的 score / EWMA / 速度窗口依然适用，不该因为换了个
+    /// 签名就清零重学。旧 URL 从所有表里彻底摘掉，这样：
+    /// - [`get_url_hybrid`](Self::get_url_hybrid) / [`get_url`](Self::get_url) 不会再选中它
+    /// - [`available_count`](Self::available_count) 不会把它算进可用数
+    /// - warm / restore 流程也不会把这条已经作废的签名捡回来探测
+    fn adopt_resigned_url(&self, stale: &str, fresh: &str, probe_speed: f64) {
+        let score = self.url_scores.get(stale).map(|v| *v).unwrap_or(50);
+        let avg_speed = self
+            .url_avg_speeds
+            .get(stale)
+            .map(|v| *v)
+            .unwrap_or(probe_speed);
+        let samples = self.url_sample_counts.get(stale).map(|v| *v).unwrap_or(0);
+        let cooldown = self.cooldown_secs.get(stale).map(|v| *v).unwrap_or(10);
+        let window: VecDeque<f64> = self
+            .url_recent_speeds
+            .get(stale)
+            .and_then(|e| e.value().try_lock().ok().map(|w| w.clone()))
+            .unwrap_or_default();
+
+        // 退休旧签名
+        self.additional_urls.remove(stale);
+        self.weights.remove(stale);
+        self.url_speeds.remove(stale);
+        self.url_avg_speeds.remove(stale);
+        self.url_sample_counts.remove(stale);
+        self.url_scores.remove(stale);
+        self.cooldown_secs.remove(stale);
+        self.next_probe_time.remove(stale);
+        self.url_recent_speeds.remove(stale);
+
+        // 启用新签名：探测刚刚成功，权重至少给到 1（旧签名若已降权，这里等于给节点
+        // 一次重新证明自己的机会；score 原样继承，慢节点仍然只会分到很少的分片）
+        self.additional_urls.insert(fresh.to_string(), true);
+        self.weights.insert(fresh.to_string(), 1);
+        self.url_speeds.insert(fresh.to_string(), probe_speed);
+        self.url_avg_speeds.insert(fresh.to_string(), avg_speed);
+        self.url_sample_counts.insert(fresh.to_string(), samples);
+        self.url_scores.insert(fresh.to_string(), score);
+        self.cooldown_secs.insert(fresh.to_string(), cooldown);
+        self.url_recent_speeds
+            .insert(fresh.to_string(), StdMutex::new(window));
+
+        debug!(
+            "🔁 链接换签名: 节点复用，继承 score={}, EWMA={:.2} KB/s, 采样={} 次",
+            score, avg_speed, samples
+        );
     }
 
     /// 🔥 获取所有可用链接（包括原始和刷新添加的）
@@ -2585,23 +2766,110 @@ impl DownloadEngine {
         refresh_coordinator: Arc<RefreshCoordinator>,
         cancellation_token: CancellationToken,
         config: crate::common::SpeedAnomalyConfig,
+        concurrency_rx: broadcast::Receiver<crate::downloader::ConcurrencyChange>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let detector = crate::common::SpeedAnomalyDetector::new(config.clone());
+            let mut detector = crate::common::SpeedAnomalyDetector::new(config.clone());
             let check_interval = Duration::from_secs(config.check_interval_secs);
             let mut timer = tokio::time::interval(check_interval);
+            // Closed 之后置为 None，避免 recv() 立即返回导致 select! 空转
+            let mut concurrency_rx = Some(concurrency_rx);
 
             info!(
                 "📈 速度异常检测循环已启动: 检查间隔 {}秒, 基线建立时间 {}秒",
                 config.check_interval_secs, config.baseline_establish_secs
             );
 
+            // 本轮循环被什么唤醒
+            enum Wakeup {
+                /// 到了定时检查点，走正常的速度异常判定
+                Timer,
+                /// 并发环境变化；`None` 表示事件积压被丢弃，只知道变过、不知道方向
+                Concurrency(Option<crate::downloader::ConcurrencyChange>),
+            }
+
             loop {
-                timer.tick().await;
+                // 🔥 同时等待「定时检查」和「并发环境变化」
+                //
+                // 基线速度是在任务启动 N 秒后一次性采样的，它只对采样当时的并发环境有效：
+                // - 任务在竞争中启动 → 基线记的是被压低的值，之后再也不会觉得自己慢
+                // - 任务独自启动后别人加入 → 速度合法腰斩会被误判成异常，白刷一次链接
+                // 所以任务数一变就必须重建基线。
+                let wakeup = tokio::select! {
+                    biased;
+
+                    _ = cancellation_token.cancelled() => {
+                        debug!("速度异常检测: 任务已取消，退出");
+                        break;
+                    }
+
+                    result = async {
+                        // 分支守卫：通道已关闭时永久挂起，交给其它分支
+                        match concurrency_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match result {
+                            Ok(change) => Wakeup::Concurrency(Some(change)),
+                            // 事件积压丢失：并发环境确实变过，方向未知，按最保守的方式处理
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("速度异常检测: 并发变化事件积压丢弃 {} 条，按未知方向处理", n);
+                                Wakeup::Concurrency(None)
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                concurrency_rx = None;
+                                continue;
+                            }
+                        }
+                    }
+
+                    _ = timer.tick() => Wakeup::Timer,
+                };
 
                 if cancellation_token.is_cancelled() {
                     debug!("速度异常检测: 任务已取消，退出");
                     break;
+                }
+
+                if let Wakeup::Concurrency(change) = wakeup {
+                    detector.reset();
+                    info!("📊 并发环境变化 {:?}，速度基线已重置，将重新建立", change);
+
+                    // 任务数减少 = 带宽被释放，但当前链接集合和它们的健康状态都是在
+                    // 更拥挤的环境下定下来的（探测被压低、慢链接被淘汰）。
+                    // 主动重新拉一批链接，让任务能用上释放出来的带宽 ——
+                    // 这正是用户手动「暂停再开始」时发生的事，现在自动做掉。
+                    //
+                    // 方向未知（事件积压）时也刷一次：可能丢掉的正是一个「减少」事件。
+                    // 刷新本身被 RefreshCoordinator 按 min_refresh_interval_secs 节流，
+                    // 多刷一次不会造成风暴。
+                    if !matches!(
+                        change,
+                        Some(crate::downloader::ConcurrencyChange::Increased { .. })
+                    ) {
+                        if let Some(_guard) = refresh_coordinator.try_acquire() {
+                            info!("🔄 活跃任务减少，主动刷新下载链接");
+                            match engine
+                                .refresh_download_links(
+                                    &remote_path,
+                                    total_size,
+                                    &url_health,
+                                    &download_client,
+                                )
+                                .await
+                            {
+                                Ok(count) => {
+                                    info!("🔄 任务数减少触发刷新完成: 新增/更新 {} 个链接", count)
+                                }
+                                Err(e) => error!("🔄 任务数减少触发刷新失败: {}", e),
+                            }
+                        } else {
+                            debug!("任务数减少: 跳过刷新（另一个刷新正在进行）");
+                        }
+                    }
+
+                    continue;
                 }
 
                 // ⚠️ 修复问题3：获取全局总速度（所有活跃任务速度之和）
@@ -3659,6 +3927,198 @@ mod tests {
         let user_auth = create_mock_user_auth();
         let engine = DownloadEngine::new(user_auth);
         assert_eq!(engine.vip_type as u32, 2); // SVIP
+    }
+
+    /// 同一个 CDN 节点重新签名后必须被认成同一条链接
+    ///
+    /// 两条 URL 取自 2026-08-21 的真实日志：主机 / 路径 / `to` 相同，
+    /// 只有 sign、r、time 这些签名参数不同。
+    #[test]
+    fn test_stable_url_identity_ignores_volatile_signature() {
+        let before = "https://allall02.baidupcs.com/file/22218b433sf8a61cc01c7ed397655b54?bkt=en-4d16&fid=3745347292-250528-95798568691574&time=1787277053&sign=FDTAXUbGERQlBHSKfWaqi-AAA&to=80&size=12757764231&r=968065036&dp-logid=111";
+        let after = "https://allall02.baidupcs.com/file/22218b433sf8a61cc01c7ed397655b54?bkt=en-4d16&fid=3745347292-250528-95798568691574&time=1787299999&sign=FDTAXUbGERQlBHSKfWaqi-ZZZ&to=80&size=12757764231&r=123456789&dp-logid=222";
+
+        assert_eq!(
+            UrlHealthManager::stable_url_identity(before),
+            UrlHealthManager::stable_url_identity(after),
+            "同一节点换签名后应识别为同一条链接"
+        );
+
+        // http / https 同一节点
+        let http_variant = after.replacen("https://", "http://", 1);
+        assert_eq!(
+            UrlHealthManager::stable_url_identity(after),
+            UrlHealthManager::stable_url_identity(&http_variant)
+        );
+
+        // 同一主机但 to（节点编号）不同 → 不同链接
+        let other_node = after.replace("&to=80&", "&to=145&");
+        assert_ne!(
+            UrlHealthManager::stable_url_identity(after),
+            UrlHealthManager::stable_url_identity(&other_node),
+            "同主机不同 to 是不同节点，不能合并"
+        );
+
+        // 不同主机 → 不同链接
+        let other_host = after.replacen("allall02", "allall06", 1);
+        assert_ne!(
+            UrlHealthManager::stable_url_identity(after),
+            UrlHealthManager::stable_url_identity(&other_host)
+        );
+    }
+
+    /// 刷新拿到重新签名的 URL 时，链接池不应膨胀，健康状态要跟着走
+    #[test]
+    fn test_refresh_reuses_node_instead_of_growing_pool() {
+        let url_v1 = "https://allall02.baidupcs.com/file/abc?to=80&sign=AAA&r=1".to_string();
+        let health = UrlHealthManager::new(vec![url_v1.clone()], vec![150.0]);
+        assert_eq!(health.available_count(), 1);
+
+        // 该节点已经跑出真实速度和评分
+        health.url_avg_speeds.insert(url_v1.clone(), 6800.0);
+        health.url_scores.insert(url_v1.clone(), 91);
+        health.url_sample_counts.insert(url_v1.clone(), 42);
+
+        // 刷新拿回同一节点的新签名
+        let url_v2 = "https://allall02.baidupcs.com/file/abc?to=80&sign=ZZZ&r=2".to_string();
+        health.add_refreshed_urls(vec![url_v2.clone()], vec![160.0]);
+
+        // 池子不膨胀
+        assert_eq!(
+            health.available_count(),
+            1,
+            "同一节点换签名不应新增一条链接"
+        );
+        // 旧签名彻底退休
+        assert!(!health.weights.contains_key(&url_v1));
+        assert!(!health.url_scores.contains_key(&url_v1));
+        // 新签名接手，健康状态继承
+        assert_eq!(*health.url_scores.get(&url_v2).unwrap(), 91);
+        assert_eq!(*health.url_avg_speeds.get(&url_v2).unwrap(), 6800.0);
+        assert_eq!(*health.url_sample_counts.get(&url_v2).unwrap(), 42);
+        // 选链只会给出新签名
+        assert_eq!(health.get_url_hybrid(0).unwrap(), url_v2);
+
+        // 已退休的旧签名上还有分片跑完 → 不能把它复活成僵尸条目
+        health.record_chunk_speed(&url_v1, 5 * 1024 * 1024, 800);
+        assert!(!health.weights.contains_key(&url_v1));
+        assert!(!health.url_scores.contains_key(&url_v1));
+        assert_eq!(health.available_count(), 1);
+
+        // 真正的新节点才会让池子变大
+        health.add_refreshed_urls(
+            vec!["https://allall06.baidupcs.com/file/abc?to=145&sign=QQQ".to_string()],
+            vec![200.0],
+        );
+        assert_eq!(health.available_count(), 2);
+    }
+
+    /// available_count 不能把刷新加入的链接重复计数
+    ///
+    /// 回归用例：实测 5 条原始 + 5 条刷新被报成 15（正确值 10）。
+    #[test]
+    fn test_available_count_does_not_double_count_refreshed() {
+        let originals: Vec<String> = (0..5)
+            .map(|i| format!("https://cdn{i}.baidupcs.com/file/abc?to={i}"))
+            .collect();
+        let health = UrlHealthManager::new(originals, vec![150.0; 5]);
+        assert_eq!(health.available_count(), 5);
+
+        let refreshed: Vec<String> = (10..15)
+            .map(|i| format!("https://cdn{i}.baidupcs.com/file/abc?to={i}"))
+            .collect();
+        health.add_refreshed_urls(refreshed, vec![150.0; 5]);
+
+        assert_eq!(health.available_count(), 10, "刷新加入的链接被重复计数了");
+    }
+
+    /// 同一时刻在跑的十几个分片必须散到不同链接上
+    ///
+    /// 回归用例：旧实现 `position = chunk_index % total_weight` 把分片序号当权重坐标用，
+    /// EWMA 预热后单条链接权重就有几千，而并发分片的 chunk_index 只差几十 —— 十几个分片
+    /// 会全部落到同一条链接，任务所有连接压在一个 CDN 节点上。
+    #[test]
+    fn test_get_url_hybrid_spreads_concurrent_chunks() {
+        let urls: Vec<String> = (0..6).map(|i| format!("https://cdn{i}.example.com/f")).collect();
+        let health = UrlHealthManager::new(urls.clone(), vec![160.0; 6]);
+
+        // 模拟 EWMA 预热到真实分片速度（5MB / 0.7s ≈ 7300 KB/s）
+        for url in &urls {
+            health.url_avg_speeds.insert(url.clone(), 7300.0);
+            health.url_scores.insert(url.clone(), 100);
+        }
+
+        // 15 个并发分片（连续的 chunk_index）
+        let picked: std::collections::HashSet<String> = (300..315)
+            .filter_map(|i| health.get_url_hybrid(i))
+            .collect();
+
+        assert_eq!(
+            picked.len(),
+            6,
+            "15 个并发分片应覆盖全部 6 条链接，实际只用了 {} 条",
+            picked.len()
+        );
+    }
+
+    /// 长期分流比例仍要收敛到权重比例（加权语义不能因为打散而丢失）
+    #[test]
+    fn test_get_url_hybrid_respects_weight_ratio() {
+        let urls: Vec<String> = (0..3).map(|i| format!("https://cdn{i}.example.com/f")).collect();
+        let health = UrlHealthManager::new(urls.clone(), vec![100.0, 200.0, 700.0]);
+        for url in &urls {
+            health.url_scores.insert(url.clone(), 100);
+        }
+
+        const N: usize = 100_000;
+        let mut counts = [0usize; 3];
+        for i in 0..N {
+            let picked = health.get_url_hybrid(i).unwrap();
+            let idx = urls.iter().position(|u| *u == picked).unwrap();
+            counts[idx] += 1;
+        }
+
+        // 期望 10% / 20% / 70%，低差异序列的偏差应远小于 1 个百分点
+        let expected = [0.10, 0.20, 0.70];
+        for (i, exp) in expected.iter().enumerate() {
+            let actual = counts[i] as f64 / N as f64;
+            assert!(
+                (actual - exp).abs() < 0.01,
+                "链接 #{i} 分流比例 {actual:.4} 偏离期望 {exp:.4} 过多"
+            );
+        }
+    }
+
+    /// 并发环境变化后，竞争期学到的 score / EWMA 必须回到中立值
+    #[test]
+    fn test_reset_learned_state_clears_contended_judgements() {
+        let urls: Vec<String> = (0..3).map(|i| format!("https://cdn{i}.example.com/f")).collect();
+        let health = UrlHealthManager::new(urls.clone(), vec![150.0, 150.0, 150.0]);
+
+        // 竞争期：EWMA 被压低、score 被扣分、窗口塞满样本
+        for url in &urls {
+            health.url_avg_speeds.insert(url.clone(), 42.0);
+            health.url_scores.insert(url.clone(), 14);
+            health.url_sample_counts.insert(url.clone(), 37);
+            if let Some(w) = health.url_recent_speeds.get(url) {
+                w.value().lock().unwrap().push_back(42.0);
+            }
+        }
+        // 其中一条已被降权，不应被无条件复活
+        health.weights.insert(urls[2].clone(), 0);
+
+        health.reset_learned_state();
+
+        for url in &urls[..2] {
+            assert_eq!(*health.url_scores.get(url).unwrap(), 50);
+            assert_eq!(*health.url_avg_speeds.get(url).unwrap(), 150.0);
+            assert_eq!(*health.url_sample_counts.get(url).unwrap(), 0);
+            assert!(health.url_recent_speeds.get(url).unwrap().value().lock().unwrap().is_empty());
+        }
+
+        // 已降权的链接保持降权，交给 try_restore_links 的探测流程
+        assert_eq!(*health.weights.get(&urls[2]).unwrap(), 0);
+        assert_eq!(*health.url_scores.get(&urls[2]).unwrap(), 14);
     }
 
     #[test]

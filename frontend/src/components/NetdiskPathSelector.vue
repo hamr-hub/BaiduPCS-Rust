@@ -9,23 +9,24 @@
 
     <!-- 目录选择对话框 -->
     <el-dialog
-      v-model="dialogVisible"
-      title="选择保存位置"
-      width="600px"
-      :close-on-click-modal="false"
-      @open="handleDialogOpen"
+        v-model="dialogVisible"
+        title="选择保存位置"
+        width="600px"
+        :close-on-click-modal="false"
+        @open="handleDialogOpen"
     >
       <!-- 面包屑导航 -->
       <div class="breadcrumb-nav">
         <el-breadcrumb separator="/">
-          <el-breadcrumb-item @click="navigateTo('/')">
+          <el-breadcrumb-item :class="{ 'is-last': pathParts.length === 0 }" @click="navigateTo('/')">
             <el-icon><HomeFilled /></el-icon>
             根目录
           </el-breadcrumb-item>
           <el-breadcrumb-item
-            v-for="(part, index) in pathParts"
-            :key="index"
-            @click="navigateTo(getPathUpTo(index))"
+              v-for="(part, index) in pathParts"
+              :key="getPathUpTo(index)"
+              :class="{ 'is-last': index === pathParts.length - 1 }"
+              @click="navigateTo(getPathUpTo(index))"
           >
             {{ part }}
           </el-breadcrumb-item>
@@ -40,12 +41,12 @@
 
           <!-- 目录列表 -->
           <div
-            v-for="folder in folders"
-            :key="folder.fs_id"
-            class="folder-item"
-            :class="{ selected: selectedFsId === folder.fs_id }"
-            @click="selectFolder(folder)"
-            @dblclick="enterFolder(folder)"
+              v-for="folder in folders"
+              :key="folder.fs_id"
+              class="folder-item"
+              :class="{ selected: selectedFsId === folder.fs_id }"
+              @click="selectFolder(folder)"
+              @dblclick="enterFolder(folder)"
           >
             <el-icon class="folder-icon"><Folder /></el-icon>
             <span class="folder-name">{{ folder.server_filename }}</span>
@@ -65,10 +66,10 @@
       <!-- 新建文件夹 -->
       <div class="create-folder">
         <el-input
-          v-model="newFolderName"
-          placeholder="新建文件夹"
-          size="small"
-          @keyup.enter="createNewFolder"
+            v-model="newFolderName"
+            placeholder="新建文件夹"
+            size="small"
+            @keyup.enter="createNewFolder"
         >
           <template #append>
             <el-button @click="createNewFolder" :loading="creating">
@@ -266,8 +267,8 @@ async function createNewFolder() {
 
   try {
     const fullPath = currentPath.value === '/'
-      ? `/${name}`
-      : `${currentPath.value}/${name}`
+        ? `/${name}`
+        : `${currentPath.value}/${name}`
 
     await createFolder(fullPath)
     ElMessage.success('文件夹创建成功')
@@ -351,6 +352,15 @@ watch(() => props.modelValue, (newVal) => {
     &:hover {
       color: var(--el-color-primary);
     }
+  }
+
+  // 不依赖 :last-child 结构伪类控制分隔符，避免层级增删后 "/" 残留 display:none
+  :deep(.el-breadcrumb__item:not(.is-last) .el-breadcrumb__separator) {
+    display: inline-block;
+  }
+
+  :deep(.el-breadcrumb__item.is-last .el-breadcrumb__separator) {
+    display: none;
   }
 }
 

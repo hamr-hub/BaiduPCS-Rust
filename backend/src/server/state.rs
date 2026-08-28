@@ -247,6 +247,9 @@ impl AppState {
         let folder_download_manager = Arc::new(FolderDownloadManager::new(
             config.download.download_dir.clone(),
         ));
+        // 🔥 待办文件补任务兜底循环：拿不到槽位而退回 pending_files 的文件，
+        //    在文件夹一个子任务都没在跑时没有任何事件驱动，靠这个循环兜住
+        folder_download_manager.start_pending_refill_loop();
 
         // 🔥 创建持久化管理器
         let base_dir = std::path::Path::new(".");

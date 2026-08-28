@@ -121,6 +121,12 @@ pub enum ShareSyncEvent {
         /// 预计剩余时间(秒,仅下载段且 speed>0 时有值)，与自动备份对齐
         #[serde(default)]
         eta_seconds: Option<u64>,
+        /// 所属父任务的 `task_id`：文件夹子文件行指向文件夹那一行的 `"folder:{id}"`，
+        /// 顶层行为 `None`。前端据此把子文件嵌套渲染在文件夹下面。
+        ///
+        /// 老事件流没这个字段，`serde(default)` 兜底成 `None`（顶层），与改动前一致。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_task_id: Option<String>,
         #[serde(default)]
         owner_uid: u64,
     },
@@ -289,6 +295,7 @@ mod tests {
             progress: 50.0,
             speed: 1024,
             eta_seconds: Some(50),
+            parent_task_id: None,
             owner_uid: 9,
         };
         assert_eq!(e.subscription_id(), "s1");

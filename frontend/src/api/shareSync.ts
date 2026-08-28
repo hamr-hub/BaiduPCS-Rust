@@ -187,6 +187,15 @@ export interface ShareSyncSubtask {
   speed: number
   /** 预计剩余时间（秒，仅下载段且 speed>0 时有值） */
   eta_seconds?: number | null
+  /**
+   * 所属父任务的 `task_id`；顶层行没有这个字段。
+   *
+   * 目前只有一种父子关系：文件夹聚合行（`task_id` 形如 `folder:{id}`）与它当前
+   * 正在跑的子文件下载任务。文件夹的子任务是**按批物化**的（后端 folder_manager
+   * 只维持约等于槽位数的活跃子任务，其余文件还在 pending 队列里没有任务对象），
+   * 所以这里能拿到的是「正在跑的那几个文件」，不是文件夹的全量文件列表。
+   */
+  parent_task_id?: string | null
   /** 订阅所属账号 uid */
   owner_uid: number
 }
@@ -222,6 +231,8 @@ export type ShareSyncWsEvent =
   progress: number
   speed: number
   eta_seconds?: number | null
+  /** 文件夹子文件行指向文件夹那一行的 `folder:{id}`；顶层行缺省 */
+  parent_task_id?: string | null
   owner_uid?: number
 }
 

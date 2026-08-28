@@ -1294,9 +1294,13 @@ function handleDownloadEvent(event: DownloadEvent) {
           mainListWsTime.set(groupId, Date.now())
         }
       }
+      // 🔥 进度事件带 200ms 节流，收尾那一帧多半被丢掉，进度条会停在最后一次采样上
+      //    （小文件尤其明显，肉眼可见地卡在 86% 之类）。完成事件自带终值，这里统一采信。
+      //    老后端不带该字段 → 回退到各行自己的 total_size。
+      const finalSize = event.downloaded_size ?? event.total_size
       if (index !== -1) {
         downloadItems.value[index].status = 'completed'
-        downloadItems.value[index].downloaded_size = downloadItems.value[index].total_size
+        downloadItems.value[index].downloaded_size = finalSize ?? downloadItems.value[index].total_size
         downloadItems.value[index].speed = 0
         // 🔥 如果是加密文件，完成时解密进度也应该是 100%
         if (downloadItems.value[index].is_encrypted) {
@@ -1304,10 +1308,19 @@ function handleDownloadEvent(event: DownloadEvent) {
         }
         mainListWsTime.set(taskId, Date.now())
       }
-    }
       // 🔥 更新文件夹详情弹窗中的子任务完成状态（不设置 decrypt_progress，避免影响普通文件）
-      updateFolderDetailTask(taskId, {status: 'completed' as TaskStatus, speed: 0}, true)
+      //    这一行的进度条同样按 downloaded_size / total_size 现算，必须一并推到终值
+      updateFolderDetailTask(
+          taskId,
+          {
+            status: 'completed' as TaskStatus,
+            speed: 0,
+            ...(finalSize !== undefined ? {downloaded_size: finalSize} : {}),
+          },
+          true,
+      )
       break
+    }
 
     case 'failed':
       // 任务失败

@@ -25,7 +25,7 @@ use crate::share_sync::events::{
 use crate::share_sync::executor::{
     ApplyOutcome, ExecutorHooks, NetdiskTargetEntry, ShareSyncExecutor,
 };
-use crate::share_sync::persistence::ShareSyncPersistence;
+use crate::share_sync::persistence::{ShareSyncPersistence, RUN_PHASE_EXECUTING};
 use crate::share_sync::resolver::ShareSyncAccountResolver;
 use crate::share_sync::scheduler::SubscriptionScheduler;
 use crate::share_sync::snapshot::{
@@ -74,6 +74,28 @@ impl std::fmt::Debug for ShareSyncManager {
     }
 }
 
+/// 每条订阅最多取几条历史 `interrupted` run 作为「续跑重试」候选。
+///
+/// 残留下载是按订阅（`backup_config_id`）归属的，最新那次尝试才是它们的主人；
+/// 取 3 条而不是 1 条，是为了容忍「最新那条在抓取阶段就断了、根本没有 run_items，
+/// 真正有活儿的是再往前一条」这种情况。
+const STALE_INTERRUPTED_PER_SUB: usize = 3;
+
+/// 启动续跑的待处理 run，按「本次收编」和「历史遗留」分开。
+///
+/// 两者的处理权限不同，混在一起会出事：
+/// - `fresh`：本次启动刚从 `running` 收编的。进程上次退出时它确实在飞，
+///   所以既可以原地接管，也可以在接管不了时**清理残留 + 重跑**。
+/// - `stale`：上次启动就已经是 `interrupted` 的（说明上一轮的续跑没来得及把它标回
+///   `running` 就又被杀了）。这些**只允许原地接管**：真有残留就接管，没残留就跳过。
+///   若也允许重跑，那么任何一条历史 interrupted 记录都会变成「每次开机自动同步一次」，
+///   用户没触发却凭空多出 run。
+#[derive(Default)]
+struct ResumeTarget {
+    fresh: Vec<String>,
+    stale: Vec<String>,
+}
+
 /// Manager 构造参数
 pub struct ManagerConfig {
     pub config_path: PathBuf,
@@ -104,10 +126,10 @@ impl ShareSyncManager {
             .ok()
             .map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(true);
-        // 被中断的 run：订阅 id -> 该订阅名下所有被收编的 run_id。
+        // 被中断的 run：订阅 id -> 该订阅名下的待处理 run。
         // 需要 run_id 而不只是订阅 id —— 重跑之前要按 run 清掉候选快照，
         // 否则那些永远不会被提升的候选会一直留在库里。
-        let mut interrupted_runs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut interrupted_runs: BTreeMap<String, ResumeTarget> = BTreeMap::new();
         if stale_fixup_enabled {
             match persistence.mark_running_runs_interrupted() {
                 Ok(interrupted) if !interrupted.is_empty() => {
@@ -119,11 +141,47 @@ impl ShareSyncManager {
                         interrupted_runs
                             .entry(rec.subscription_id.clone())
                             .or_default()
+                            .fresh
                             .push(rec.run_id.clone());
                     }
                 }
                 Ok(_) => {}
                 Err(e) => warn!("share_sync 启动自愈失败: {}", e),
+            }
+
+            // 再捞一遍**上次启动就已经是** `interrupted` 的 run。
+            //
+            // 上面那个查询只认 `status='running'`，一条 run 被标成 interrupted 后就
+            // 再也捡不起来了。而「标记 interrupted」到 `resume_run_in_place` 把它标回
+            // `running` 之间隔着续跑任务的初始延迟 + 等账号就绪（最长两分钟）——
+            // 进程在这个窗口里再被杀一次（连着重启、改代码重编译时很常见），这条 run
+            // 就永久卡死，它名下那批恢复成暂停态的下载再没人驱动，表现为「同步任务
+            // 全是暂停的，重启多少次都不动」。
+            //
+            // 这些候选走**只接管、不重跑**的路径（见 `ResumeTarget::stale`）：真有残留
+            // 就原地接管保住已下的分片，没残留就原样跳过，不会变成每次开机重跑老 run。
+            match persistence.list_interrupted_runs(STALE_INTERRUPTED_PER_SUB) {
+                Ok(stale) => {
+                    let mut n = 0usize;
+                    for rec in stale {
+                        let entry = interrupted_runs
+                            .entry(rec.subscription_id.clone())
+                            .or_default();
+                        // 本次刚收编的优先，别把同一条 run 重复排进来
+                        if entry.fresh.contains(&rec.run_id) {
+                            continue;
+                        }
+                        entry.stale.push(rec.run_id);
+                        n += 1;
+                    }
+                    if n > 0 {
+                        info!(
+                            "share_sync 启动自愈: 另有 {} 条历史中断 run 待判定是否接管",
+                            n
+                        );
+                    }
+                }
+                Err(e) => warn!("share_sync 启动自愈: 读取历史中断 run 失败: {}", e),
             }
         }
 
@@ -216,7 +274,7 @@ impl ShareSyncManager {
         // execute_one 在创建 run 前就报错(不留失败记录),退避重试若干次;始终不行则交给
         // 调度器在下个轮询周期补上,不阻塞启动。
         if resume_on_startup && !interrupted_runs.is_empty() {
-            let resume_targets: Vec<(String, Vec<String>)> = interrupted_runs
+            let resume_targets: Vec<(String, ResumeTarget)> = interrupted_runs
                 .into_iter()
                 .filter(|(id, _)| {
                     manager
@@ -587,13 +645,13 @@ impl ShareSyncManager {
     /// 启动期对被中断的订阅自动重跑一次。best-effort:先**轮询等账号登录态就绪**
     /// 再触发,避免账号没恢复时 execute_one 反复在「抓取阶段」失败、刷出一堆失败 run。
     /// 等到就绪(或超时)后只触发一次;触发不成则交给轮询调度兜底。供 `new` 后台调用。
-    async fn resume_interrupted_runs(self: Arc<Self>, targets: Vec<(String, Vec<String>)>) {
+    async fn resume_interrupted_runs(self: Arc<Self>, targets: Vec<(String, ResumeTarget)>) {
         // 给账号登录态恢复留点时间(进程刚起,resolver 可能还没就绪)。
         const RESUME_INITIAL_DELAY_SECS: u64 = 5;
         const READY_MAX_ATTEMPTS: u32 = 12;
         const READY_RETRY_DELAY_SECS: u64 = 10;
         tokio::time::sleep(std::time::Duration::from_secs(RESUME_INITIAL_DELAY_SECS)).await;
-        for (id, interrupted_run_ids) in targets {
+        for (id, target) in targets {
             let owner_uid = match self.get_subscription(&id) {
                 Some(s) => s.owner_uid,
                 None => continue, // 订阅启动后被删,跳过
@@ -636,8 +694,11 @@ impl ShareSyncManager {
 
             // 🔥 先看能不能「接着跑」——能续就不推倒重来（判据见 `probe_resumable_run`）。
             // 只接管一条：同一订阅同一时刻只允许一个 run 在飞。
+            //
+            // fresh 排在 stale 前面：本次刚收编的那条才是进程被杀时真正在飞的活儿，
+            // 历史 interrupted 只是它的前身。
             let mut taken_over = false;
-            for run_id in &interrupted_run_ids {
+            for run_id in target.fresh.iter().chain(target.stale.iter()) {
                 if let Some(task_ids) = self.probe_resumable_run(&id, run_id, owner_uid).await {
                     let mgr = Arc::clone(&self);
                     let sub = id.clone();
@@ -654,7 +715,19 @@ impl ShareSyncManager {
                 continue;
             }
 
-            for run_id in &interrupted_run_ids {
+            // 只有历史遗留候选、且一条都接管不了 —— 说明这些 interrupted 记录名下
+            // 已经没有未完成的下载了（`probe_resumable_run` 第 3 步的判据），纯属历史。
+            // 到此为止：不清快照、不重跑。否则每次开机都会凭空多跑一轮，
+            // 用户会看到「我没点，它自己同步了」。真要重跑交给轮询调度器。
+            if target.fresh.is_empty() {
+                debug!(
+                    "share_sync 启动续跑: 订阅 {} 的历史中断 run 名下没有未完成下载，跳过（不重跑）",
+                    id
+                );
+                continue;
+            }
+
+            for run_id in &target.fresh {
                 if let Err(e) = self.persistence.delete_snapshot_for_run(run_id) {
                     warn!("清理中断 run 的候选快照失败: run_id={}, error={}", run_id, e);
                 }
@@ -763,7 +836,8 @@ impl ShareSyncManager {
 
     /// 列出某订阅当前的子任务进度（下载段 + 内部转存段），供 REST 轮询兜底接口。
     ///
-    /// 与「每个 run 的进度广播器」共用 `collect_share_sync_subtasks`，形状一致。
+    /// 与「每个 run 的进度广播器」共用 `collect_share_sync_subtasks_with_children`，
+    /// 形状一致——含文件夹展开出来的子文件行（`parent_task_id` 指向文件夹行）。
     /// 账号转存管理器未就绪时返回空列表（视为暂无进行中子任务，不报错）。
     pub async fn subtasks(&self, id: &str) -> Result<Vec<ShareSyncSubtask>, ShareSyncError> {
         let sub = self
@@ -777,12 +851,12 @@ impl ShareSyncManager {
                 // 若不过滤,切换页面后重新拉取会把已完成的文件夹当成「进行中」显示
                 // (前端 REST 路径直接信任后端,不像 WS upsert 那样剔除终态)。
                 // 与前端 SUBTASK_TERMINAL 口径一致,在源头过滤掉终态子任务。
-                let subs = collect_share_sync_subtasks(&tm, id, owner_uid)
+                let subs = collect_share_sync_subtasks_with_children(&tm, id, owner_uid)
                     .await
                     .into_iter()
                     .filter(|s| !is_terminal_subtask_status(&s.status))
                     .collect();
-                Ok(subs)
+                Ok(drop_orphan_children(subs))
             }
             None => Ok(Vec::new()),
         }
@@ -1070,7 +1144,7 @@ impl ShareSyncManager {
         }
 
         Ok(ClearRunsAndOrphansResult {
-            db_deleted,
+            db_deleted: db_deleted as usize,
             transfer_mem,
             transfer_hist,
             folder_count,
@@ -1301,6 +1375,20 @@ impl ShareSyncManager {
             }
         };
 
+        // 0) 清掉上一轮遗留的、没人再驱动的内部子任务。
+        //
+        // 到这里 `running` 已被本次 run 独占（`resume_run_in_place` 走同一把守卫），
+        // 所以此刻还挂在本订阅名下的转存/下载任务必然是**孤儿**：上一轮 run 已经
+        // 结束（超时、失败、或进程被杀后没走到启动续跑），没有任何 run 在等它们。
+        //
+        // 留着它们的代价就是 issue #148：本轮 diff 仍会包含同一批文件（上一轮没成功
+        // ⇒ 快照基线没推进），重新提交后新旧两支一起挂在「进行中子任务」里，同一个
+        // 文件显示两条（旧的 paused / 新的 pending）。
+        //
+        // 与启动续跑路径的处理保持一致（见 `resume_interrupted_runs` 里的同名清理）：
+        // 只删任务记录，已下载的本地文件保留，本轮会按 diff 重新补齐。
+        self.sweep_residual_subtasks(id, owner_uid).await;
+
         // 1) 抓取
         //
         // 百度分享页/列表接口在高频同步时会偶发返回 HTML 风控页或半截响应，
@@ -1491,8 +1579,6 @@ impl ShareSyncManager {
                 ),
             }
         } else {
-            }
-        } else {
             warn!(
                 "share-sync: run 未完全成功或有资源类跳过，不推进快照基线，下一次将重试 diff: run_id={}, status={:?}, failed={}, resource_skipped={}, transient_skipped={}",
                 outcome.run_id, outcome.status, outcome.diff_summary.failed, outcome.resource_skipped, outcome.transient_skipped
@@ -1552,6 +1638,49 @@ impl ShareSyncManager {
             _ => {}
         }
         Ok(outcome)
+    }
+
+    /// 清掉某订阅名下没人驱动的内部转存/下载任务（孤儿残留）。
+    ///
+    /// **调用方必须已持有该订阅的 `running` 守卫**——否则会把正在跑的 run 的子任务
+    /// 一起删掉。目前只有 `execute_one_with_run_id` 在建任何新任务之前调用。
+    ///
+    /// 只删任务记录，不删已下载的本地文件：本轮 diff 会把缺的重新补上，而
+    /// `local_file_matches` 对已经落地的文件仍会直接标 Completed，不会白下一遍。
+    async fn sweep_residual_subtasks(&self, id: &str, owner_uid: u64) {
+        let Some(transfer) = self.resolver.transfer_manager(owner_uid).await else {
+            return;
+        };
+
+        // 先探测有没有「还没到终态」的残留，有才动手。
+        //
+        // 健康订阅每个轮询周期都会走到这里，而 `delete_tasks_for_backup_config` 是
+        // 全量操作：会对历史库发 DELETE、还会对**已完成**的文件夹调 `cancel_folder`
+        // （刷一行 warn）。没残留时白跑一遍纯属噪音，探测只读内存、代价可以忽略。
+        //
+        // 转存段一起看：卡在 `checkingshare` / `transferring` 的孤儿转存同样该收。
+        // （前提是 `is_terminal_subtask_status` 认得 `transferred` —— 那是纯网盘腿的
+        // 正常终点，漏判的话每轮都会被误认成有残留。）
+        let residual: Vec<String> = collect_share_sync_subtasks(&transfer, id, owner_uid)
+            .await
+            .into_iter()
+            .filter(|s| !is_terminal_subtask_status(&s.status))
+            .map(|s| format!("{}:{}({})", s.kind, s.name, s.status))
+            .collect();
+        if residual.is_empty() {
+            return;
+        }
+
+        let cfg_id = share_sync_backup_config_id(id);
+        let (mem, hist) = transfer.delete_tasks_for_backup_config(&cfg_id).await;
+        warn!(
+            "share-sync: 订阅 {} 本轮开始前清理上一轮残留子任务 {} 个（转存内存={}, 历史={}）: {}",
+            id,
+            residual.len(),
+            mem,
+            hist,
+            residual.join(", ")
+        );
     }
 
     fn fail_run(&self, run_id: &str, sub_id: &str, owner_uid: u64, err: &str) {
@@ -1762,6 +1891,13 @@ pub struct ShareSyncSubtask {
     /// 预计剩余时间(秒,仅下载段且 speed>0 时有值)，与自动备份 `eta_seconds` 对齐
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eta_seconds: Option<u64>,
+    /// 所属父任务的 `task_id`（当前只有一种父子关系：文件夹聚合行 `"folder:{id}"`
+    /// 与它的子文件下载任务）。顶层行为 `None`。
+    ///
+    /// 前端据此把子文件嵌套渲染在文件夹那一行下面；**只出现在展示链路**
+    /// （[`collect_share_sync_subtasks_with_children`]），控制链路拿不到带父的行。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
     /// 订阅所属账号 uid
     pub owner_uid: u64,
 }
@@ -1798,15 +1934,26 @@ fn no_progress_but_queued<'a>(
     use crate::downloader::TaskStatus;
 
     let mut any_running = false;
-    let mut any_pending = false;
+    let mut any_waiting = false;
     for status in statuses {
         match status {
             TaskStatus::Downloading | TaskStatus::Decrypting => any_running = true,
-            TaskStatus::Pending => any_pending = true,
+            // 🔥 `Paused` 与 `Pending` 同样算「在等」。
+            //
+            // 分享同步的下载走 `create_backup_task` → `TaskPriority::Backup`，是**可被
+            // 抢占**的最低优先级：普通下载任务一来就把它踢成 `Paused`（见
+            // `task_slot_pool.rs` 的 `is_preemptable`）。此前只认 `Pending`，被抢占的
+            // 任务既不算在跑也不算在排队 → `is_waiting_for_download_slot` 返回 false
+            // → idle 计时不清零 → 30 分钟后 run 被判「等待任务完成超时」而失败，
+            // 而它派生的下载子任务还留在系统里，成为下一轮的重复项来源（issue #148）。
+            //
+            // 与下面 `folder_has_queued_work` 的口径也就此统一（那边一直把 `Paused`
+            // 算作待办，理由同样是「恢复出来的子任务以 Paused 起步」）。
+            TaskStatus::Pending | TaskStatus::Paused => any_waiting = true,
             _ => {}
         }
     }
-    any_pending && !any_running
+    any_waiting && !any_running
 }
 
 /// run_item 是否已到终态（不会再变）。
@@ -1819,7 +1966,7 @@ fn is_terminal_run_item_status(status: &str) -> bool {
 
 /// 文件夹是否「还有活没做完，但一个都没在跑」。
 ///
-/// 与 [`no_progress_but_queued`] 的差别：**这里把 `Paused` 也算作待办**。
+/// 与 [`no_progress_but_queued`] 同口径：`Pending` / `Paused` 都算待办。
 ///
 /// 原因：重启恢复出来的文件夹子任务是以 `Paused` 创建的
 /// （日志「恢复模式补任务完成: 文件夹 X 创建了 N 个暂停任务」），
@@ -1870,11 +2017,47 @@ fn folder_subtask_status(
 
 /// 收集某个订阅当前的子任务进度（下载段 + 内部转存段），按 `backup_config_id` 归属。
 ///
-/// REST 轮询接口与「每个 run 的进度广播器」共用此函数，保证两条链路形状一致。
+/// **控制链路专用**：文件夹只出一条聚合行，不含它的子文件任务。
+///
+/// 这个口径必须保持「一个可操作单元一行」——调用方会拿返回的 `task_id` 去做
+/// 暂停/恢复/取消/统计未完成数（见 [`restartable_share_sync_download`]、
+/// `finalize_resumed_run`、`cancel_residual_downloads`）。文件夹的子文件任务由
+/// folder_manager 按批物化并自己调度（`refill_tasks_batch`），拿单个子任务 id 去
+/// pause/resume 会和文件夹的槽位逻辑打架，未完成计数也会被重复计一遍。
+///
+/// 要给用户看逐文件进度时用 [`collect_share_sync_subtasks_with_children`]。
 pub async fn collect_share_sync_subtasks(
     transfer: &TransferManager,
     subscription_id: &str,
     owner_uid: u64,
+) -> Vec<ShareSyncSubtask> {
+    collect_subtasks_impl(transfer, subscription_id, owner_uid, false).await
+}
+
+/// 收集子任务进度，**并把文件夹的子文件任务一并展开**（`parent_task_id` 指向
+/// 文件夹那一行的 `"folder:{id}"`）。
+///
+/// **展示链路专用**：REST `/subtasks` 与 WS `item_progress` 广播用它，前端把子文件
+/// 嵌套渲染在文件夹行下面。别拿它去驱动控制逻辑，理由见
+/// [`collect_share_sync_subtasks`]。
+///
+/// 注意能展开的只有**当前已物化**的那一批子任务：folder_manager 只维持约等于槽位数
+/// 的活跃子任务，其余文件还躺在 `folder.pending_files` 里，压根没有 `DownloadTask`
+/// 对象、也就没有进度可言。所以这里给出的是「文件夹整体进度 + 正在跑的那几个文件的
+/// 逐文件进度」，不是全量文件列表。
+pub async fn collect_share_sync_subtasks_with_children(
+    transfer: &TransferManager,
+    subscription_id: &str,
+    owner_uid: u64,
+) -> Vec<ShareSyncSubtask> {
+    collect_subtasks_impl(transfer, subscription_id, owner_uid, true).await
+}
+
+async fn collect_subtasks_impl(
+    transfer: &TransferManager,
+    subscription_id: &str,
+    owner_uid: u64,
+    include_folder_children: bool,
 ) -> Vec<ShareSyncSubtask> {
     let cfg = share_sync_backup_config_id(subscription_id);
     let mut out: Vec<ShareSyncSubtask> = Vec::new();
@@ -1906,6 +2089,7 @@ pub async fn collect_share_sync_subtasks(
                 progress,
                 speed: t.speed,
                 eta_seconds: compute_eta_seconds(t.downloaded_size, t.total_size, t.speed),
+                parent_task_id: None,
                 owner_uid,
             });
         }
@@ -1932,6 +2116,7 @@ pub async fn collect_share_sync_subtasks(
                 progress,
                 speed: 0,
                 eta_seconds: None,
+                parent_task_id: None,
                 owner_uid,
             });
         }
@@ -1957,50 +2142,147 @@ pub async fn collect_share_sync_subtasks(
             // 只有 1 个任务槽时，抢不到槽位的文件夹 fixed_slot_id=None、子任务全部
             // 停在 Pending，但 FolderStatus 仍是 Downloading（它没有 Pending 这一档），
             // 照原样上报会让前端显示「下载中」而实际一个字节没动。
-            let (speed, waiting_for_slot) = if let Some(dm) = dm_handle.as_ref() {
+            let (speed, waiting_for_slot, children) = if let Some(dm) = dm_handle.as_ref() {
                 let children = dm.get_tasks_by_group(&f.id).await;
                 let speed = children
                     .iter()
                     .filter(|t| t.status == crate::downloader::TaskStatus::Downloading)
                     .map(|t| t.speed)
                     .sum();
-                (
-                    speed,
-                    folder_has_queued_work(children.iter().map(|t| &t.status)),
-                )
+                let waiting = folder_has_queued_work(children.iter().map(|t| &t.status));
+                (speed, waiting, children)
             } else {
-                (0, false)
+                (0, false, Vec::new())
             };
+            let folder_task_id = format!("folder:{}", f.id);
+            let folder_status = folder_subtask_status(f.status.clone(), waiting_for_slot);
+            let folder_is_terminal = is_terminal_subtask_status(&folder_status);
             out.push(ShareSyncSubtask {
-                task_id: format!("folder:{}", f.id),
+                task_id: folder_task_id.clone(),
                 name: f.name.clone(),
                 kind: "download".to_string(),
-                status: folder_subtask_status(f.status.clone(), waiting_for_slot),
+                status: folder_status,
                 downloaded: f.downloaded_size,
                 total: f.total_size,
                 progress: f.progress(),
                 speed,
                 eta_seconds: compute_eta_seconds(f.downloaded_size, f.total_size, speed),
+                parent_task_id: None,
                 owner_uid,
             });
+
+            // 展示链路：把上面那次查询已经拿到的子文件任务也吐出来，挂在文件夹行下面。
+            // 复用同一份 `children`，不额外查一遍。
+            //
+            // 文件夹本身到终态时一个子行都不出：父行会被 `subtasks()` 的终态过滤掉，
+            // 再吐子行就成了没有父的孤儿。文件夹终态意味着这批下载已经结束（完成 /
+            // 失败 / 取消），内存里可能残留的子任务对用户没有意义。
+            if include_folder_children && !folder_is_terminal {
+                out.extend(
+                    children
+                        .into_iter()
+                        .map(|t| folder_child_subtask(t, &folder_task_id, owner_uid)),
+                );
+            }
         }
     }
 
     out
 }
 
+/// 丢掉父行已经不在列表里的子行。
+///
+/// REST `subtasks()` 会先按终态过滤：文件夹自己到终态（比如整体 failed）被滤掉，
+/// 而它内存里残留的子任务可能还是非终态，于是留下一批没有父行的孤儿。前端按
+/// `parent_task_id` 分组时这些行会挂不上任何父节点，直接从界面上消失——用户看到的是
+/// 「文件夹没了、子文件也没了」。这里在源头收掉，保证 REST 快照自洽。
+///
+/// 只对全量快照有意义，WS 那条增量链路做不了这个判断（见前端 `groupedSubtasks` 里
+/// 把孤儿提到顶层的兜底）。
+fn drop_orphan_children(subs: Vec<ShareSyncSubtask>) -> Vec<ShareSyncSubtask> {
+    let parents: std::collections::HashSet<&str> = subs
+        .iter()
+        .filter(|s| s.parent_task_id.is_none())
+        .map(|s| s.task_id.as_str())
+        .collect();
+    let keep: Vec<bool> = subs
+        .iter()
+        .map(|s| match s.parent_task_id.as_deref() {
+            Some(p) => parents.contains(p),
+            None => true,
+        })
+        .collect();
+    subs.into_iter()
+        .zip(keep)
+        .filter_map(|(s, k)| k.then_some(s))
+        .collect()
+}
+
+/// 把文件夹的一个子文件下载任务转成挂在 `parent` 下的 [`ShareSyncSubtask`]。
+///
+/// 展示名优先取 `relative_path`（如 `科幻片/星际穿越.mp4`）：文件夹里重名文件很常见
+/// （每季一个 `01.mp4`），只给 basename 的话列表里会出现一串分不清谁是谁的同名行。
+fn folder_child_subtask(
+    t: crate::downloader::DownloadTask,
+    parent_task_id: &str,
+    owner_uid: u64,
+) -> ShareSyncSubtask {
+    let name = t
+        .relative_path
+        .clone()
+        .filter(|p| !p.is_empty())
+        .or_else(|| {
+            t.local_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| basename_of(&t.remote_path));
+    let progress = if t.total_size > 0 {
+        (t.downloaded_size as f64 / t.total_size as f64) * 100.0
+    } else {
+        0.0
+    };
+    ShareSyncSubtask {
+        task_id: t.id.clone(),
+        name,
+        kind: "download".to_string(),
+        status: format!("{:?}", t.status).to_lowercase(),
+        downloaded: t.downloaded_size,
+        total: t.total_size,
+        progress,
+        speed: t.speed,
+        eta_seconds: compute_eta_seconds(t.downloaded_size, t.total_size, t.speed),
+        parent_task_id: Some(parent_task_id.to_string()),
+        owner_uid,
+    }
+}
+
 /// 子任务状态是否已到终态（完成/失败/取消）。
 ///
 /// 口径覆盖三个来源的状态枚举(lowercased `{:?}`):
 /// - 文件/文件夹下载(`TaskStatus`/`FolderStatus`): `completed` / `failed` / `cancelled`
-/// - 内部转存(`TransferStatus`): `completed` / `transferfailed` / `downloadfailed`
+/// - 内部转存(`TransferStatus`): `completed` / `transferred` / `transferfailed` / `downloadfailed`
 ///
-/// 与前端 `SUBTASK_TERMINAL`(completed/failed/cancelled/success) 对齐,额外纳入
-/// 转存段特有的失败态,确保「进行中子任务」轮询接口不会回包任何已结束的子任务。
+/// `transferred` 也是终态:它是**纯网盘腿的正常终点**（`submit_transfer_batch` 传
+/// `auto_download: false`，枚举上就注释成「转存成功（无自动下载）」），自动下载那条
+/// 路径不经过它而是直接进 `Downloading`。此前漏了它，后果是纯网盘目标的订阅每次
+/// 同步完成后，都会在「进行中子任务」里永久留下一条转存记录不消失（REST 过滤不掉，
+/// WS 也因为不判终态而每秒重推）。`wait_transfer_task` 早就把它当终点处理
+/// （`Transferred if !require_download_completion => Ok(())`），这里补齐口径。
+///
+/// 与前端 `SUBTASK_TERMINAL` 保持一致（两边一起改，否则 REST 不回包、WS 推来的那条
+/// 仍会挂在列表里）。
 fn is_terminal_subtask_status(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "success" | "failed" | "cancelled" | "transferfailed" | "downloadfailed"
+        "completed"
+            | "success"
+            | "failed"
+            | "cancelled"
+            | "transferred"
+            | "transferfailed"
+            | "downloadfailed"
     )
 }
 
@@ -2310,7 +2592,8 @@ async fn emit_subtask_progress(
     owner_uid: u64,
     reported_terminal: &mut std::collections::HashSet<String>,
 ) {
-    let subs = collect_share_sync_subtasks(transfer, subscription_id, owner_uid).await;
+    let subs =
+        collect_share_sync_subtasks_with_children(transfer, subscription_id, owner_uid).await;
     for s in subs {
         // 终态只推一次（见 `broadcast_subtask_progress` 的说明）
         if is_terminal_subtask_status(&s.status) && !reported_terminal.insert(s.task_id.clone()) {
@@ -2328,6 +2611,7 @@ async fn emit_subtask_progress(
             progress: s.progress,
             speed: s.speed,
             eta_seconds: s.eta_seconds,
+            parent_task_id: s.parent_task_id,
             owner_uid,
         });
     }
@@ -2424,7 +2708,7 @@ impl ProductionHooks {
     /// 三个条件同时成立才算：
     /// 1. 槽位池当前没有空位；
     /// 2. 本订阅**没有任何**下载子任务真的在跑（Downloading / Decrypting）；
-    /// 3. 本订阅有下载子任务在等待队列里（`Pending`）。
+    /// 3. 本订阅有下载子任务在等（`Pending` 排队，或被高优先级任务抢占成 `Paused`）。
     ///
     /// 条件 2、3 的判定抽在 [`no_progress_but_queued`] 里（纯函数，便于单测）。
     ///
@@ -2907,6 +3191,16 @@ impl ExecutorHooks for ProductionHooks {
                 };
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn discard_task(&self, task_id: &str) {
+        let (downloads, folders) = self.transfer_manager().discard_task(task_id).await;
+        if downloads > 0 || folders > 0 {
+            info!(
+                "share-sync: 已丢弃转存任务 {}（连带下载子任务={}, 文件夹子任务={}）",
+                task_id, downloads, folders
+            );
         }
     }
 
@@ -3395,8 +3689,108 @@ mod tests {
             progress: 0.0,
             speed: 0,
             eta_seconds: None,
+            parent_task_id: None,
             owner_uid: 1,
         }
+    }
+
+    /// 构造一条挂在 `parent` 下的子文件行（其余字段用不到，取默认）
+    fn child_subtask(task_id: &str, parent: &str, status: &str) -> ShareSyncSubtask {
+        ShareSyncSubtask {
+            task_id: task_id.into(),
+            name: format!("{}.mp4", task_id),
+            kind: "download".into(),
+            status: status.into(),
+            downloaded: 0,
+            total: 1024,
+            progress: 0.0,
+            speed: 0,
+            eta_seconds: None,
+            parent_task_id: Some(parent.into()),
+            owner_uid: 1,
+        }
+    }
+
+    fn folder_row(task_id: &str, status: &str) -> ShareSyncSubtask {
+        ShareSyncSubtask {
+            task_id: task_id.into(),
+            status: status.into(),
+            name: "某文件夹".into(),
+            ..subtask(status)
+        }
+    }
+
+    /// 父行还在时子行原样保留 —— 这是展开逐文件进度的正常路径。
+    #[test]
+    fn test_drop_orphan_children_keeps_children_with_present_parent() {
+        let subs = vec![
+            folder_row("folder:f1", "downloading"),
+            child_subtask("dl-1", "folder:f1", "downloading"),
+            child_subtask("dl-2", "folder:f1", "pending"),
+        ];
+        let out = drop_orphan_children(subs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].task_id, "folder:f1");
+    }
+
+    /// 父行被上游的终态过滤掉之后，子行必须一起消失。
+    ///
+    /// 留着的话前端按 `parent_task_id` 分组时它们挂不上任何父节点，
+    /// 直接从界面上蒸发——比"整个文件夹一起消失"更让人摸不着头脑。
+    #[test]
+    fn test_drop_orphan_children_drops_children_without_parent() {
+        let subs = vec![
+            // 顶层的单文件下载没有父，永远保留
+            subtask("downloading"),
+            child_subtask("dl-9", "folder:gone", "downloading"),
+        ];
+        let out = drop_orphan_children(subs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].task_id, "dl-1");
+    }
+
+    /// 空列表 / 全是顶层行时行为不变（别把正常路径改坏了）
+    #[test]
+    fn test_drop_orphan_children_noop_without_children() {
+        assert!(drop_orphan_children(Vec::new()).is_empty());
+        let flat = vec![subtask("downloading"), folder_row("folder:f1", "scanning")];
+        assert_eq!(drop_orphan_children(flat).len(), 2);
+    }
+
+    /// 子文件展示名优先用 `relative_path`：文件夹里 `01.mp4` 这种重名极常见，
+    /// 只给 basename 的话展开后是一串分不清谁是谁的同名行。
+    #[test]
+    fn test_folder_child_subtask_prefers_relative_path() {
+        use crate::downloader::{DownloadTask, TaskStatus};
+
+        let mut t = DownloadTask::new(
+            1,
+            "/来自：分享/剧集/第一季/01.mp4".to_string(),
+            std::path::PathBuf::from("/data/剧集/第一季/01.mp4"),
+            2000,
+            crate::auth::Uid(42),
+        );
+        t.id = "dl-7".to_string();
+        t.status = TaskStatus::Downloading;
+        t.downloaded_size = 500;
+        t.speed = 100;
+        t.relative_path = Some("第一季/01.mp4".to_string());
+
+        let c = folder_child_subtask(t.clone(), "folder:f1", 42);
+        assert_eq!(c.name, "第一季/01.mp4");
+        assert_eq!(c.task_id, "dl-7");
+        assert_eq!(c.parent_task_id.as_deref(), Some("folder:f1"));
+        assert_eq!(c.kind, "download");
+        assert_eq!(c.status, "downloading");
+        assert_eq!(c.progress, 25.0);
+        // eta = (2000-500)/100
+        assert_eq!(c.eta_seconds, Some(15));
+        assert_eq!(c.owner_uid, 42);
+
+        // 没有 relative_path 时回退到本地文件名，不能是空串
+        let mut no_rel = t;
+        no_rel.relative_path = None;
+        assert_eq!(folder_child_subtask(no_rel, "folder:f1", 42).name, "01.mp4");
     }
 
     /// 续跑的判据/等待/收尾统一看**下载子任务**，所以子任务终态判定是这条链的地基。
@@ -3412,6 +3806,7 @@ mod tests {
             "success",
             "failed",
             "cancelled",
+            "transferred",
             "transferfailed",
             "downloadfailed",
         ] {
@@ -3509,6 +3904,30 @@ mod tests {
         assert!(
             !no_progress_but_queued(std::iter::empty()),
             "还没建出任务 → 不该误报"
+        );
+    }
+
+    /// issue #148：被普通任务抢占成 `Paused` 的下载子任务也算「在等槽位」。
+    ///
+    /// 分享同步的下载是 `TaskPriority::Backup`，普通下载一来就把它踢成 `Paused`。
+    /// 此前只认 `Pending`，这批任务既不算在跑也不算在排队 → idle 一路涨到 30 分钟
+    /// → run 被判「等待任务完成超时」失败，而它派生的下载子任务还留着，下一轮
+    /// 触发就叠出重复项。
+    #[test]
+    fn test_preempted_paused_counts_as_waiting_for_slot() {
+        use crate::downloader::TaskStatus;
+
+        assert!(
+            no_progress_but_queued([TaskStatus::Paused, TaskStatus::Paused].iter()),
+            "全被抢占暂停 → 仍是在等槽位，不该计入 idle 超时"
+        );
+        assert!(
+            no_progress_but_queued([TaskStatus::Paused, TaskStatus::Pending].iter()),
+            "一部分被抢占、一部分排队 → 同样是在等槽位"
+        );
+        assert!(
+            !no_progress_but_queued([TaskStatus::Paused, TaskStatus::Downloading].iter()),
+            "还有在跑的 → 走原来的停滞检测，不能把 idle 清零"
         );
     }
 
@@ -3793,11 +4212,16 @@ mod tests {
     #[test]
     fn test_is_terminal_subtask_status() {
         // 终态：完成/成功/各类失败/取消 → 不应出现在「进行中子任务」
+        //
+        // `transferred` 是纯网盘腿的正常终点（auto_download=false，见枚举注释
+        // 「转存成功（无自动下载）」）。此前误判成非终态，导致纯网盘订阅每次同步完
+        // 都在「进行中子任务」里永久留下一条转存记录。
         for s in [
             "completed",
             "success",
             "failed",
             "cancelled",
+            "transferred",
             "transferfailed",
             "downloadfailed",
         ] {
@@ -3809,7 +4233,6 @@ mod tests {
             "scanning",
             "downloading",
             "transferring",
-            "transferred",
             "waiting_transfer",
             "paused",
         ] {
@@ -3844,6 +4267,7 @@ mod tests {
             progress: downloaded as f64 / total as f64 * 100.0,
             speed,
             eta_seconds: None,
+            parent_task_id: None,
             owner_uid: 1,
         }
     }

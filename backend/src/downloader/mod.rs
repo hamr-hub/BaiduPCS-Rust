@@ -15,7 +15,9 @@ pub use folder::{FolderDownload, FolderStatus, PendingFile};
 pub use folder_manager::FolderDownloadManager;
 pub use manager::DownloadManager;
 pub use progress::SpeedCalculator;
-pub use scheduler::{calculate_task_max_chunks, ChunkScheduler, TaskScheduleInfo};
+pub use scheduler::{
+    calculate_task_max_chunks, ChunkScheduler, ConcurrencyChange, TaskScheduleInfo,
+};
 pub use task::{DownloadTask, TaskStatus};
 
 // Re-export conflict strategy from uploader module for convenience

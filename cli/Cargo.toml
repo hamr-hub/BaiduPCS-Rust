@@ -1,0 +1,44 @@
+[package]
+name = "baidu-pan-cli"
+version = "0.1.0"
+edition = "2021"
+description = "命令行客户端：直接驱动 baidu-netdisk-rust 核心库，能力与 HTTP API 等价"
+authors = ["BaiduPCS-Rust Team"]
+license = "Apache-2.0"
+readme = "README.md"
+
+[[bin]]
+name = "baidu-pan-cli"
+path = "src/main.rs"
+
+[dependencies]
+# 核心库（与 web 服务器共用同一份业务逻辑）
+baidu-netdisk-rust = { path = "../backend", package = "baidu-netdisk-rust" }
+
+# 异步运行时
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+futures = "0.3"
+
+# CLI 解析
+clap = { version = "4.4", features = ["derive", "wrap_help"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 错误处理
+anyhow = "1"
+thiserror = "1"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 时间
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

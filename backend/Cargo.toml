@@ -96,6 +96,9 @@ zip = "0.6"
 # Windows 路径规范化
 dunce = "1.0"
 
+# 随机数（OsRng + RngCore —— 新版 aead 要求显式 import）
+rand_core = { version = "0.6", features = ["getrandom"] }
+
 # 云存储 SDK（cloud_sync 模块：S3 / Aliyun OSS / 兼容 S3 的对象存储）
 # 决策：不引入 aws-sdk-s3 / s3 crate —— 这些依赖要求的 rustc 版本均 ≥1.91，
 # 与本仓库固定的 rustc 1.87 不兼容。改用「reqwest + 手写 SigV4 签名」，

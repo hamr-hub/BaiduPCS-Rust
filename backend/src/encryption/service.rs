@@ -3,12 +3,12 @@
 //! 提供 AES-256-GCM 和 ChaCha20-Poly1305 加密功能
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use rand::RngCore;
+use rand_core::{OsRng, RngCore};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 

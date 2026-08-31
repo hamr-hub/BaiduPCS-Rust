@@ -1268,15 +1268,10 @@ impl DownloadEngine {
             // 🔥 HTTP/2 降级：强制使用 HTTP/1.1（触发原因是「连续零字节失败」，不限于 frame error）
             builder = builder.http1_only();
             tracing::warn!("⚠ 下载客户端使用 HTTP/1.1 模式（HTTP/2 降级冷却期）");
-        } else {
-            // HTTP/2 极致优化：大幅增加窗口以消除慢启动影响
-            builder = builder
-                .http2_adaptive_window(true) // 启用HTTP/2自适应窗口
-                .http2_initial_stream_window_size(Some(1024 * 1024 * 2)) // 2MB初始流窗口（默认65KB）
-                .http2_initial_connection_window_size(Some(1024 * 1024 * 4)) // 4MB初始连接窗口（默认65KB）
-                .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10))) // HTTP/2 keep-alive
-                .http2_keep_alive_timeout(std::time::Duration::from_secs(20)); // HTTP/2 keep-alive超时
         }
+        // 注：reqwest 0.12 移除了 http2_*_window_size / http2_keep_alive_* /
+        // http2_adaptive_window 等 setter。HTTP/2 窗口与 keep-alive 由 reqwest / h2
+        // 库自适应管理，无需手动调优。
 
         if let Some(proxy) = proxy_config {
             builder = proxy

@@ -614,6 +614,45 @@ async fn main() -> anyhow::Result<()> {
         .route("/encryption/export-bundle", post(handlers::export_bundle))
         .route("/encryption/export-mapping", get(handlers::export_mapping))
         .route("/encryption/export-keys", get(handlers::export_keys))
+        // 🔥 云同步 API（百度网盘 / S3 / OSS 互相同步）
+        .route(
+            "/cloud-sync/connections",
+            get(handlers::cloud_sync::list_connections),
+        )
+        .route(
+            "/cloud-sync/connections",
+            post(handlers::cloud_sync::create_connection),
+        )
+        .route(
+            "/cloud-sync/connections/:id",
+            get(handlers::cloud_sync::get_connection),
+        )
+        .route(
+            "/cloud-sync/connections/:id",
+            delete(handlers::cloud_sync::delete_connection),
+        )
+        .route(
+            "/cloud-sync/connections/:id/test",
+            post(handlers::cloud_sync::test_connection),
+        )
+        .route(
+            "/cloud-sync/connections/:id/list",
+            post(handlers::cloud_sync::list_connection_objects),
+        )
+        .route("/cloud-sync/jobs", get(handlers::cloud_sync::list_jobs))
+        .route("/cloud-sync/jobs", post(handlers::cloud_sync::create_job))
+        .route(
+            "/cloud-sync/jobs/:id",
+            get(handlers::cloud_sync::get_job),
+        )
+        .route(
+            "/cloud-sync/jobs/:id",
+            delete(handlers::cloud_sync::delete_job),
+        )
+        .route(
+            "/cloud-sync/jobs/:id/cancel",
+            post(handlers::cloud_sync::cancel_job),
+        )
         // 🔥 离线下载 API
         .route("/cloud-dl/tasks", post(handlers::cloud_dl::add_task))
         .route("/cloud-dl/tasks", get(handlers::cloud_dl::list_tasks))
@@ -714,6 +753,9 @@ async fn main() -> anyhow::Result<()> {
     // 🔥 先加载会话和初始化所有管理器，确保前端访问时一切就绪
     app_state.load_initial_session().await?;
     info!("应用状态初始化完成");
+
+    // 🔥 初始化云同步管理器（百度 / S3 / OSS 互相同步）
+    app_state.init_cloud_sync_manager().await;
 
     // 多账号 ClientPool 预热（非活跃账号 Semaphore=3 + 2s 错峰）
     // 活跃账号客户端已在 load_initial_session 中注入；本步为非活跃账号补齐

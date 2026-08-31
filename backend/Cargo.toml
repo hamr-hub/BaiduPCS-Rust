@@ -17,7 +17,7 @@ tokio-tungstenite = "0.21"
 
 # HTTP客户端
 # 使用 rustls-tls 替代 native-tls，避免 OpenSSL 依赖问题（特别是交叉编译）
-reqwest = { version = "0.11", default-features = false, features = ["json", "cookies", "stream", "rustls-tls", "multipart", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "stream", "rustls-tls", "multipart", "socks"] }
 
 # 序列化
 serde = { version = "1.0", features = ["derive"] }
@@ -31,7 +31,7 @@ hex = "0.4"
 base64 = "0.21"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
-rand = "0.8"
+rand = "0.9"
 argon2 = "0.5"
 
 # JWT
@@ -95,6 +95,14 @@ zip = "0.6"
 
 # Windows 路径规范化
 dunce = "1.0"
+
+# 云存储 SDK（cloud_sync 模块：S3 / Aliyun OSS / 兼容 S3 的对象存储）
+# 决策：不引入 aws-sdk-s3 / s3 crate —— 这些依赖要求的 rustc 版本均 ≥1.91，
+# 与本仓库固定的 rustc 1.87 不兼容。改用「reqwest + 手写 SigV4 签名」，
+# 依赖只有 reqwest / sha2 / hmac / hex，零传递链。
+hmac = "0.12"
+bytes = "1.8"
+futures-util = "0.3"
 
 # Unix 系统调用（获取 uid/gid、faccessat 权限检测）
 [target.'cfg(not(target_os = "windows"))'.dependencies]

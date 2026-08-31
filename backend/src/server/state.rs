@@ -60,6 +60,21 @@ struct AppStateShareSyncResolver {
     active_uid: Arc<RwLock<Option<Uid>>>,
 }
 
+/// cloud_sync 的百度 client 解析器：按 owner_uid 从 ClientPool 拉对应账号。
+struct StateCloudSyncResolver {
+    client_pool: Arc<RwLock<ClientPool>>,
+}
+
+#[async_trait::async_trait]
+impl crate::cloud_sync::BaiduClientResolver for StateCloudSyncResolver {
+    async fn resolve(&self, owner_uid: u64) -> Option<Arc<NetdiskClient>> {
+        self.client_pool
+            .read()
+            .await
+            .get_client(Uid::new(owner_uid))
+    }
+}
+
 #[async_trait::async_trait]
 impl ShareSyncAccountResolver for AppStateShareSyncResolver {
     async fn netdisk_client(&self, owner_uid: u64) -> Option<Arc<NetdiskClient>> {
@@ -211,6 +226,12 @@ pub struct AppState {
 
     /// 🔥 分享同步管理器
     pub share_sync_manager: Arc<RwLock<Option<Arc<crate::share_sync::ShareSyncManager>>>>,
+
+    /// 🔥 云同步管理器（百度网盘 / S3 / OSS 互相同步）
+    pub cloud_sync_manager: Arc<RwLock<Option<Arc<crate::cloud_sync::CloudSyncManager>>>>,
+
+    /// 🔥 百度 client 解析器 —— 把 owner_uid 翻译成 NetdiskClient。
+    pub cloud_sync_baidu_resolver: Arc<dyn crate::cloud_sync::BaiduClientResolver>,
 }
 
 impl AppState {
@@ -400,6 +421,8 @@ impl AppState {
 
         // 2) ClientPool 初始化（不在此处预热网络，预热由 main.rs 启动流程承担）
         let client_pool = Arc::new(RwLock::new(ClientPool::new()));
+        // 给 cloud_sync 解析器留一份 Arc 引用（在 client_pool 被 move 进 Self 之前）
+        let cloud_sync_client_pool = Arc::clone(&client_pool);
 
         // 3) active_uid 运行时真源
         let active_uid = Arc::new(RwLock::new(initial_active_uid));
@@ -459,6 +482,10 @@ impl AppState {
             budget_scheduler,
             decrypt_semaphore,
             share_sync_manager: Arc::new(RwLock::new(None)),
+            cloud_sync_manager: Arc::new(RwLock::new(None)),
+            cloud_sync_baidu_resolver: Arc::new(StateCloudSyncResolver {
+                client_pool: cloud_sync_client_pool,
+            }),
         })
     }
 
@@ -1577,6 +1604,37 @@ impl AppState {
                 error!("分享同步管理器初始化失败: {}", e);
             }
         }
+    }
+
+    /// 🔥 初始化云同步管理器（百度 / S3 / OSS 互相同步）
+    ///
+    /// 与 share_sync 共享主 SQLite（`config.persistence.db_path`），新增
+    /// `cloud_sync_connections` / `cloud_sync_jobs` 两张表，schema 由
+    /// `CloudSyncPersistence::open` 内 `CREATE TABLE IF NOT EXISTS` 自管。
+    pub async fn init_cloud_sync_manager(&self) {
+        use crate::cloud_sync::{CloudSyncPersistence, CloudSyncManager};
+
+        let config = self.config.read().await;
+        let db_path = std::path::PathBuf::from(&config.persistence.db_path);
+        drop(config);
+
+        let persistence = match CloudSyncPersistence::open(db_path.to_string_lossy().as_ref()) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                error!("云同步持久化层打开失败: {}", e);
+                return;
+            }
+        };
+
+        let manager = CloudSyncManager::new(
+            persistence,
+            Arc::clone(&self.cloud_sync_baidu_resolver),
+            Arc::clone(&self.ws_manager),
+        )
+        .into_arc();
+
+        info!("云同步管理器初始化完成");
+        *self.cloud_sync_manager.write().await = Some(manager);
     }
 
     /// 🔥 初始化活跃账号的离线下载监听服务（兼容 legacy 调用点）

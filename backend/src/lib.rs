@@ -52,6 +52,9 @@ pub mod web_auth;
 // 🔥 分享同步模块（订阅第三方分享并持续同步）
 pub mod share_sync;
 
+// 🔥 云同步模块（百度网盘 / S3 / Aliyun OSS 互相同步）
+pub mod cloud_sync;
+
 // 导出常用类型
 pub use auth::{LoginRequest, LoginResponse, QRCode, QRCodeStatus, UserAuth};
 pub use config::AppConfig;

@@ -1095,6 +1095,9 @@ pub enum TaskEvent {
     /// 分享同步事件
     #[serde(rename = "share_sync")]
     ShareSync(crate::share_sync::events::ShareSyncEvent),
+    /// 🔥 云同步事件（百度 / S3 / OSS 互相同步）
+    #[serde(rename = "cloud_sync")]
+    CloudSync(crate::cloud_sync::events::CloudSyncEvent),
     /// 系统级事件（远端文件变动等非任务类通知）
     ///
     /// 🔥 与 `Download`/`Upload` 等以任务为中心的事件不同——本事件**没有** task_id 概念，
@@ -1111,6 +1114,7 @@ impl TaskEvent {
         match self {
             TaskEvent::Download(e) => e.task_id(),
             TaskEvent::Folder(e) => e.folder_id(),
+            TaskEvent::CloudSync(_) => "cloud_sync",
             TaskEvent::Upload(e) => e.task_id(),
             TaskEvent::Transfer(e) => e.task_id(),
             TaskEvent::Backup(e) => e.task_id(),
@@ -1171,6 +1175,7 @@ impl TaskEvent {
             TaskEvent::Scan(e) => e.priority(),
             TaskEvent::Account(_) => EventPriority::High,
             TaskEvent::ShareSync(_) => EventPriority::Medium,
+            TaskEvent::CloudSync(_) => EventPriority::Medium,
             // 系统级远端文件变动：让前端在不打断用户操作的前提下尽快响应
             TaskEvent::System(_) => EventPriority::High,
         }
@@ -1188,6 +1193,7 @@ impl TaskEvent {
             TaskEvent::Scan(_) => "scan",
             TaskEvent::Account(_) => "account",
             TaskEvent::ShareSync(_) => "share_sync",
+            TaskEvent::CloudSync(_) => "cloud_sync",
             TaskEvent::System(_) => "system",
         }
     }
@@ -1204,6 +1210,7 @@ impl TaskEvent {
             TaskEvent::Scan(e) => e.event_type_name(),
             TaskEvent::Account(e) => e.event_type_name(),
             TaskEvent::ShareSync(e) => e.event_type_name(),
+            TaskEvent::CloudSync(e) => e.event_type_name(),
             TaskEvent::System(e) => e.event_type_name(),
         }
     }
@@ -1271,6 +1278,7 @@ impl TaskEvent {
             TaskEvent::Scan(_) => false,
             TaskEvent::Account(_) => false,
             TaskEvent::ShareSync(_) => false,
+            TaskEvent::CloudSync(_) => false,
             // 系统级事件不属于"备份"语义，按下载/上传之外的杂类处理
             TaskEvent::System(_) => false,
         }

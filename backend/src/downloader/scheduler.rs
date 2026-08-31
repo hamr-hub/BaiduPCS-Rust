@@ -337,7 +337,7 @@ pub struct ChunkScheduler {
     /// 调度器是否正在运行
     scheduler_running: Arc<AtomicBool>,
     /// 任务完成通知发送器（用于通知 FolderDownloadManager 补充任务）
-    task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, bool)>>>>,
+    task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, u64, bool)>>>>,
     /// 🔥 备份任务统一通知发送器（用于通知 AutoBackupManager 所有事件）
     /// 包括：进度更新、状态变更、任务完成、任务失败等
     backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
@@ -495,7 +495,7 @@ impl ChunkScheduler {
     ///
     /// FolderDownloadManager 调用此方法设置 channel sender，
     /// 当文件夹子任务完成时会发送 group_id 到 channel
-    pub async fn set_task_completed_sender(&self, tx: mpsc::UnboundedSender<(String, String, u64, bool)>) {
+    pub async fn set_task_completed_sender(&self, tx: mpsc::UnboundedSender<(String, String, u64, u64, bool)>) {
         let mut sender = self.task_completed_tx.write().await;
         *sender = Some(tx);
         info!("任务完成通知 channel 已设置");
@@ -504,10 +504,16 @@ impl ChunkScheduler {
     /// 🔥 通知文件夹管理器子任务失败
     ///
     /// 供 DownloadManager 的非调度器失败路径（槽位超时、0延迟启动失败等）调用
-    pub async fn notify_subtask_failed(&self, group_id: String, task_id: String, total_size: u64) {
+    pub async fn notify_subtask_failed(
+        &self,
+        group_id: String,
+        task_id: String,
+        fs_id: u64,
+        total_size: u64,
+    ) {
         let tx_guard = self.task_completed_tx.read().await;
         if let Some(tx) = tx_guard.as_ref() {
-            if let Err(e) = tx.send((group_id, task_id, total_size, false)) {
+            if let Err(e) = tx.send((group_id, task_id, fs_id, total_size, false)) {
                 error!("发送子任务失败通知失败: {}", e);
             }
         }
@@ -1113,7 +1119,7 @@ impl ChunkScheduler {
         slot_pool: Arc<ChunkSlotPool>,
         global_active_count: Arc<AtomicUsize>,
         _backup_notification_tx: Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
-        _task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, bool)>>>>,
+        _task_completed_tx: Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, u64, bool)>>>>,
         _waiting_queue_trigger: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
         // 🔥 多账号注入：必填 budget_scheduler 为 `Arc<BudgetScheduler>`（非 Option），
         // 结构性消除"未注入 → fallback 到本地 slot 绕过配额"的破口。
@@ -1496,7 +1502,7 @@ impl ChunkScheduler {
         task_info: &TaskScheduleInfo,
         decrypt_result: Result<()>,
         my_epoch: u64,
-        task_completed_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, bool)>>>>,
+        task_completed_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, u64, bool)>>>>,
         backup_notification_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
         waiting_queue_trigger: &Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     ) {
@@ -1704,12 +1710,16 @@ impl ChunkScheduler {
             }
         }
 
-        // 通知文件夹任务补充（发送 group_id 和 task_id）
+        // 通知文件夹任务补充（发送 group_id、task_id 和 fs_id）
         if let Some(gid) = group_id.clone() {
+            // 🔥 fs_id 是文件夹侧完成计数的去重键（issue #156）：同一个文件被重新
+            //    建成新任务时 task_id 会变，只有 fs_id 是稳定的文件身份。
+            //    先取出来再拿 tx_guard，避免在 channel 锁里嵌套任务锁。
+            let fs_id = task_info.task.lock().await.fs_id;
             let tx_guard = task_completed_tx.read().await;
             if let Some(tx) = tx_guard.as_ref() {
                 let is_success = decrypt_error.is_none();
-                if let Err(e) = tx.send((gid.clone(), task_id.to_string(), task_info.total_size, is_success)) {
+                if let Err(e) = tx.send((gid.clone(), task_id.to_string(), fs_id, task_info.total_size, is_success)) {
                     error!("发送任务完成通知失败: {}", e);
                 }
             }

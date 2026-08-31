@@ -70,7 +70,7 @@ pub struct FolderDownloadManager {
     /// 路由到对应账号 manager 做槽位释放 / 补任务。保留为字段以便登录路径
     /// （新增账号 manager 时）能取到现有 sender 注入。
     task_completed_tx:
-        Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, bool)>>>>,
+        Arc<RwLock<Option<mpsc::UnboundedSender<(String, String, u64, u64, bool)>>>>,
     /// 持久化管理器（用于访问历史数据库）
     persistence_manager: Arc<RwLock<Option<Arc<tokio::sync::Mutex<PersistenceManager>>>>>,
     /// 🔥 备份记录管理器（用于文件夹名还原）
@@ -182,6 +182,25 @@ async fn resolve_folder_conflict_strategy(
     }
 
     crate::uploader::conflict::DownloadConflictStrategy::Overwrite
+}
+
+/// 🔥 子任务成功时抵消它对应的那笔失败计数（issue #156）
+///
+/// 失败侧原本只按 `task_id` 记账，而同一个文件被重新建成子任务时 task_id 会变：
+/// 「任务 A 耗尽重试被判死 → 同一文件的任务 B 下载成功」这种组合下，按 task_id 根本
+/// 抵消不掉 A 的那笔失败，文件夹会带着一笔幽灵失败进终态 —— 报"N 个文件下载失败"，
+/// 而文件其实都好端端在盘上。
+///
+/// 这里按 task_id 和 fs_id 各查一次，但**最多只抵消一笔**：任务 A 自己重试成功时两边
+/// 会命中同一笔失败，`||` 保证不会把 failed_count 多减一次。
+fn clear_failed_for_success(
+    folder: &mut crate::downloader::folder::FolderDownload,
+    task_id: &str,
+    fs_id: u64,
+) -> bool {
+    let by_task = folder.failed_task_ids.remove(task_id);
+    let by_fs = fs_id != 0 && folder.failed_fs_ids.remove(&fs_id);
+    by_task || by_fs
 }
 
 /// 🔥 持久化文件夹快照（自由函数版）
@@ -950,6 +969,18 @@ impl FolderDownloadManager {
                         Ok(crate::uploader::conflict::ConflictResolution::Proceed) => local_path,
                         Ok(crate::uploader::conflict::ConflictResolution::Skip) => {
                             info!("跳过下载（文件已存在）: {:?}", local_path);
+                            // 🔥 跳过的文件必须从 pending_files 摘掉（issue #156）
+                            //    与另外两条补任务路径同因同治：本路径同样只挑选不摘除，
+                            //    Skip 又不建任务、等不到落盘回调，文件会赖在队列里被反复
+                            //    选中重复跳过，skipped_count 越算越大。
+                            {
+                                let mut folders_guard = self.folders.write().await;
+                                if let Some(folder) = folders_guard.get_mut(&folder_id) {
+                                    folder
+                                        .pending_files
+                                        .retain(|p| p.fs_id != pending_file.fs_id);
+                                }
+                            }
                             skipped_count += 1;
                             skipped_bytes += pending_file.size;
                             skipped_list.push(crate::downloader::folder::SkippedFile {
@@ -1070,7 +1101,7 @@ impl FolderDownloadManager {
 
         // 首次进入：创建 channel + 启动监听器
         // 创建任务完成通知 channel（发送 group_id 和 task_id）
-        let (tx, rx) = mpsc::unbounded_channel::<(String, String, u64, bool)>();
+        let (tx, rx) = mpsc::unbounded_channel::<(String, String, u64, u64, bool)>();
 
         // 设置 sender 到 download_manager
         manager.set_task_completed_sender(tx.clone()).await;
@@ -1335,7 +1366,7 @@ impl FolderDownloadManager {
     /// `self.download_manager_pool` 解析 manager，不再读单例
     /// `self.download_manager`（避免账号切换后用错 manager 释放槽 / 补任务 /
     /// 把 owner=A 的新子任务塞进 B manager）
-    fn start_task_completed_listener(&self, mut rx: mpsc::UnboundedReceiver<(String, String, u64, bool)>) {
+    fn start_task_completed_listener(&self, mut rx: mpsc::UnboundedReceiver<(String, String, u64, u64, bool)>) {
         let folders = self.folders.clone();
         let download_manager_pool = self.download_manager_pool.clone();
         let download_manager_legacy = self.download_manager.clone();
@@ -1346,7 +1377,7 @@ impl FolderDownloadManager {
         let app_config = self.app_config.clone();
 
         tokio::spawn(async move {
-            while let Some((group_id, task_id, file_size, is_success)) = rx.recv().await {
+            while let Some((group_id, task_id, fs_id, file_size, is_success)) = rx.recv().await {
                 // 🔥 先读 folder.owner_uid，再按 uid 解析 manager
                 let folder_owner_uid_for_routing = {
                     let folders_guard = folders.read().await;
@@ -1391,8 +1422,21 @@ impl FolderDownloadManager {
                         let mut folders_guard = folders.write().await;
 
                         if let Some(folder) = folders_guard.get_mut(&group_id) {
-                            // 🔥 检查任务是否已经被计数过
-                            let already_counted = folder.counted_task_ids.contains(&task_id);
+                            // 🔥 检查这个**文件**是否已经被计数过（issue #156）
+                            //
+                            //    去重键必须是 fs_id 而不是 task_id：task_id 是每次建任务新生成的
+                            //    UUID，同一个文件被重新建成子任务时就换了一个，按它去重等于没去重
+                            //    （实测 1041 个文件计成 5337、18.4GB 计成 94.5GB）。
+                            //
+                            //    fs_id == 0 是异常数据（百度侧不会给 0）。真出现时若仍按 fs_id
+                            //    去重，会把所有这类文件折叠成一个，completed_count 永远涨不上去、
+                            //    文件夹到不了终态 —— 比重复计数更糟。这种情况退回按 task_id 去重，
+                            //    宁可多计也不少计。
+                            let already_counted = if fs_id != 0 {
+                                folder.counted_fs_ids.contains(&fs_id)
+                            } else {
+                                folder.counted_task_ids.contains(&task_id)
+                            };
 
                             // A. 处理借调位映射
                             let slot_id = if let Some(slot_id) = folder.borrowed_subtask_map.remove(&task_id) {
@@ -1423,14 +1467,40 @@ impl FolderDownloadManager {
                                     false
                                 };
 
-                            if is_success && !already_counted {
+                            if is_success && already_counted {
+                                // 🔥 同一个文件被第二次下完 —— 说明**确实有路径在重复建任务**。
+                                //    计数在上面已经被 fs_id 挡住了（这正是 issue #156 的止血点），
+                                //    但重复下载本身仍然白烧了一遍流量，值得留一条可 grep 的记录：
+                                //    真出现了就照着 fs_id 去追是哪条路径把它重新排进队列的。
+                                warn!(
+                                    "文件夹 {} 的文件 fs_id={} 被重复下载完成 (task_id={}, size={})，\
+                                     已跳过重复计数；这意味着有路径重复创建了该文件的子任务",
+                                    group_id, fs_id, task_id, file_size
+                                );
+                                // 仍要登记 task_id：否则这个已完成任务会被 active_sum 再算一遍
+                                folder.counted_task_ids.insert(task_id.clone());
+                                folder.subtask_retry_counts.remove(&task_id);
+                                // 🔥 失败对账不能漏：同一个文件的上一个任务可能已经耗尽重试
+                                //    额度被计进 failed_count，之后这个任务把它下成了。若不在这里
+                                //    抵消，文件明明都在盘上，文件夹却会以"N 个文件下载失败"收场。
+                                if clear_failed_for_success(folder, &task_id, fs_id) {
+                                    folder.failed_count = folder.failed_count.saturating_sub(1);
+                                }
+                            } else if is_success {
                                 // 🔥 成功且未计数：递增 completed_count
                                 folder.counted_task_ids.insert(task_id.clone());
+                                if fs_id != 0 {
+                                    folder.counted_fs_ids.insert(fs_id);
+                                }
                                 folder.subtask_retry_counts.remove(&task_id);
                                 folder.completed_count += 1;
                                 folder.completed_downloaded_size += file_size;
                                 // 如果之前失败过（retry→success），从 failed 中移除
-                                if folder.failed_task_ids.remove(&task_id) {
+                                //
+                                // 🔥 必须按 fs_id 抵消：判死的那个任务可能是**同一文件的
+                                //    另一个 task_id**（重复建任务时），只 remove 自己的 task_id
+                                //    抵消不掉，文件夹会带着一笔幽灵失败进终态。
+                                if clear_failed_for_success(folder, &task_id, fs_id) {
                                     folder.failed_count = folder.failed_count.saturating_sub(1);
                                     info!(
                                         "文件夹 {} 子任务重试成功 {}/{} (task_id={}, file_size={})",
@@ -1459,6 +1529,10 @@ impl FolderDownloadManager {
                                     // 会提前凑满 total_files，重试还没跑文件夹就被判成终态
                                 } else if folder.failed_task_ids.insert(task_id.clone()) {
                                     folder.failed_count += 1;
+                                    // 🔥 同时按文件身份记一份，供成功侧抵消（见 failed_fs_ids）
+                                    if fs_id != 0 {
+                                        folder.failed_fs_ids.insert(fs_id);
+                                    }
                                     warn!(
                                         "文件夹 {} 子任务重试 {} 次仍失败，计为失败 (failed_count={}, task_id={})",
                                         group_id, MAX_SUBTASK_AUTO_RETRIES, folder.failed_count, task_id
@@ -1590,10 +1664,14 @@ impl FolderDownloadManager {
                     let completed_count = folder.completed_count;
 
                     // 检查是否全部完成
+                    // 🔥 用 >= 而不是 ==（issue #156）：completed_count 一旦因为重复计数
+                    //    冲过 total_files，严格相等就**永远不可能成立**，文件夹会卡在
+                    //    downloading 无限补任务；失败终态分支又要求 failed_count > 0 也进不去。
+                    //    去重本身在完成监听器里按 fs_id 兜住，这里再加一道不等式防御。
                     if folder.pending_files.is_empty()
                         && folder.scan_completed
                         && active_count == 0
-                        && completed_count + folder.skipped_count == folder.total_files
+                        && completed_count + folder.skipped_count >= folder.total_files
                     {
                         let old_status = format!("{:?}", folder.status).to_lowercase();
                         folder.mark_completed();
@@ -1776,6 +1854,17 @@ impl FolderDownloadManager {
                         .take(available)
                         .cloned()
                         .collect();
+                    // 🔥 观测点（issue #156）：已经下完过的文件又被排进补任务队列
+                    //    说明有路径把它重新塞回了 pending_files。计数那边已按 fs_id 去重，
+                    //    但重复下载本身仍然烧流量，这条日志用来定位是哪条路径干的。
+                    for f in &files {
+                        if folder.counted_fs_ids.contains(&f.fs_id) {
+                            warn!(
+                                "文件夹 {} 把已完成过的文件重新排进了补任务队列 (fs_id={}, path={})，将会重复下载",
+                                group_id, f.fs_id, f.relative_path
+                            );
+                        }
+                    }
                     (files, folder.local_root.clone(), folder.remote_root.clone(), folder.owner_uid)
                 };
 
@@ -1841,6 +1930,21 @@ impl FolderDownloadManager {
                             Ok(crate::uploader::conflict::ConflictResolution::Proceed) => local_path,
                             Ok(crate::uploader::conflict::ConflictResolution::Skip) => {
                                 info!("跳过下载（文件已存在）: {:?}", local_path);
+                                // 🔥 跳过的文件必须从 pending_files 摘掉（issue #156）
+                                //
+                                // 补任务改成「只挑选不摘除、落盘时才摘」之后，Skip 分支既不建任务
+                                // 也就永远等不到落盘回调，文件会一直赖在队列里：
+                                //   - pending_files 永不为空 → 终态判定过不了，文件夹卡在 downloading
+                                //   - 每轮补任务重复选中它 → skipped_count 无限增长
+                                //   - refill_tasks 的 `loop { .. if skipped == 0 { break } }` 直接变成死循环
+                                {
+                                    let mut folders_guard = folders.write().await;
+                                    if let Some(folder) = folders_guard.get_mut(&group_id) {
+                                        folder
+                                            .pending_files
+                                            .retain(|p| p.fs_id != file_to_create.fs_id);
+                                    }
+                                }
                                 skipped_count += 1;
                                 skipped_bytes += file_to_create.size;
                                 skipped_list.push(crate::downloader::folder::SkippedFile {
@@ -4030,6 +4134,15 @@ impl FolderDownloadManager {
                 .take(needed)
                 .cloned()
                 .collect();
+            // 🔥 观测点（issue #156），说明见另一条补任务路径的同名循环
+            for f in &files {
+                if folder.counted_fs_ids.contains(&f.fs_id) {
+                    warn!(
+                        "文件夹 {} 把已完成过的文件重新排进了补任务队列 (fs_id={}, path={})，将会重复下载",
+                        folder_id, f.fs_id, f.relative_path
+                    );
+                }
+            }
             if files.is_empty() {
                 return Ok(RefillBatch::default());
             }
@@ -4104,6 +4217,21 @@ impl FolderDownloadManager {
                     Ok(crate::uploader::conflict::ConflictResolution::Proceed) => local_path,
                     Ok(crate::uploader::conflict::ConflictResolution::Skip) => {
                         info!("跳过下载（文件已存在）: {:?}", local_path);
+                        // 🔥 跳过的文件必须从 pending_files 摘掉（issue #156）
+                        //
+                        // 本方法的外层 `refill_tasks` 是 `loop { batch; if skipped == 0 { break } }`，
+                        // 其终止性注释写的是「每轮 skipped > 0 意味着至少从 pending 取走了一个文件」。
+                        // 但补任务后来改成了「只挑选不摘除、落盘时才摘」，而 Skip 分支不建任务、
+                        // 也就永远等不到落盘回调 —— 终止性假设被打破，整个 loop 变成无限热循环
+                        // （每轮重选同一批文件、skipped_count 无限涨、还每轮落一次盘）。
+                        {
+                            let mut folders_guard = self.folders.write().await;
+                            if let Some(folder) = folders_guard.get_mut(folder_id) {
+                                folder
+                                    .pending_files
+                                    .retain(|p| p.fs_id != pending_file.fs_id);
+                            }
+                        }
                         // 🔥 跳过的文件同样是"处理完毕"，必须计入 skipped_count。
                         //    total_files 在扫描时已包含它们，若不计数，
                         //    completed+skipped+failed 永远够不到 total_files，
@@ -4374,13 +4502,38 @@ impl FolderDownloadManager {
 
     /// 🔥 检查文件夹是否已全部处理完毕，是则置终态、落盘并发布事件
     ///
-    /// 从 `update_folder_progress` 抽出，供两处复用：
-    /// - `update_folder_progress`：子任务完成事件驱动的常规路径
+    /// 从 `update_folder_progress` 抽出，原本供两处复用：
+    /// - `update_folder_progress`：已是死代码，全 crate 没有调用方（见
+    ///   `start_pending_refill_loop` 的注释），因此本方法**实际只剩下面一条活路径**
     /// - `refill_tasks`：整批文件都命中冲突策略"跳过"时，不会有任何子任务完成事件来
     ///   驱动终态检查，需要主动调用，否则文件夹卡在 downloading（issue #141 连带问题）
     ///
     /// 注意：本方法**不能**调用 `refill_tasks`，否则与 `refill_tasks` 形成异步递归。
     async fn finalize_folder_if_done(&self, folder_id: &str) {
+        // 🔥 先确认没有子任务还在跑（issue #156）
+        //
+        //    任务完成监听器里的兄弟判定有 `active_count == 0` 这道闸门，本方法一直没有。
+        //    而「只挑选不摘除、落盘时才摘」之后，pending_files 会在子任务**还在下载时**
+        //    就空掉；只要计数虚高一点（例如跳过分支重复累加 skipped_count），下面的
+        //    不等式就会提前成立 → 文件夹被判终态 → 调用方随后 release_all_slots
+        //    把正在跑的子任务连锅端掉。终态判定放宽成 `>=` 之后，这种越界不再自愈，
+        //    这道闸门就更不能少。
+        let owner_uid = {
+            let folders = self.folders.read().await;
+            match folders.get(folder_id) {
+                Some(f) => f.owner_uid,
+                None => return,
+            }
+        };
+        if let Some(dm) = self.download_manager_for(owner_uid).await {
+            let has_active = dm.get_tasks_by_group(folder_id).await.iter().any(|t| {
+                t.status == TaskStatus::Downloading || t.status == TaskStatus::Pending
+            });
+            if has_active {
+                return;
+            }
+        }
+
         let (should_persist, old_status) = {
             let mut folders = self.folders.write().await;
             let mut should_persist = false;

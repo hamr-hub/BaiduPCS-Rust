@@ -42,6 +42,13 @@ pub struct FolderPersisted {
     pub scan_progress: Option<String>,
     /// 待下载的文件队列
     pub pending_files: Vec<PendingFile>,
+    /// 🔥 已计入完成数的文件 fs_id 集合（issue #156）
+    ///
+    /// 必须持久化：完成计数的去重键从 task_id 换成了 fs_id，而 task_id 每次建任务都会
+    /// 变。若重启后清空，上次已下完的文件再次被建成子任务时会被重新计数，
+    /// `completed_count` / `completed_downloaded_size` 继续虚高，重复下载照旧。
+    #[serde(default)]
+    pub counted_fs_ids: std::collections::HashSet<u64>,
     /// 创建时间
     pub created_at: i64,
     /// 开始时间
@@ -113,6 +120,7 @@ impl FolderPersisted {
             scan_completed: folder.scan_completed,
             scan_progress: folder.scan_progress.clone(),
             pending_files: folder.pending_files.clone(),
+            counted_fs_ids: folder.counted_fs_ids.clone(),
             created_at: folder.created_at,
             started_at: folder.started_at,
             completed_at: folder.completed_at,
@@ -165,6 +173,7 @@ impl FolderPersisted {
             fixed_slot_subtask: None,
             encrypted_folder_mappings: std::collections::HashMap::new(),
             counted_task_ids: std::collections::HashSet::new(),
+            counted_fs_ids: self.counted_fs_ids.clone(),
             conflict_strategy: self.conflict_strategy,
             skipped_count: self.skipped_count,
             skipped_size: self.skipped_size,
@@ -172,6 +181,7 @@ impl FolderPersisted {
             completed_downloaded_size: 0,
             failed_count: 0,
             failed_task_ids: std::collections::HashSet::new(),
+            failed_fs_ids: std::collections::HashSet::new(),
             subtask_retry_counts: std::collections::HashMap::new(),
         }
     }
@@ -599,6 +609,49 @@ mod tests {
         let parsed: FolderPersisted =
             serde_json::from_str(legacy).expect("旧快照应能继续解析");
         assert_eq!(parsed.conflict_strategy, None);
+    }
+
+    /// 🔥 issue #156 回归：完成计数的去重键 `counted_fs_ids` 必须跨重启保留。
+    ///
+    /// 去重键从 task_id（每次建任务新生成的 UUID）换成了 fs_id（稳定的文件身份）。
+    /// 若这个集合不落盘，重启后上次已下完的文件再被建成子任务时会被重新计数，
+    /// `completed_count` / `completed_downloaded_size` 继续虚高、进度冲过 100%，
+    /// 文件夹到不了终态 → 无限补任务 → 同一批文件反复重下把流量烧光。
+    #[test]
+    fn test_counted_fs_ids_survives_save_and_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path();
+
+        let mut folder = FolderDownload::new("/电影".to_string(), PathBuf::from("/local/电影"));
+        folder.counted_fs_ids.insert(1001);
+        folder.counted_fs_ids.insert(1002);
+
+        save_folder(wal_dir, &FolderPersisted::from_folder(&folder)).unwrap();
+
+        let restored = load_folder(wal_dir, &folder.id).unwrap().unwrap().to_folder();
+        assert_eq!(
+            restored.counted_fs_ids.len(),
+            2,
+            "已计入完成数的 fs_id 必须在保存/加载后保留"
+        );
+        assert!(restored.counted_fs_ids.contains(&1001));
+        assert!(restored.counted_fs_ids.contains(&1002));
+    }
+
+    /// 升级兼容：老快照没有 counted_fs_ids 字段，应反序列化为空集合而不是解析失败。
+    #[test]
+    fn test_legacy_snapshot_without_counted_fs_ids() {
+        let legacy = r#"{
+            "id": "f1", "name": "电影", "remote_root": "/电影",
+            "local_root": "/local/电影", "status": "paused",
+            "total_files": 3, "total_size": 100, "created_count": 1,
+            "completed_count": 0, "downloaded_size": 0, "scan_completed": true,
+            "pending_files": [], "created_at": 0
+        }"#;
+
+        let parsed: FolderPersisted =
+            serde_json::from_str(legacy).expect("旧快照应能继续解析");
+        assert!(parsed.counted_fs_ids.is_empty());
     }
 
     #[test]

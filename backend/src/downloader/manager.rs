@@ -3056,13 +3056,13 @@ impl DownloadManager {
                 let tasks_guard = tasks.read().await;
                 if let Some(task) = tasks_guard.get(&task_id) {
                     // 🔥 先在锁内读出后续要用到的字段，再尽快释放锁，避免发送通知时持锁过久
-                    let (group_id, total_size, is_backup, task_owner_uid_raw) = {
+                    let (group_id, fs_id, total_size, is_backup, task_owner_uid_raw) = {
                         let mut t = task.lock().await;
                         t.status = crate::downloader::TaskStatus::Failed;
                         t.error = Some(STALE_ERROR_MSG.to_string());
                         // 🔥 清除已释放的槽位ID，避免重试时误以为还持有槽位
                         t.slot_id = None;
-                        (t.group_id.clone(), t.total_size, t.is_backup, t.owner_uid.raw())
+                        (t.group_id.clone(), t.fs_id, t.total_size, t.is_backup, t.owner_uid.raw())
                     };
 
                     // 🔥 真正停掉下载 worker：先触发取消令牌终止当前分片循环，再让调度器
@@ -3128,7 +3128,7 @@ impl DownloadManager {
                     // 🔥 通知文件夹管理器子任务失败
                     if let Some(gid) = group_id {
                         chunk_scheduler
-                            .notify_subtask_failed(gid, task_id.clone(), total_size)
+                            .notify_subtask_failed(gid, task_id.clone(), fs_id, total_size)
                             .await;
                     }
                 }
@@ -3784,10 +3784,11 @@ impl DownloadManager {
                                                         t.uses_folder_fixed_slot = false;
                                                         // 🔥 通知文件夹管理器子任务失败
                                                         let group_id = t.group_id.clone();
+                                                        let fs_id = t.fs_id;
                                                         let total_size = t.total_size;
                                                         drop(t);
                                                         if let Some(gid) = group_id {
-                                                            chunk_scheduler_clone.notify_subtask_failed(gid, id_clone.clone(), total_size).await;
+                                                            chunk_scheduler_clone.notify_subtask_failed(gid, id_clone.clone(), fs_id, total_size).await;
                                                         }
                                                     }
                                                     cancellation_tokens_clone
@@ -3863,10 +3864,11 @@ impl DownloadManager {
                                                 t.uses_folder_fixed_slot = false;
                                                 // 🔥 通知文件夹管理器子任务失败
                                                 let group_id = t.group_id.clone();
+                                                let fs_id = t.fs_id;
                                                 let total_size = t.total_size;
                                                 drop(t);
                                                 if let Some(gid) = group_id {
-                                                    chunk_scheduler_clone.notify_subtask_failed(gid, id_clone.clone(), total_size).await;
+                                                    chunk_scheduler_clone.notify_subtask_failed(gid, id_clone.clone(), fs_id, total_size).await;
                                                 }
                                             }
                                             cancellation_tokens_clone
@@ -6760,7 +6762,7 @@ impl DownloadManager {
     }
 
     /// 设置任务完成通知发送器（用于文件夹下载补充任务）
-    pub async fn set_task_completed_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<(String, String, u64, bool)>) {
+    pub async fn set_task_completed_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<(String, String, u64, u64, bool)>) {
         self.chunk_scheduler.set_task_completed_sender(tx).await;
     }
 

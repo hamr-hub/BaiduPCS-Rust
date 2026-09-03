@@ -277,7 +277,15 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 ## 📋 最新版本
 
-### v2.2.2 (当前版本)
+### v2.2.3 (当前版本)
+
+**维护版本**：修复文件夹下载**重复计数、永远到不了终态、同一批文件反复重下把流量烧光**（issue #156，建议所有用户升级），并堵住分片「部分数据」续传黏在坏链接上的流量黑洞。
+
+**问题修复：**
+- 🐛 **下载·文件夹完成计数按 task_id 去重导致无限重下（重要）**：完成计数按每次新建任务的 UUID 去重，同一文件被重新建成子任务就会再 +1。实测 1041 个文件数成 5337、18.4GB 数成 94.5GB，进度冲过 100% 后文件夹永远完不成、同一批文件反复重下（用户烧掉约 100GB 流量）。现按百度侧稳定的 `fs_id` 去重并随快照持久化；失败计数同样按 `fs_id` 抵消，避免文件都在盘上却报失败
+- 🐛 **下载·「部分数据」续传黏在坏链接上耗尽流量（重要）**：CDN 每次只吐几 KB 就断时，分片会永远黏在同一条坏链接上磨、重试永远到不了上限；目标文件被重置时裸减法还会回绕，把零字节失败当成「有进展」。现连续 10 轮净进展不足 256KB 就强制换链接，并用饱和减法堵住回绕
+
+### v2.2.2
 
 **维护版本**：修复**5~10MB 文件必然下载失败**（自 `v2.1.2` 起的回归，建议所有用户升级）与**小文件进度条停在中途**。
 
@@ -826,9 +834,9 @@ open http://localhost:18888
 从 [Releases](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 下载对应架构的压缩包（Apple Silicon 选 `macos-arm64`，Intel 选 `macos-x86_64`）：
 
 ```bash
-# 1. 解压（以 v2.2.2 为例）
-unzip BaiduPCS-Rust-v2.2.2-macos-arm64.zip
-cd BaiduPCS-Rust-v2.2.2-macos-arm64
+# 1. 解压（以 v2.2.3 为例）
+unzip BaiduPCS-Rust-v2.2.3-macos-arm64.zip
+cd BaiduPCS-Rust-v2.2.3-macos-arm64
 
 # 2. 解除 Gatekeeper 隔离标记（必需）
 xattr -dr com.apple.quarantine .

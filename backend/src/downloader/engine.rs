@@ -30,6 +30,18 @@ const MAX_BACKOFF_MS: u64 = 5000;
 /// 最少保留链接数
 const MIN_AVAILABLE_LINKS: usize = 2;
 
+/// 「部分数据」续传一轮算作有效进展的最小净增字节数（issue #156）
+///
+/// 分片上限是百度的 5MB Range 硬限，正常断流续传一轮少说也有几百 KB；
+/// 低于这个阈值说明链接已经烂到只能挤出零头，不该再算作"有进展"。
+const PARTIAL_RESUME_PROGRESS_THRESHOLD: u64 = 256 * 1024;
+
+/// 同一条链接上允许连续多少轮「有数据但没进展」的续传，超过就强制换链接
+///
+/// 取 10 是因为每轮之间固定 sleep 500ms，10 轮 = 5 秒，既给了限速账号喘息的余地，
+/// 又不至于像修复前那样无限期黏在坏链接上（issue #156：retries 永远到不了上限）。
+const MAX_UNPRODUCTIVE_PARTIAL_RESUMES: u32 = 10;
+
 /// 短期速度窗口大小（用于 score 判定）
 /// 推荐值：5-10，避免早期高速持续影响后期判定
 const SPEED_WINDOW_SIZE: usize = 7;
@@ -3407,6 +3419,14 @@ impl DownloadEngine {
         // 记录尝试过的链接（避免在同一次重试循环中重复尝试同一个链接）
         let mut tried_urls = std::collections::HashSet::new();
         let mut retries = 0;
+        // 🔥 同一条链接上「有数据但几乎没进展」的续传次数（issue #156）
+        //
+        // 「部分数据」分支不递增 retries、也不换链接，这在断流后能接着下是对的；
+        // 但百度 CDN 抽风时每次只吐几 KB 就断，净进展逼近 0，分片会以 500ms 一轮的
+        // 节奏永远黏在同一条坏链接上磨（用户观感 = 卡死，且 retries 永远到不了上限）。
+        // 这里按「净进展是否达标」计数：达标就清零（正常续传不受影响），
+        // 连续 MAX_UNPRODUCTIVE_PARTIAL_RESUMES 次不达标就强制换链接。
+        let mut unproductive_partial_resumes: u32 = 0;
         #[allow(unused_assignments)]
         let mut last_error = None;
 
@@ -3694,10 +3714,23 @@ impl DownloadEngine {
                     // ❌ 下载失败
 
                     // 🔥 分片内断点续传：检查本次是否有部分数据写入
-                    let bytes_this_attempt = chunk.bytes_downloaded - bytes_before;
+                    // 🔥 必须用 saturating_sub：chunk.download() 的续传安全校验
+                    //    （见 ChunkData::download，目标文件缺失/长度不足时）会把
+                    //    self.bytes_downloaded 重置为 0，本轮结束后可能**小于** bytes_before。
+                    //    裸减法在 release（overflow-checks 默认关闭）下会回绕成天文数字，
+                    //    让一次**零字节失败**被误判成"下到了部分数据"，进而既不计重试也不
+                    //    换链接，还会从分片头重下已下过的区间——issue #156 的流量黑洞。
+                    let bytes_this_attempt = chunk.bytes_downloaded.saturating_sub(bytes_before);
 
-                    // 🔥 将部分进度同步回 ChunkManager（下次循环 clone 时可继承）
-                    if bytes_this_attempt > 0 {
+                    // 🔥 将本轮进度同步回 ChunkManager（下次循环 clone 时可继承）
+                    //
+                    //    条件必须是 `!=` 而不是 `> 0`：download() 的续传安全校验会把
+                    //    chunk.bytes_downloaded 重置为 0，本轮结束值可能**小于** bytes_before。
+                    //    这种"进度回退"同样必须写回，否则下一轮从 manager clone 到的还是那个
+                    //    过大的旧偏移，resume_start 再次超过文件真实长度 → 再次重置 → 本轮下
+                    //    的字节全部作废，分片会一直从头重下直到 max_retries 耗尽。
+                    //    （改用 saturating_sub 之前，回绕出的天文数字歪打正着满足了 `> 0`。）
+                    if chunk.bytes_downloaded != bytes_before {
                         let mut manager = chunk_manager.lock().await;
                         manager.update_bytes_downloaded(chunk_index, chunk.bytes_downloaded);
                     }
@@ -3802,7 +3835,22 @@ impl DownloadEngine {
                     last_error = Some(e);
 
                     // 🔥 分片内断点续传：区分"有数据"和"零数据"两种失败
-                    if bytes_this_attempt > 0 {
+                    // 🔥 本轮净进展是否达标，决定"部分数据"续传的额度（issue #156）
+                    //
+                    //    阈值要跟"本轮开始时分片还剩多少"取小：分片尾部（剩余不足 256KB）
+                    //    或本身就小于 256KB 的分片，任何一次尝试都不可能达标，否则整条尾巴
+                    //    会被一路算成"没进展"，把一个马上就下完的分片强行判死。
+                    let progress_threshold = PARTIAL_RESUME_PROGRESS_THRESHOLD
+                        .min(chunk.size().saturating_sub(bytes_before));
+                    if bytes_this_attempt >= progress_threshold {
+                        unproductive_partial_resumes = 0;
+                    } else if bytes_this_attempt > 0 {
+                        unproductive_partial_resumes += 1;
+                    }
+
+                    if bytes_this_attempt > 0
+                        && unproductive_partial_resumes < MAX_UNPRODUCTIVE_PARTIAL_RESUMES
+                    {
                         // ✅ 有部分数据：链接本身可用，只是被限速/断流
                         // 不递增 retries，不切换链接，从断点继续
                         // tried_urls 中已有当前 URL，需要移除以允许复用
@@ -3820,7 +3868,28 @@ impl DownloadEngine {
                         // 短暂延迟后重试（限速账号需要间隔，避免立刻被再次断流）
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     } else {
-                        // ❌ 零数据：连接本身有问题，递增 retries 并切换链接
+                        // 🔥 走到这里有两种情况：
+                        //   a. 零数据失败（连接本身有问题）
+                        //   b. 有数据但连续 MAX_UNPRODUCTIVE_PARTIAL_RESUMES 轮净进展都不达标
+                        //      —— 这条链接实际已经废了，继续黏着它只会白烧时间和流量
+                        // 两种都递增 retries 并保留 tried_urls（下一轮会挑一条没试过的链接）。
+                        // 走到这里一定会换链接，计数器必须清零：它统计的是
+                        // 「同一条链接上」的连续无进展轮数，跨链接累加会让下一条
+                        // 好链接继承上一条坏链接的欠账、被提前判死。
+                        if bytes_this_attempt > 0 {
+                            warn!(
+                                "[分片线程{}] ⚠ 分片 #{} 在同一链接上连续 {} 轮续传都几乎没有进展\
+                                 (本次 {} bytes，累计 {}/{} bytes)，强制切换链接",
+                                chunk_thread_id,
+                                chunk_index,
+                                unproductive_partial_resumes,
+                                bytes_this_attempt,
+                                chunk.bytes_downloaded,
+                                chunk.size(),
+                            );
+                        }
+                        unproductive_partial_resumes = 0;
+
                         retries += 1;
 
                         // 检查是否达到重试次数上限，或所有链接都已尝试过
@@ -3850,7 +3919,7 @@ impl DownloadEngine {
                         }
 
                         warn!(
-                            "[分片线程{}] ⚠ 分片 #{} 下载失败（零数据），切换链接重试 (已尝试 {}/{} 个链接，重试 {}/{}): {:?}",
+                            "[分片线程{}] ⚠ 分片 #{} 下载失败（零数据或无进展），切换链接重试 (已尝试 {}/{} 个链接，重试 {}/{}): {:?}",
                             chunk_thread_id,
                             chunk_index,
                             tried_urls.len(),

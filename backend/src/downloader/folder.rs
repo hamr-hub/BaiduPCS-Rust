@@ -144,8 +144,26 @@ pub struct FolderDownload {
 
     /// 🔥 已计数的任务ID集合（用于避免重复计数 completed_count）
     /// 解决问题：使用固定位的子任务完成时也需要递增 completed_count
+    ///
+    /// 注意：这个集合只用于「把已完成任务从 active_sum 里剔掉」（见
+    /// `active_downloaded_excluding_counted`），**不再充当完成计数的去重闸门** ——
+    /// 去重键已换成 `counted_fs_ids`，原因见该字段。
     #[serde(default, skip)]
     pub counted_task_ids: HashSet<String>,
+
+    /// 🔥 已计入完成数的文件 fs_id 集合（issue #156）
+    ///
+    /// 完成计数原本按 `task_id` 去重，而 task_id 是每次建任务新生成的 UUID：同一个
+    /// 文件只要被重新建成子任务（重启后对账失效、跳过分支没摘队列、失败重入队等），
+    /// 就会**再 +1 并把 file_size 再累加进 `completed_downloaded_size`**。实测
+    /// 1041 个文件数成 5337、18.4GB 数成 94.5GB，进度冲过 100% 后文件夹永远到不了
+    /// 终态，于是无限补任务、把同一批文件反复重下（用户实测烧掉约 100GB 流量）。
+    ///
+    /// `fs_id` 是百度网盘侧稳定的文件身份，跨任务、跨重启都不变，用它做去重键才能
+    /// 真正把重复计数堵死在源头 —— 这也意味着**不需要枚举出所有"重复建任务"的路径**
+    /// 就能止血。因此本字段必须持久化（见 `FolderPersisted.counted_fs_ids`）。
+    #[serde(default, skip)]
+    pub counted_fs_ids: HashSet<u64>,
 
     /// 🔥 下载冲突策略（用于子任务）
     ///
@@ -197,6 +215,17 @@ pub struct FolderDownload {
     #[serde(default, skip)]
     pub subtask_retry_counts: HashMap<String, u32>,
 
+    /// 🔥 已计入 failed_count 的文件 fs_id 集合（运行时字段）
+    ///
+    /// 与 `counted_fs_ids` 同因同治（issue #156）：`failed_task_ids` 按 task_id 记账，
+    /// 而同一个文件被重新建成子任务时 task_id 会变。于是「任务 A 耗尽重试被判死 →
+    /// 同一文件的任务 B 下载成功」时，成功侧按 task_id 抵消不掉 A 的那笔失败，
+    /// 文件明明都在盘上，文件夹却以"N 个文件下载失败"收场。用 fs_id 记一份才能抵消。
+    ///
+    /// 与 `failed_task_ids` 一样不持久化 —— 重启后重新给一份重试额度。
+    #[serde(default, skip)]
+    pub failed_fs_ids: HashSet<u64>,
+
     /// 🔥 已失败的任务ID集合（运行时字段）
     /// 避免同一任务多次失败时重复计数；重试成功时从此集合移除并减少 failed_count
     #[serde(default, skip)]
@@ -245,6 +274,7 @@ impl FolderDownload {
             fixed_slot_subtask: None,
             encrypted_folder_mappings: HashMap::new(),
             counted_task_ids: HashSet::new(),
+            counted_fs_ids: HashSet::new(),
             conflict_strategy: None,
             skipped_count: 0,
             skipped_size: 0,
@@ -252,6 +282,7 @@ impl FolderDownload {
             completed_downloaded_size: 0,
             failed_count: 0,
             failed_task_ids: HashSet::new(),
+            failed_fs_ids: HashSet::new(),
             subtask_retry_counts: HashMap::new(),
         }
     }

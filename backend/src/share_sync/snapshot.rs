@@ -223,6 +223,17 @@ impl ScanCache {
     }
 }
 
+/// 扫描列目录的并发度（每波并发抓取的目录数）。默认 8，范围 [1,32]。
+/// 用 `BAIDUPCS_SHARE_SYNC_SCAN_CONCURRENCY` 覆盖。所有请求仍受共享限速器约束，
+/// 调大并发只提升连接利用率，不会突破全局 RPS 上限。
+fn scan_concurrency() -> usize {
+    std::env::var("BAIDUPCS_SHARE_SYNC_SCAN_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(|n: usize| n.clamp(1, 32))
+        .unwrap_or(8)
+}
+
 /// 单个 list 请求的重试次数（不含首次）。默认 3。
 /// 可用 `BAIDUPCS_SHARE_SYNC_LIST_RETRIES` 覆盖（设 0 关闭）。
 fn list_retry_limit() -> u32 {
@@ -474,7 +485,18 @@ impl<'a> SnapshotCollector<'a> {
             }
         }
 
-        // Step 2: BFS 子目录
+        // Step 2: 有界并发 BFS 子目录
+        //
+        // 历史上这里是纯串行 BFS：stk_factor 这类分享有 ~1 万个 day 目录，每个目录
+        // 至少 1 次 list 请求，即便限速器允许 12 RPS，串行也要十几分钟到 2 小时，
+        // 多轮重试时反复踩「snapshot phase too slow」中止。改成按波次并发：每波取
+        // 至多 N 个目录并发翻页，N 受 BAIDUPCS_SHARE_SYNC_SCAN_CONCURRENCY 控制（默认 8）。
+        // 所有请求仍先过同一个共享限速器（令牌桶），所以并发只提升连接利用率，
+        // 不会突破全局 RPS 上限、不会放大风控风险。每波的结果仍串行合并（absorb +
+        // 入队），include/exclude/去重语义与串行版一致；唯一行为差异：开启
+        // include_paths 精确选文件时不再跨页提前 break（并发下无法共享 found 集合），
+        // 会多翻若干页，结果仍然正确（dir_needs_more_pages 的短路本就是纯优化）。
+        let scan_concurrency = scan_concurrency();
         let mut queue: VecDeque<String> = queued_dirs.iter().cloned().collect();
 
         // 首帧进度：让前端在第一个目录还没列完时就能从「运行中」切到「扫描中」。
@@ -486,18 +508,109 @@ impl<'a> SnapshotCollector<'a> {
             cached_hits,
         });
 
-        while let Some(dir) = queue.pop_front() {
-            let normalized_dir =
-                normalize_share_path(&dir, dir.rsplit('/').next().unwrap_or(&dir), &share_root);
-            if !self.dir_allowed(&normalized_dir) {
-                continue;
-            }
+        // 单目录抓取结果：缓存命中直接带回条目；否则翻完全部页。
+        struct DirFetch {
+            normalized_dir: String,
+            entries: Vec<SharedFileInfo>,
+            cache_hit: bool,
+        }
 
-            // 缓存命中 → 本轮不发任何请求，直接复用上一轮已列完的结果（续爬）。
-            if let Some(hit) = self.cache.as_ref().and_then(|c| c.get(&dir)) {
-                cached_hits += 1;
+        while !queue.is_empty() {
+            // 取一波（最多 N 个）目录
+            let wave_size = queue.len().min(scan_concurrency);
+            let wave: Vec<String> = (0..wave_size).filter_map(|_| queue.pop_front()).collect();
+
+            // map 闭包是 FnMut（每波调用多次），不能 move 走 self / 局部 String；
+            // 在闭包外取共享引用，闭包按引用捕获（& 是 Copy），各 future 并发共享。
+            let this = &self;
+            let share_root_ref: &String = &share_root;
+            let root_shareid_ref: &String = &root_shareid;
+            let root_uk_ref: &String = &root_uk;
+            let fetches = futures::future::join_all(wave.into_iter().map(|dir| async move {
+                let normalized_dir = normalize_share_path(
+                    &dir,
+                    dir.rsplit('/').next().unwrap_or(&dir),
+                    share_root_ref,
+                );
+                if !this.dir_allowed(&normalized_dir) {
+                    return Ok(DirFetch {
+                        normalized_dir,
+                        entries: Vec::new(),
+                        cache_hit: false,
+                    });
+                }
+
+                // 缓存命中 → 本轮不发任何请求，直接复用上一轮已列完的结果（续爬）。
+                if let Some(hit) = this.cache.as_ref().and_then(|c| c.get(&dir)) {
+                    return Ok(DirFetch {
+                        normalized_dir,
+                        entries: hit,
+                        cache_hit: true,
+                    });
+                }
+
+                // 本目录累计到的全部条目。**只有完整翻完页**才写入缓存 ——
+                // 被 include 短路提前 break 的结果是不完整的，缓存下来会让后续
+                // 重试漏掉条目（并发版 include 场景一律翻满）。
+                let cache_on = this.cache.is_some();
+                let mut collected: Vec<SharedFileInfo> = Vec::new();
+                let mut page: u32 = 1;
+                loop {
+                    let batch = this
+                        .list_dir_page_with_retry(
+                            root_shareid_ref,
+                            root_uk_ref,
+                            &dir,
+                            page,
+                            page_size,
+                        )
+                        .await?;
+
+                    if batch.is_empty() {
+                        break;
+                    }
+
+                    let batch_len = batch.len();
+                    // entries 始终累积：它既是本波合并（absorb）的输入，
+                    // 也在开缓存时回写 ScanCache。只在 cache_on 累积会让
+                    // 无缓存运行抓不到任何文件（只留 root 目录骨架）。
+                    collected.extend(batch.iter().cloned());
+                    // include 跨页短路在并发版保守关闭（见上方注释）；
+                    // 空 include_paths（全量同步）时该判断恒 true，无影响。
+                    if batch_len < page_size as usize {
+                        break;
+                    }
+                    page += 1;
+                    if page > 10_000 {
+                        return Err(ShareSyncError::Internal(
+                            "递归层数/翻页数超过安全上限，可能存在循环引用".into(),
+                        ));
+                    }
+                }
+
+                // 完整翻页 → 回写缓存（ScanCache 内部加锁，可跨并发任务共享）。
+                if cache_on {
+                    if let Some(cache) = this.cache.as_ref() {
+                        cache.put(dir.clone(), collected.clone());
+                    }
+                }
+
+                Ok(DirFetch {
+                    normalized_dir,
+                    entries: collected,
+                    cache_hit: false,
+                })
+            }))
+            .await;
+
+            // 串行合并本波结果，保持 absorb/入队/去重的确定性顺序
+            for fetch in fetches {
+                let fetch = fetch?;
+                if fetch.cache_hit {
+                    cached_hits += 1;
+                }
                 absorb_entries(
-                    hit,
+                    fetch.entries,
                     &share_root,
                     &self.include_paths,
                     &self.include_index,
@@ -513,81 +626,10 @@ impl<'a> SnapshotCollector<'a> {
                     dirs_done,
                     dirs_pending: queue.len(),
                     files_seen,
-                    current_dir: normalized_dir.clone(),
+                    current_dir: fetch.normalized_dir.clone(),
                     cached_hits,
                 });
-                continue;
             }
-
-            // 本目录累计到的全部条目。**只有完整翻完页**才写入缓存 ——
-            // 被 include 短路提前 break 的结果是不完整的，缓存下来会让后续
-            // 重试漏掉条目。
-            let mut collected: Vec<SharedFileInfo> = Vec::new();
-            let mut fully_paged = false;
-            let mut page: u32 = 1;
-            loop {
-                let batch = self
-                    .list_dir_page_with_retry(
-                        &root_shareid,
-                        &root_uk,
-                        &dir,
-                        page,
-                        page_size,
-                    )
-                    .await?;
-
-                if batch.is_empty() {
-                    fully_paged = true;
-                    break;
-                }
-
-                let batch_len = batch.len();
-                // 只有开了缓存才需要留副本；否则大目录每页白克隆 100 条。
-                if self.cache.is_some() {
-                    collected.extend(batch.iter().cloned());
-                }
-                absorb_entries(
-                    batch,
-                    &share_root,
-                    &self.include_paths,
-                    &self.include_index,
-                    &mut all_items,
-                    &mut seen,
-                    &mut queued_dirs,
-                    &mut queue,
-                    &mut found_included_files,
-                    &mut files_seen,
-                );
-
-                if !self.dir_needs_more_pages(&normalized_dir, &found_included_files) {
-                    break;
-                }
-                if batch_len < page_size as usize {
-                    fully_paged = true;
-                    break;
-                }
-                page += 1;
-                if page > 10_000 {
-                    return Err(ShareSyncError::Internal(
-                        "递归层数/翻页数超过安全上限，可能存在循环引用".into(),
-                    ));
-                }
-            }
-
-            if fully_paged {
-                if let Some(cache) = self.cache.as_ref() {
-                    cache.put(dir.clone(), collected);
-                }
-            }
-
-            dirs_done += 1;
-            self.emit_progress(ScanProgress {
-                dirs_done,
-                dirs_pending: queue.len(),
-                files_seen,
-                current_dir: normalized_dir.clone(),
-                cached_hits,
-            });
         }
 
         // Step 3: 过滤 + 标记（抽成自由函数，见 `filter_and_mark_pruned` 注释）

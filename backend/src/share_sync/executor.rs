@@ -1373,10 +1373,105 @@ impl<'a> ShareSyncExecutor<'a> {
         depth: u32,
     ) -> Result<(), ErrorCategory> {
         use crate::share_sync::tree as tree_mod;
+        use std::collections::HashSet;
 
         if indices.is_empty() {
             return Ok(());
         }
+
+        // 提速:本地目标 + 文件已存在 + size 匹配 → 直接标 Completed,跳过整条转存腿。
+        // 之前在 30h 同步里, 99.5% 文件已在盘, executor 还是把它们一个一个重新下载;
+        // 现在只对真正缺的文件做转存, 实际 ETA 从 ~3h 压到 ~30s (仅 ~40 个 missing)。
+        // 仅在 Local 目标生效 (Netdisk 没有"已存在"概念)。
+        let indices = if let SyncTarget::Local(local_t) = target {
+            let local_dir = local_t.local_path.as_path();
+            let mut already_done_leaves: HashSet<usize> = HashSet::new();
+            let mut diag_total = 0usize;
+            let mut diag_match = 0usize;
+            let mut diag_sample: Option<(String, u64, bool)> = None;
+            for idx in &indices {
+                let leaves = tree.descendants_leaves(*idx);
+                diag_total += leaves.len();
+                for leaf_idx in leaves {
+                    let leaf = tree.get(leaf_idx);
+                    let m = !leaf.is_dir
+                        && local_file_matches(local_dir, &leaf.path, leaf.size);
+                    if m {
+                        diag_match += 1;
+                    }
+                    if diag_sample.is_none() && !leaf.is_dir {
+                        let fp = local_dir.join(leaf.path.trim_start_matches('/'));
+                        let exists = std::fs::metadata(&fp).is_ok();
+                        diag_sample = Some((leaf.path.clone(), leaf.size, exists));
+                    }
+                    if m {
+                        if let Err(e) = self.persistence.add_run_item(
+                            run_id,
+                            &leaf.path,
+                            action_for_path(action_by_path, &leaf.path),
+                            record_kind,
+                            None,
+                            None,
+                            RunItemStatus::Completed,
+                            None,
+                            None,
+                        ) {
+                            warn!(
+                                "share_sync_skip_existing: 标已完成失败: run_id={} path={} err={}",
+                                run_id, leaf.path, e
+                            );
+                        }
+                        already_done_leaves.insert(leaf_idx);
+                    }
+                }
+            }
+            // 过滤掉"所有叶子都已存在"的 index;部分存在的 index **展开为缺失叶子
+            // 的散文件索引**，而不是保留原目录节点 —— 否则 nodes_to_items 会按整目录
+            // 提交，下载器把 99.7% 已在盘的文件重新下一遍（27/8723 缺失也要跑 5.2GB、
+            // 反复 idle 超时）。展开后只提交真正缺的叶子（散文件批量，无转存上限问题）。
+            let mut remaining: Vec<usize> = Vec::with_capacity(indices.len());
+            for idx in &indices {
+                let leaves: HashSet<usize> =
+                    tree.descendants_leaves(*idx).into_iter().collect();
+                if !leaves.is_empty() && leaves.is_subset(&already_done_leaves) {
+                    // 这棵子树全部跳过
+                    continue;
+                }
+                if leaves.is_empty() {
+                    // 无叶子（理论上不该发生），保守保留原节点
+                    remaining.push(*idx);
+                } else if leaves.is_disjoint(&already_done_leaves) {
+                    // 一个都没落地 → 保留整棵子树（目录提交比成千上万散文件高效，
+                    // 且后续 presplit/二分仍按节点工作）
+                    remaining.push(*idx);
+                } else {
+                    // 部分落地 → 只追加缺失叶子
+                    for leaf in leaves.difference(&already_done_leaves) {
+                        remaining.push(*leaf);
+                    }
+                }
+            }
+            if remaining.len() != indices.len() || diag_match != 0 {
+                info!(
+                    "share_sync_skip_existing: run_id={} leaves_total={} matched={} sample={:?} orig_nodes={} kept={} target=local",
+                    run_id,
+                    diag_total,
+                    diag_match,
+                    diag_sample,
+                    indices.len(),
+                    remaining.len()
+                );
+            } else {
+                info!(
+                    "share_sync_skip_diag: run_id={} leaves_total={} matched=0 sample={:?}",
+                    run_id, diag_total, diag_sample
+                );
+            }
+            remaining
+        } else {
+            indices
+        };
+
         let items_to_submit = tree_mod::nodes_to_items(tree, &indices);
         if items_to_submit.is_empty() {
             // 全是 placeholder — 降级按叶子提交
@@ -3447,6 +3542,86 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
         assert!(local_file_exists(dir.path(), "/a.txt"));
         assert!(!local_file_exists(dir.path(), "/b.txt"));
+    }
+
+    /// 提速验证:tree 入口下,本地目标 + 文件已存在 + size 匹配
+    /// → apply_with_run_id_tree 应直接跳过整条转存腿、标记 Completed、不调用 hooks。
+    /// 这正是上一轮 30h 长跑的 99.5% 文件已在盘时跳过的场景。
+    #[test]
+    fn test_tree_skip_existing_local_files() {
+        let dir = tempdir().unwrap();
+        let local_root = dir.path().to_path_buf();
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+
+        let s = {
+            let mut s = sub();
+            s.targets = vec![SyncTarget::Local(LocalTarget {
+                local_path: local_root.clone(),
+                conflict_strategy: None,
+                mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
+            })];
+            s
+        };
+        let pm = ShareSyncPersistence::new(&db_dir.join("s.db")).unwrap();
+        pm.upsert_subscription(&s).unwrap();
+
+        // 准备 3 个 leaf 文件,本地已存在且 size 匹配
+        for (rel, sz) in [("/a.txt", 11u64), ("/b.txt", 22u64), ("/c.txt", 33u64)] {
+            std::fs::write(local_root.join(rel.trim_start_matches('/')), vec![0u8; sz as usize])
+                .unwrap();
+        }
+
+        // 1 个文件 missing,确认它会被真正下载
+        // (c.txt 已存在 → 跳过; d.txt 不存在 → 走正常 transfer / download)
+
+        let prev = ShareSnapshot::with_items(&s.id, vec![]);
+        pm.save_snapshot(&prev).unwrap();
+        let curr = ShareSnapshot::with_items(
+            &s.id,
+            vec![
+                item("/a.txt", 1, 11),
+                item("/b.txt", 2, 22),
+                item("/c.txt", 3, 33),
+                item("/d.txt", 4, 44), // missing
+            ],
+        );
+        let diff = diff_snapshots(Some(&prev), &curr);
+
+        let hooks = MockHooks::default();
+        let ex = ShareSyncExecutor::new(&s, &pm, &hooks);
+
+        let outcome =
+            futures::executor::block_on(ex.apply_with_run_id_tree("test-run".into(), &captured(), &diff));
+
+        assert_eq!(outcome.status, RunStatus::Completed);
+
+        // run_items:3 个跳过 + 1 个走下载 = 4 项
+        let items = pm.list_run_items("test-run").unwrap();
+        assert_eq!(items.len(), 4, "expect 4 run_items, got: {:?}", items);
+
+        let skipped_paths: Vec<String> = items
+            .iter()
+            .filter(|i| i.status == "completed" && i.download_task_id.is_none() && i.transfer_task_id.is_none())
+            .map(|i| i.path.clone())
+            .collect();
+        let d_path: Vec<String> = items
+            .iter()
+            .filter(|i| i.path == "/d.txt")
+            .map(|i| i.path.clone())
+            .collect();
+
+        assert_eq!(
+            skipped_paths.len(),
+            3,
+            "skip_existing 应跳过 3 个本地已有的文件; got: {:?}",
+            skipped_paths
+        );
+        for p in ["/a.txt", "/b.txt", "/c.txt"] {
+            assert!(skipped_paths.iter().any(|x| x == p), "missing {} in skipped", p);
+        }
+        // 缺失的 d.txt 必须通过正常路径(transfer / download)
+        assert_eq!(d_path, vec!["/d.txt".to_string()]);
     }
 
     // ============================================================

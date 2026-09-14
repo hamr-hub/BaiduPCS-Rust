@@ -565,7 +565,7 @@ install_systemd() {
     log "写入 $SYSTEMD_DIR/$SYSTEMD_BACKEND_UNIT"
     cat > "$SYSTEMD_DIR/$SYSTEMD_BACKEND_UNIT" <<UNIT
 [Unit]
-Description=BaiduPCS-Rust Backend
+Description=BaiduPCS-Rust Backend (v2.2.3 + local fork)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=120
@@ -577,16 +577,26 @@ User=$target_user
 WorkingDirectory=$PROJECT_ROOT
 Environment=PATH=$user_path
 Environment=HOME=$(getent passwd "$target_user" | cut -d: -f6)
-# 提速：share-sync QuotaLimiter（backend/src/share_sync/rate_limit.rs）
+# share-sync 限速（本地 c816c56 默认值：12 RPS / burst 24，DOCKER 8/16 保守档）
 Environment=BAIDUPCS_RATE_LIMIT_RPS=12
 Environment=BAIDUPCS_RATE_LIMIT_BURST=24
 Environment=BAIDUPCS_RATE_LIMIT_ENABLED=1
+# share-sync snapshot 并发扫描（本地 2d21b4a 默认 8 路，1.4 万节点 ~2h→~28min）
+Environment=BAIDUPCS_SHARE_SYNC_SCAN_CONCURRENCY=8
+# share-sync 列表失败重试（snapshot.rs 默认 3 / 500ms）
+Environment=BAIDUPCS_SHARE_SYNC_LIST_RETRIES=3
+Environment=BAIDUPCS_SHARE_SYNC_LIST_BACKOFF_MS=500
 ExecStart=$SCRIPT_DIR/local-deploy.sh run-backend
 Restart=on-failure
 RestartSec=5
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=20
+TimeoutStartSec=60
+# 资源限制（Jetson aarch64，4 核 8G）
+MemoryHigh=1500M
+MemoryMax=2G
+CPUQuota=200%
 StandardOutput=append:$BACKEND_LOG
 StandardError=append:$BACKEND_LOG
 # 安全加固（v2.2.0 起启用）：限制服务可写区域，避免污染系统
@@ -609,7 +619,7 @@ UNIT
     log "写入 $SYSTEMD_DIR/$SYSTEMD_FRONTEND_UNIT"
     cat > "$SYSTEMD_DIR/$SYSTEMD_FRONTEND_UNIT" <<UNIT
 [Unit]
-Description=BaiduPCS-Rust Frontend (vite)
+Description=BaiduPCS-Rust Frontend (vite, v2.2.3 + local fork)
 After=network-online.target $SYSTEMD_BACKEND_UNIT
 Wants=network-online.target
 PartOf=$SYSTEMD_BACKEND_UNIT
@@ -628,6 +638,11 @@ RestartSec=5
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=20
+TimeoutStartSec=60
+# 资源限制（vite preview 纯静态）
+MemoryHigh=400M
+MemoryMax=512M
+CPUQuota=100%
 StandardOutput=append:$FRONTEND_LOG
 StandardError=append:$FRONTEND_LOG
 # 安全加固：前端是纯静态服务（vite preview），不需要写业务目录

@@ -1600,6 +1600,7 @@ mod tests {
                 failed: 0,
                 overwritten: 0,
                 skipped: 0,
+                transient_retries_exhausted: 0,
             },
             None,
         )

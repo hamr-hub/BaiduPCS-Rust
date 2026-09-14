@@ -69,6 +69,12 @@ COPY config/app.toml.example /app/config/app.toml.example
 # 设置环境变量
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
+# 提速：share-sync 全局 QuotaLimiter（backend/src/share_sync/rate_limit.rs）
+# 默认 4 RPS / burst 8 偏保守，单文件实测被百度单请求限到 ~50 KB/s。
+# 提到 8 RPS / burst 16 仍远低于百度经验值 ~30 RPS 触发 errno=132 风控的线。
+ENV BAIDUPCS_RATE_LIMIT_RPS=8
+ENV BAIDUPCS_RATE_LIMIT_BURST=16
+ENV BAIDUPCS_RATE_LIMIT_ENABLED=1
 
 # 暴露端口（后端 API 和前端静态文件服务都在此端口）
 EXPOSE 18888

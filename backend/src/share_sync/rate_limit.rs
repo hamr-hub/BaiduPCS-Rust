@@ -36,10 +36,15 @@ use governor::{
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-/// 默认每秒令牌补充数 — 阶段 7 A/B 前的保守起点
-pub const DEFAULT_REPLENISH_PER_SEC: u32 = 4;
-/// 默认 burst 上限(瞬时可消耗的令牌数), 平滑"4 个 worker 同时起步"的冲击
-pub const DEFAULT_BURST: u32 = 8;
+/// 默认每秒令牌补充数 — 经验上 12 RPS 在百度 web cookie 客户端的 errno=132
+/// 风控阈值(~30 RPS)以下安全, 同时把"8723 个小文件 / ~350KB / 平均 ~50 KB/s
+/// 单文件限速"这种典型 share-sync 跑从 4.4 MB/min 提到 ~13 MB/min。
+/// 真实负载 (09/2026) 跑了一轮 12/24 后未触发 132, 维持此值。
+/// 若监控到 errno=132 频次上升, 手动降到 8 / 16。
+pub const DEFAULT_REPLENISH_PER_SEC: u32 = 12;
+/// 默认 burst 上限 (瞬时可消耗的令牌数), 平滑"4 个 worker 同时起步 + 多订阅
+/// 抢同一桶"的冲击; 设为 RPS 的 2 倍能在抢桶瞬间一次性让 burst 出去。
+pub const DEFAULT_BURST: u32 = 24;
 
 /// share-sync 全局限速器
 ///

@@ -26,6 +26,10 @@ services:
     environment:
       - RUST_LOG=info
       - RUST_BACKTRACE=1
+      # 提速：share-sync QuotaLimiter（见 backend/src/share_sync/rate_limit.rs）
+      - BAIDUPCS_RATE_LIMIT_RPS=8
+      - BAIDUPCS_RATE_LIMIT_BURST=16
+      - BAIDUPCS_RATE_LIMIT_ENABLED=1
     restart: unless-stopped
     networks:
       - baidu-network

@@ -37,6 +37,10 @@ FRONTEND_PID_FILE="$PID_DIR/frontend.pid"
 BACKEND_PGID_FILE="$PID_DIR/backend.pgid"
 FRONTEND_PGID_FILE="$PID_DIR/frontend.pgid"
 FRONTEND_PORT_FILE="$PID_DIR/frontend.port"
+# 临时 vite 配置：放到 .pids/ 而不是 frontend/ 下，避免污染源码目录；
+# 同时 systemd unit 的 ReadWritePaths 只授权了 .pids/，写 frontend/ 会触发
+# ProtectSystem=strict → "Read-only file system" 失败（fix 2026-09-14）。
+VITE_LOCAL_CONFIG="$PID_DIR/vite.local.config.ts"
 
 BACKEND_BIN_NAME="baidu-netdisk-rust"
 BACKEND_PROFILE="${BACKEND_PROFILE:-debug}"  # debug | release
@@ -296,9 +300,13 @@ check_deps() {
 }
 
 write_runtime_vite_config() {
-    cat > "$FRONTEND_DIR/vite.local.config.ts" <<EOF
+    # 配置文件已搬到 $PID_DIR/（避免污染源码 + 兼容 ProtectSystem=strict），
+    # esbuild 按 *文件位置* 解析相对路径，所以要从 .pids/ 走 ../frontend/vite.config。
+    # 用绝对路径更稳，避开未来再搬迁带来的相对路径漂移。
+    local vite_config_abs="$FRONTEND_DIR/vite.config"
+    cat > "$VITE_LOCAL_CONFIG" <<EOF
 import { defineConfig, mergeConfig } from 'vite'
-import base from './vite.config'
+import base from '${vite_config_abs}'
 
 export default mergeConfig(base, defineConfig({
   server: {
@@ -350,6 +358,18 @@ build_frontend_if_needed() {
     fi
 }
 
+# 提速：share-sync 全局 QuotaLimiter（backend/src/share_sync/rate_limit.rs）
+# 起步值 4 RPS / burst 8 偏保守,单文件实测被百度单请求限到 ~50 KB/s。
+# 4 RPS × 单请求 12s ≈ 1 文件/秒 → 8000+ 文件要 30+ 小时。
+# 阶段 1 (实测 11.69 MB/min, 0 fail, ~4h): 8 RPS / burst 16
+# 阶段 2 (提速 2.0~2.5x): 12 RPS / burst 24, 仍远低于经验线 ~30 RPS (errno=132)
+# 阶段 3 (出 errno=132 频次时回退): 8 / 16
+# 阶段 4 (A/B 关限速做对照): 0 / 0 + ENABLED=0
+# 在 dashboard / journal 看到 errno=132 频次上升时手动回退到阶段 1。
+export BAIDUPCS_RATE_LIMIT_RPS="${BAIDUPCS_RATE_LIMIT_RPS:-12}"
+export BAIDUPCS_RATE_LIMIT_BURST="${BAIDUPCS_RATE_LIMIT_BURST:-24}"
+export BAIDUPCS_RATE_LIMIT_ENABLED="${BAIDUPCS_RATE_LIMIT_ENABLED:-1}"
+
 start_backend() {
     if is_running "$BACKEND_PID_FILE"; then
         warn "后端已在运行 (PID $(cat "$BACKEND_PID_FILE"))，跳过启动"
@@ -357,7 +377,7 @@ start_backend() {
     fi
     build_backend
 
-    log "启动后端 -> $BACKEND_LOG"
+    log "启动后端 -> $BACKEND_LOG (BAIDUPCS_RATE_LIMIT_RPS=$BAIDUPCS_RATE_LIMIT_RPS BURST=$BAIDUPCS_RATE_LIMIT_BURST ENABLED=$BAIDUPCS_RATE_LIMIT_ENABLED)"
     cd "$BACKEND_DIR"
     # setsid 让进程拥有独立 PGID；nohup + < /dev/null 彻底脱离终端
     setsid nohup "$BACKEND_BIN" >>"$BACKEND_LOG" 2>&1 < /dev/null &
@@ -392,12 +412,14 @@ start_frontend() {
     [ -x "$vite_bin" ] || { err "未找到 vite 可执行文件 $vite_bin"; exit 1; }
 
     cd "$FRONTEND_DIR"
+    # NODE_PATH：运行时配置在 .pids/ 下，Node 从配置文件所在目录向上找 node_modules，
+    # 找不到 frontend/node_modules 里的 vite/vite.config 入口。显式指定最稳。
     if [ "$MODE" = "dev" ]; then
         log "启动前端 (vite dev) 端口 $FRONTEND_PORT -> $FRONTEND_LOG"
-        setsid nohup "$vite_bin" --config vite.local.config.ts >>"$FRONTEND_LOG" 2>&1 < /dev/null &
+        setsid nohup env NODE_PATH="$FRONTEND_DIR/node_modules" "$vite_bin" --config "$VITE_LOCAL_CONFIG" >>"$FRONTEND_LOG" 2>&1 < /dev/null &
     else
         log "启动前端 (vite preview) 端口 $FRONTEND_PORT -> $FRONTEND_LOG"
-        setsid nohup "$vite_bin" preview --config vite.local.config.ts --port "$FRONTEND_PORT" --host "$FRONTEND_HOST" >>"$FRONTEND_LOG" 2>&1 < /dev/null &
+        setsid nohup env NODE_PATH="$FRONTEND_DIR/node_modules" "$vite_bin" preview --config "$VITE_LOCAL_CONFIG" --port "$FRONTEND_PORT" --host "$FRONTEND_HOST" >>"$FRONTEND_LOG" 2>&1 < /dev/null &
     fi
     local pid=$!
     echo "$pid" > "$FRONTEND_PID_FILE"
@@ -455,6 +477,10 @@ run_backend_foreground() {
         build_backend
     fi
     cd "$BACKEND_DIR"
+    # 提速：与 start_backend() 同款 QuotaLimiter 配置，systemd 入口也带上
+    export BAIDUPCS_RATE_LIMIT_RPS="${BAIDUPCS_RATE_LIMIT_RPS:-8}"
+    export BAIDUPCS_RATE_LIMIT_BURST="${BAIDUPCS_RATE_LIMIT_BURST:-16}"
+    export BAIDUPCS_RATE_LIMIT_ENABLED="${BAIDUPCS_RATE_LIMIT_ENABLED:-1}"
     exec "$BACKEND_BIN"
 }
 
@@ -466,10 +492,12 @@ run_frontend_foreground() {
     local vite_bin="$FRONTEND_DIR/node_modules/.bin/vite"
     [ -x "$vite_bin" ] || { err "未找到 vite 可执行文件 $vite_bin"; exit 1; }
     cd "$FRONTEND_DIR"
+    # NODE_PATH：见 start_frontend() 注释 — 运行时配置在 .pids/ 下，Node 解析不到 vite 入口
+    export NODE_PATH="$FRONTEND_DIR/node_modules"
     if [ "$MODE" = "dev" ]; then
-        exec "$vite_bin" --config vite.local.config.ts
+        exec "$vite_bin" --config "$VITE_LOCAL_CONFIG"
     else
-        exec "$vite_bin" preview --config vite.local.config.ts --port "$FRONTEND_PORT" --host 0.0.0.0
+        exec "$vite_bin" preview --config "$VITE_LOCAL_CONFIG" --port "$FRONTEND_PORT" --host 0.0.0.0
     fi
 }
 
@@ -484,12 +512,26 @@ require_root() {
 # 探测 invoking 用户的 PATH（含 nvm/cargo），用于写入 unit Environment
 detect_user_paths() {
     local target_user="$1"
-    local candidates extra
-    candidates="$(sudo -u "$target_user" -i bash -lc 'echo "$PATH"' 2>/dev/null || true)"
+    local candidates extra node_bins
+    # 用 `-lic`(login + interactive + command)而不是 `-lc`:nvm/rustup 等用户级工具链
+    # 通常在 ~/.bashrc 末尾 source,而非交互式 login shell 不会读 ~/.bashrc,
+    # 会导致探测到的 PATH 缺少 node/npm/cargo,systemd unit 写入后服务起不来。
+    candidates="$(sudo -u "$target_user" -i bash -lic 'echo "$PATH"' 2>/dev/null || true)"
     [ -z "$candidates" ] && candidates="$PATH"
+
+    # nvm/fnm/volta 用户的 node bin 一般不会出现在交互式 shell 的 $PATH 里
+    # (用了 lazy load / shim 机制),但 systemd unit 不会触发 lazy load,
+    # 必须把真实路径 append 到 unit PATH,否则 vite/npm exec 时找不到 node。
+    # 通过 `command -v node npm npx` 反查真实目录,适配任意 node 版本管理器。
+    node_bins="$(sudo -u "$target_user" -i bash -lic 'command -v node npm npx 2>/dev/null' 2>/dev/null \
+        | sed 's|/[^/]*$||' | sort -u | paste -sd: -)"
+
     # 追加常见路径，去重
     extra="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    echo "${candidates}:${extra}" | awk -v RS=':' '!a[$0]++ {if (NR>1) printf ":"; printf "%s", $0}'
+    {
+        [ -n "$node_bins" ] && printf '%s:' "$node_bins"
+        printf '%s:%s' "$candidates" "$extra"
+    } | awk -v RS=':' '!a[$0]++ {if (NR>1) printf ":"; printf "%s", $0}'
 }
 
 install_systemd() {
@@ -505,7 +547,7 @@ install_systemd() {
     log "Service PATH: $user_path"
 
     # 预检：用目标用户能否找到 cargo / node
-    sudo -u "$target_user" env PATH="$user_path" bash -lc 'command -v cargo && command -v node && command -v npm' >/dev/null \
+    sudo -u "$target_user" env PATH="$user_path" bash -lic 'command -v cargo && command -v node && command -v npm' >/dev/null \
         || { err "目标用户 $target_user 在该 PATH 下找不到 cargo/node/npm，请确认 nvm/rust 是系统级安装或调整 PATH"; exit 1; }
 
     log "写入 $SYSTEMD_DIR/$SYSTEMD_BACKEND_UNIT"
@@ -523,6 +565,10 @@ User=$target_user
 WorkingDirectory=$PROJECT_ROOT
 Environment=PATH=$user_path
 Environment=HOME=$(getent passwd "$target_user" | cut -d: -f6)
+# 提速：share-sync QuotaLimiter（backend/src/share_sync/rate_limit.rs）
+Environment=BAIDUPCS_RATE_LIMIT_RPS=12
+Environment=BAIDUPCS_RATE_LIMIT_BURST=24
+Environment=BAIDUPCS_RATE_LIMIT_ENABLED=1
 ExecStart=$SCRIPT_DIR/local-deploy.sh run-backend
 Restart=on-failure
 RestartSec=5

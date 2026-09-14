@@ -21,6 +21,8 @@
 - 🔧 **fix(deploy): vite 运行时配置搬到 `.pids/` + `NODE_PATH` 修 systemd frontend 启动失败**
 - 🛠️ **chore(scripts): add `fix-ddns-go.sh`**：一次性修复 ddns-go systemd unit 二进制目录搬迁后的失效
 - 🛠️ **fix(scripts): local-deploy.sh 跟随 `backend/.cargo/config.toml` 的 target-dir 重定向**：用 `cargo metadata` 解析真实 target_directory
+- 🚀 **perf(share-sync): 转存按 share_root 下一级聚合（group_files_by_top_level）**：share-direct 路径下原 `group_files_by_parent_dir` 对深 tree（year/month/day/file）每个文件独立分 batch → 一 share 产生 1000+ 批次，每 batch 一个 transfer API 调用。新增 `group_files_by_top_level` 在 `share_root` 非空时按"share_root 下一级"聚合（如 weekly/year=YYYY ~36 组替代 1064 组），省 30x API 调用 + 30x 中间目录预建。`file_limit`（默认 500）继续兜底大组二次切分。普通转存（share_root 为空）保留原父目录分组语义
+- 🔧 **fix(share-sync): RPS 12→20 / BURST 24→40 + max_concurrent_tasks 5→15 / max_global_threads 10→20**：本地 4 路并行转存 + 12 RPS 偏保守，配合上面的分组提速实测 weekly 1812 文件 ~1h 完成（之前 90 min 转存+数小时下载卡死）。可经 env `BAIDUPCS_RATE_LIMIT_*` 覆盖
 - 🔧 **fix(deploy): systemd ReadWritePaths 补 backend/{logs,wal,config} + 探测 share-sync 写路径**：run-backend / run-frontend 入口 `cd $BACKEND_DIR`，CWD-相对的 logs/wal/config 实际写到 backend/ 子目录而非项目根，旧 ReadWritePaths 没覆盖导致 `os error 30 (EROFS)`、日志回退到 stdout 而 backend 起不来；install-systemd 新增 `discover_extra_rw_paths()` 从 backend `/api/v1/share-sync/subscriptions` 拉订阅 local_path（同时读 config.app.toml 的 download_dir，兜底硬编码项目外固定路径如 `/mnt/ssd/codespace/quant/data`），追加到 ReadWritePaths —— 否则 share-sync 在 ProtectSystem=strict 下 1012 项全部 downloading 但 `创建目录失败`，整个 run 卡死。顺带清掉 heredoc 注释里的反引号，bash 会当命令替换执行（之前 install-systemd 报 `line 566: logs/: Is a directory`）
 
 ---

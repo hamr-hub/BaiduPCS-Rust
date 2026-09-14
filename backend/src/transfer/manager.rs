@@ -1237,7 +1237,16 @@ let share_root = derive_share_root(task_share_root_path.as_deref(), &filtered_fi
             // 这一步是**零请求**的：只按选中项个数切，一个组里塞了 1200 个文件时
             // 必然超限，不用问百度也知道要拆。选中项是目录时无从判断（1 个 fs_id 底下
             // 可能有上万文件），那种情况留给下面的惰性兜底。
-            let dir_groups = group_files_by_parent_dir(&filtered_file_list, &share_root);
+            // v2 提速：share-direct 路径（share_root 非空，从 temp_dir 出发）
+            // 下，share tree 层级深（year=YYYY/month=MM/day=DD/file）按完整父目录
+            // 分组会产生 1000+ 批次，每批次一个 API 调用（还要预建中间目录）。
+            // 改成按「share_root 下一级」聚合（如 weekly/year=YYYY ~36 组），省 30x API。
+            // 普通转存（share_root 为空）保留原父目录分组（用户语义是保留完整目录）。
+            let dir_groups = if !share_root.is_empty() {
+                group_files_by_top_level(&filtered_file_list, &share_root)
+            } else {
+                group_files_by_parent_dir(&filtered_file_list, &share_root)
+            };
             let dir_group_count = dir_groups.len();
             let groups = split_groups_by_file_limit(dir_groups, file_limit);
             let total_groups = groups.len();
@@ -5354,6 +5363,49 @@ fn group_files_by_parent_dir(
             .push(file.clone());
     }
 
+    let mut result: Vec<(String, Vec<SharedFileInfo>)> = groups.into_iter().collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+/// v2 提速：share-direct 路径专用分组器
+///
+/// 原 `group_files_by_parent_dir` 按每个文件的完整父目录分 group，对深 tree
+/// （year=YYYY/month=MM/day=DD/file）一个 share 产生 1000+ group、1000+ API
+/// 调用。这里改按「share_root 下一级」聚合（取 share_root 后面再剥一层，
+/// 如 weekly/year=YYYY）—— 同 year 的文件进同一 group，~36 组替代 1064 组。
+///
+/// 适用条件：`share_root` 非空（即 share-direct 模式，从临时目录出发）。
+/// 普通转存走原 `group_files_by_parent_dir`，保留完整目录结构。
+fn group_files_by_top_level(
+    files: &[SharedFileInfo],
+    share_root: &str,
+) -> Vec<(String, Vec<SharedFileInfo>)> {
+    use std::collections::HashMap;
+    let mut groups: HashMap<String, Vec<SharedFileInfo>> = HashMap::new();
+    let root_trim = share_root.trim_end_matches('/');
+    for file in files {
+        // 1) 拿到完整父目录（去掉 basename）
+        let parent = extract_parent_dir_str(&file.path);
+        // 2) 相对 share_root 剥前缀
+        let rel_parent = if !root_trim.is_empty() && parent.starts_with(root_trim) {
+            parent[root_trim.len()..].trim_start_matches('/').to_string()
+        } else {
+            parent.trim_start_matches('/').to_string()
+        };
+        // 3) 取「share_root 下一级」作为 group key
+        //    例：share_root=/.bpr_share_temp/UUID, rel_parent=weekly/year=1996/month=06/day=14
+        //        → group_key = weekly/year=1996（剥到第二个 / 后）
+        //    没有 / 时（如 rel_parent 为 weekly 或空）→ 整个 rel_parent 当 group key
+        let group_key = match rel_parent.find('/') {
+            Some(idx) => rel_parent[..idx].to_string(),
+            None => rel_parent,
+        };
+        groups
+            .entry(group_key)
+            .or_default()
+            .push(file.clone());
+    }
     let mut result: Vec<(String, Vec<SharedFileInfo>)> = groups.into_iter().collect();
     result.sort_by(|a, b| a.0.cmp(&b.0));
     result

@@ -69,3 +69,22 @@ cleanup_on_failure = true
 # 默认关闭，避免误删用户数据
 cleanup_orphaned_on_startup = false
 
+
+[deploy]
+# 部署相关配置：systemd install-systemd 时会读取本节，注入到 baidupcs-backend.service 的
+# ReadWritePaths 白名单，让 share-sync / autobackup 订阅的 local_path 能写入。
+#
+# 默认 install-systemd 已经把 /mnt/ssd/codespace/ 整棵树加进去了（D 方案：约定同步
+# 目标都落在 /mnt/ssd/codespace/ 下）。如果你的同步目标在别的盘符（比如 /data/stock
+# 或 /home/user/sync-target），把绝对路径加到下面数组里（每行一项），重跑 install-systemd
+# 即可。**不需要改脚本**——改 git 追踪的 config 即可，diff 可见、可审计。
+#
+# 注意：每次改完都要 sudo bash scripts/local-deploy.sh install-systemd，
+# 因为 systemd unit 是启动时静态决定的，运行时不会自动重读。
+#
+# 示例：
+# extra_rw_paths = [
+#     "/data/stock",
+#     "/home/user/sync-target",
+# ]
+extra_rw_paths = []

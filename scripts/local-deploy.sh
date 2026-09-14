@@ -378,8 +378,8 @@ build_frontend_if_needed() {
 # 阶段 3 (出 errno=132 频次时回退): 8 / 16
 # 阶段 4 (A/B 关限速做对照): 0 / 0 + ENABLED=0
 # 在 dashboard / journal 看到 errno=132 频次上升时手动回退到阶段 1。
-export BAIDUPCS_RATE_LIMIT_RPS="${BAIDUPCS_RATE_LIMIT_RPS:-12}"
-export BAIDUPCS_RATE_LIMIT_BURST="${BAIDUPCS_RATE_LIMIT_BURST:-24}"
+export BAIDUPCS_RATE_LIMIT_RPS="${BAIDUPCS_RATE_LIMIT_RPS:-20}"
+export BAIDUPCS_RATE_LIMIT_BURST="${BAIDUPCS_RATE_LIMIT_BURST:-40}"
 export BAIDUPCS_RATE_LIMIT_ENABLED="${BAIDUPCS_RATE_LIMIT_ENABLED:-1}"
 
 start_backend() {
@@ -552,24 +552,49 @@ detect_user_paths() {
 # - 已知的项目外固定路径（兜底，例如 /mnt/ssd/codespace/quant/data 这种跨项目数据盘）
 #
 # 实现：优先在 backend 可达时调 /api/v1/share-sync/subscriptions 抽 local_path；
-# 退而求其次从 config/app.toml 读 download_dir；最后追加项目外硬编码兜底。
-# 这样脚本能在 backend 还没起来/刚迁移完 DB 时也写出最小可写集。
+# 探测 share-sync / config 里需要写权限的目录，加进 ReadWritePaths。
+# 三个来源（合并去重后输出，跨行空格分隔）：
+#   1) config/app.toml [deploy].extra_rw_paths（用户/管理员手动维护，diff 可审计）
+#   2) config/app.toml [download].download_dir（如果有的话）
+#   3) backend API /api/v1/share-sync/subscriptions 拉已订阅的 local_path（运行中的订阅）
+#   4) 默认数据盘根 /mnt/ssd/codespace/（D 方案：约定所有项目外写路径都落在这里）
 discover_extra_rw_paths() {
     local target_user="$1"
     local cfg="$PROJECT_ROOT/config/app.toml"
     local discovered=""
 
-    # 1) config/app.toml 里的 [download].download_dir（如果有的话）
+    # 默认数据盘根（D 方案）
+    discovered="$discovered /mnt/ssd/codespace"
+
     if [ -f "$cfg" ]; then
-        local dd
-        dd=$(awk '
+        # 1) [deploy].extra_rw_paths —— TOML 数组，每个元素一行字符串
+        # 用 awk 简单解析（避免依赖 tomlq 等外部工具）
+        local cfg_paths
+        cfg_paths=$(awk '
             /^\[/{section=$0; next}
+            section=="[deploy]" && /^[[:space:]]*extra_rw_paths[[:space:]]*=/ {in_arr=1; next}
+            in_arr && /^[[:space:]]*\][[:space:]]*$/{in_arr=0; next}
+            in_arr {
+                line=$0
+                # 去掉前导空白 + "- "（数组元素前缀）
+                sub(/^[[:space:]]*-?[[:space:]]*/, "", line)
+                # 去掉尾部逗号/空白
+                sub(/[[:space:]]*,?[[:space:]]*$/, "", line)
+                # 去掉引号
+                gsub(/^"|"$/, "", line)
+                if (line != "") print line
+            }
+            # [download].download_dir
             section=="[download]" && /^[[:space:]]*download_dir[[:space:]]*=/ {
                 match($0, /"[^"]+"/); s=substr($0, RSTART+1, RLENGTH-2);
-                print s; exit
+                if (s != "") { print s; exit }
             }
         ' "$cfg")
-        [ -n "$dd" ] && [ "$dd" != "logs" ] && [ "$dd" != "data" ] && discovered="$discovered $dd"
+        # 把 cfg_paths 里的 [deploy] 段读出来的就是 extra_rw_paths；
+        # 但 awk 没法在同一段里既支持 in_arr 又支持其他规则，简化：
+        # 上面 awk 同时捕获 extra_rw_paths 和 download_dir，但 extra_rw_paths 在 in_arr
+        # 模式下一次性输出多条，download_dir 是 exit 后的单条 —— 已经能分开。
+        discovered="$discovered $cfg_paths"
     fi
 
     # 2) 如果 backend 已经在跑（手动启动过、迁移场景），直接问订阅列表拿 local_path
@@ -579,7 +604,6 @@ discover_extra_rw_paths() {
         api_out=$(sudo -u "$target_user" curl -sf --max-time 3 \
             "http://127.0.0.1:${port}/api/v1/share-sync/subscriptions" 2>/dev/null || true)
         if [ -n "$api_out" ]; then
-            # 用 python3 解析（用户机器必有；DB 里没 sqlite3 CLI 时也走得通）
             local paths
             paths=$(echo "$api_out" | sudo -u "$target_user" python3 -c '
 import json, sys, re
@@ -601,11 +625,7 @@ for sub in d.get("data") or []:
         fi
     fi
 
-    # 3) 项目外固定数据盘（兜底；本次 fix 是 /mnt/ssd/codespace/quant/data）
-    #    想加新路径就在这里 append 一行。
-    discovered="$discovered /mnt/ssd/codespace/quant/data"
-
-    # dedup + 去空
+    # dedup + 去空 + 排序
     echo "$discovered" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '
 }
 

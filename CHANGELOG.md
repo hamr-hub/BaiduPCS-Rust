@@ -21,6 +21,7 @@
 - 🔧 **fix(deploy): vite 运行时配置搬到 `.pids/` + `NODE_PATH` 修 systemd frontend 启动失败**
 - 🛠️ **chore(scripts): add `fix-ddns-go.sh`**：一次性修复 ddns-go systemd unit 二进制目录搬迁后的失效
 - 🛠️ **fix(scripts): local-deploy.sh 跟随 `backend/.cargo/config.toml` 的 target-dir 重定向**：用 `cargo metadata` 解析真实 target_directory
+- 🔧 **fix(deploy): systemd ReadWritePaths 补 backend/{logs,wal,config} + 探测 share-sync 写路径**：run-backend / run-frontend 入口 `cd $BACKEND_DIR`，CWD-相对的 logs/wal/config 实际写到 backend/ 子目录而非项目根，旧 ReadWritePaths 没覆盖导致 `os error 30 (EROFS)`、日志回退到 stdout 而 backend 起不来；install-systemd 新增 `discover_extra_rw_paths()` 从 backend `/api/v1/share-sync/subscriptions` 拉订阅 local_path（同时读 config.app.toml 的 download_dir，兜底硬编码项目外固定路径如 `/mnt/ssd/codespace/quant/data`），追加到 ReadWritePaths —— 否则 share-sync 在 ProtectSystem=strict 下 1012 项全部 downloading 但 `创建目录失败`，整个 run 卡死。顺带清掉 heredoc 注释里的反引号，bash 会当命令替换执行（之前 install-systemd 报 `line 566: logs/: Is a directory`）
 
 ---
 

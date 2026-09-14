@@ -546,6 +546,69 @@ detect_user_paths() {
     } | awk -v RS=':' '!a[$0]++ {if (NR>1) printf ":"; printf "%s", $0}'
 }
 
+# 探测 backend 的写路径，用于追加到 systemd unit 的 ReadWritePaths
+# - share-sync 订阅的 local_path（每个订阅目标里 kind=local 的 local_path）
+# - config/app.toml 里的 [download].download_dir
+# - 已知的项目外固定路径（兜底，例如 /mnt/ssd/codespace/quant/data 这种跨项目数据盘）
+#
+# 实现：优先在 backend 可达时调 /api/v1/share-sync/subscriptions 抽 local_path；
+# 退而求其次从 config/app.toml 读 download_dir；最后追加项目外硬编码兜底。
+# 这样脚本能在 backend 还没起来/刚迁移完 DB 时也写出最小可写集。
+discover_extra_rw_paths() {
+    local target_user="$1"
+    local cfg="$PROJECT_ROOT/config/app.toml"
+    local discovered=""
+
+    # 1) config/app.toml 里的 [download].download_dir（如果有的话）
+    if [ -f "$cfg" ]; then
+        local dd
+        dd=$(awk '
+            /^\[/{section=$0; next}
+            section=="[download]" && /^[[:space:]]*download_dir[[:space:]]*=/ {
+                match($0, /"[^"]+"/); s=substr($0, RSTART+1, RLENGTH-2);
+                print s; exit
+            }
+        ' "$cfg")
+        [ -n "$dd" ] && [ "$dd" != "logs" ] && [ "$dd" != "data" ] && discovered="$discovered $dd"
+    fi
+
+    # 2) 如果 backend 已经在跑（手动启动过、迁移场景），直接问订阅列表拿 local_path
+    local port="$BACKEND_PORT"
+    if ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":${port}\$"; then
+        local api_out
+        api_out=$(sudo -u "$target_user" curl -sf --max-time 3 \
+            "http://127.0.0.1:${port}/api/v1/share-sync/subscriptions" 2>/dev/null || true)
+        if [ -n "$api_out" ]; then
+            # 用 python3 解析（用户机器必有；DB 里没 sqlite3 CLI 时也走得通）
+            local paths
+            paths=$(echo "$api_out" | sudo -u "$target_user" python3 -c '
+import json, sys, re
+raw = sys.stdin.read()
+raw = re.sub(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]", "", raw)
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.exit(0)
+seen = set()
+for sub in d.get("data") or []:
+    for t in sub.get("targets") or []:
+        if t.get("kind") == "local":
+            p = t.get("local_path") or ""
+            if p and p not in seen:
+                seen.add(p); print(p)
+' 2>/dev/null || true)
+            discovered="$discovered $paths"
+        fi
+    fi
+
+    # 3) 项目外固定数据盘（兜底；本次 fix 是 /mnt/ssd/codespace/quant/data）
+    #    想加新路径就在这里 append 一行。
+    discovered="$discovered /mnt/ssd/codespace/quant/data"
+
+    # dedup + 去空
+    echo "$discovered" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '
+}
+
 install_systemd() {
     require_root
     command -v systemctl >/dev/null 2>&1 || { err "系统未安装 systemd"; exit 1; }
@@ -557,6 +620,11 @@ install_systemd() {
     user_path=$(detect_user_paths "$target_user")
     log "目标用户: $target_user"
     log "Service PATH: $user_path"
+
+    # 探测 share-sync / config 里需要写权限的目录，加进 ReadWritePaths
+    local extra_rw
+    extra_rw=$(discover_extra_rw_paths "$target_user")
+    [ -n "$extra_rw" ] && log "额外可写路径 (share-sync / download): $extra_rw"
 
     # 预检：用目标用户能否找到 cargo / node
     sudo -u "$target_user" env PATH="$user_path" bash -lic 'command -v cargo && command -v node && command -v npm' >/dev/null \
@@ -601,7 +669,18 @@ StandardOutput=append:$BACKEND_LOG
 StandardError=append:$BACKEND_LOG
 # 安全加固（v2.2.0 起启用）：限制服务可写区域，避免污染系统
 ProtectSystem=strict
-ReadWritePaths=$PROJECT_ROOT/downloads $PROJECT_ROOT/data $PROJECT_ROOT/logs $PROJECT_ROOT/.pids
+# backend 二进制在 run-backend 入口会 cd 到 BACKEND_DIR，CWD-相对的
+# logs、wal、config/baidu-pcs.db 实际写到 backend/ 子目录下，
+# 而不是项目根。ProtectSystem=strict 下必须显式授权 backend/{logs,wal,config}，
+# 否则启动失败：日志回退 + WAL/DB 全部 Read-only file system（fix 2026-09-14）。
+#
+# 另外 share-sync / autobackup 订阅的 local_path（项目外的同步目标，例如
+# /mnt/ssd/codespace/quant/data）也必须显式授权 —— 这些是 discover_extra_rw_paths()
+# 在 install 时从 backend API / config.app.toml 探测出来的。漏一个就会
+# 出现 "创建目录失败: Read-only file system (os error 30)"，整个同步 run 卡死
+# （fix 2026-09-14：当时 stk_factor/weekly 1012 项全部 downloading 但目录都建不了）。
+# 注：heredoc 内避免用反引号，bash 会当命令替换执行。
+ReadWritePaths=$PROJECT_ROOT/downloads $PROJECT_ROOT/data $PROJECT_ROOT/logs $PROJECT_ROOT/.pids $PROJECT_ROOT/backend/logs $PROJECT_ROOT/backend/wal $PROJECT_ROOT/backend/config $extra_rw
 # Home 目录：nvm/rustup/cargo 用户级安装需要可读访问（不可写即可）
 ProtectHome=read-only
 PrivateTmp=true
@@ -647,7 +726,12 @@ StandardOutput=append:$FRONTEND_LOG
 StandardError=append:$FRONTEND_LOG
 # 安全加固：前端是纯静态服务（vite preview），不需要写业务目录
 ProtectSystem=strict
-ReadWritePaths=$PROJECT_ROOT/.pids
+# 前端 systemd 入口 (run_frontend_foreground) 会调用 ensure_config()，
+# 把 $PROJECT_ROOT/config/app.toml 拷一份到 $BACKEND_DIR/config/，
+# 所以 frontend unit 也得授权 backend/config（fix 2026-09-14：启动报
+# "Read-only file system" 是因为 cp -f 触发了 backend/config 的写权限）。
+# .pids 是 vite 写 vite.local.config.ts 和 PID/PGID 文件的目录。
+ReadWritePaths=$PROJECT_ROOT/.pids $PROJECT_ROOT/backend/config
 # Home 目录：vite / npm 用户级安装需要访问 nvm nodejs
 ProtectHome=read-only
 PrivateTmp=true

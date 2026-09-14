@@ -10,6 +10,18 @@
 - 🐛 **下载·文件夹完成计数按 task_id 去重导致无限重下（重要）**：完成计数原本按 `task_id` 去重，而 task_id 是每次建任务新生成的 UUID。同一个文件只要被重新建成子任务（重启后对账失效、跳过分支没从队列摘掉、失败重入队等），就会再 +1 并把 `file_size` 再累加进 `completed_downloaded_size`。实测 1041 个文件数成 5337、18.4GB 数成 94.5GB，进度冲过 100% 后 `completed_count == total_files` 永远不成立，文件夹卡在 downloading 无限补任务，同一批文件反复重下（用户实测烧掉约 100GB 流量）。现去重键换成百度侧稳定的文件身份 `fs_id`，并随文件夹快照持久化（老快照缺该字段反序列化为空集合，不阻断升级）；失败计数同样按 `fs_id` 记账，同一文件「任务 A 判死 → 任务 B 下成」时能抵消幽灵失败，不再报「N 个文件下载失败」而文件其实都在盘上。顺带修了跳过分支只挑选不摘除导致 `skipped_count` 越算越大、终态判定从 `==` 改成 `>=` 防虚高卡死、以及「待办已空但子任务还在跑」时提前判终态把正在下的任务连锅端。重复建任务本身仍会烧一遍流量，补了可 grep 的观测日志便于追路径
 - 🐛 **下载·「部分数据」续传黏在坏链接上耗尽流量（重要）**：分片内断点续传把「本轮写下了部分字节」当成链接仍可用，不计重试、不换链接——正常断流后续传是对的。但百度 CDN 抽风时每次只吐几 KB 就断，分片会以 500ms 一轮永远黏在同一条坏链接上磨，`retries` 永远到不了上限。更糟的是续传安全校验在目标文件缺失/长度不足时会把 `bytes_downloaded` 重置为 0，裸减法在 release 下回绕成天文数字，一次**零字节失败**被误判成「下到了部分数据」，既不计重试也不换链接，还会从分片头重下已下过的区间。现用 `saturating_sub` 算净增；进度回退也必须写回 ChunkManager，避免下一轮从过大的旧偏移再次重置；同一条链接连续 10 轮（约 5 秒）净进展不足 256KB（分片尾巴按剩余量取小，避免马上下完的尾巴被误判）就强制换链接并计入重试
 
+### 本地 fork 增强（在 v2.2.3 之上的本地独有改动，未合并回上游）
+
+- ✨ **feat(netdisk): RecentWatcher 远端文件变动通知**：定期 poll 网盘根目录，对比 `fs_id` 集合推送 `system` WebSocket 事件；前端 `useRemoteFileChanges.ts` 接收事件刷新文件列表
+- ✨ **feat(cli): baidu-pan-cli headless CLI**：新增 `cli/` 子项目，17 个子命令（login/ls/upload/download/share/task…），跟 web 服务共享账号/任务/配置；--json / -q 双输出，退出码 0~5
+- 🔒 **fix(security): 全量漏洞修复（24 项 + 8 个依赖升级）**：CORS 白名单、pending_token 真实校验、auth/web_auth 文件 0o600、middleware bypass 收紧、reqwest 0.12 适配
+- 🚀 **perf(share-sync): rate-limit defaults 4→12 RPS / 8→24 burst**：实测在百度 errno=132 风控阈值（~30 RPS）以下安全；Docker 8/16 保守档通过 ENV 切换
+- 🐛 **fix(share-sync): 并发 snapshot 扫描 + skip-existing 部分命中修复**：串行 BFS 改有界并发波次（默认 8 路），1.4 万节点扫描 ~2h→~28min；skip-existing 部分命中展开为仅含缺失叶子的散文件索引
+- 🔧 **fix(deploy): systemd 单元端口与安全加固**：BACKEND_PORT 对齐 18888；`ProtectSystem=strict` + `ProtectHome=read-only` + `PrivateTmp=true` + `NoNewPrivileges=true` + StartLimit 防快速重启循环
+- 🔧 **fix(deploy): vite 运行时配置搬到 `.pids/` + `NODE_PATH` 修 systemd frontend 启动失败**
+- 🛠️ **chore(scripts): add `fix-ddns-go.sh`**：一次性修复 ddns-go systemd unit 二进制目录搬迁后的失效
+- 🛠️ **fix(scripts): local-deploy.sh 跟随 `backend/.cargo/config.toml` 的 target-dir 重定向**：用 `cargo metadata` 解析真实 target_directory
+
 ---
 
 ## v2.2.2

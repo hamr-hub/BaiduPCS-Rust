@@ -74,8 +74,9 @@ cleanup_orphaned_on_startup = false
 # 部署相关配置：systemd install-systemd 时会读取本节，注入到 baidupcs-backend.service 的
 # ReadWritePaths 白名单，让 share-sync / autobackup 订阅的 local_path 能写入。
 #
-# 默认 install-systemd 已经把 /mnt/ssd/codespace/ 整棵树加进去了（D 方案：约定同步
-# 目标都落在 /mnt/ssd/codespace/ 下）。如果你的同步目标在别的盘符（比如 /data/stock
+# 默认 install-systemd 已经把 /mnt/ssd/ 整棵树加进去了（D 方案：约定所有项目外
+# 数据盘都挂在 /mnt/ssd 下，codespace / quant / stock / sync-target 等任意子目录
+# 都能写）。如果你的同步目标在别的盘符（比如 /data/stock
 # 或 /home/user/sync-target），把绝对路径加到下面数组里（每行一项），重跑 install-systemd
 # 即可。**不需要改脚本**——改 git 追踪的 config 即可，diff 可见、可审计。
 #

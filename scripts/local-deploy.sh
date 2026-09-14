@@ -557,14 +557,16 @@ detect_user_paths() {
 #   1) config/app.toml [deploy].extra_rw_paths（用户/管理员手动维护，diff 可审计）
 #   2) config/app.toml [download].download_dir（如果有的话）
 #   3) backend API /api/v1/share-sync/subscriptions 拉已订阅的 local_path（运行中的订阅）
-#   4) 默认数据盘根 /mnt/ssd/codespace/（D 方案：约定所有项目外写路径都落在这里）
+#   4) 默认数据盘根 /mnt/ssd/（D 方案：约定所有项目外写路径都落在这里 —— 用户机器
+#      通常把数据盘挂到 /mnt/ssd 下,一次授权覆盖 codespace / quant / data / sync 等
+#      各种子目录,无须每加一个盘符就改脚本）
 discover_extra_rw_paths() {
     local target_user="$1"
     local cfg="$PROJECT_ROOT/config/app.toml"
     local discovered=""
 
     # 默认数据盘根（D 方案）
-    discovered="$discovered /mnt/ssd/codespace"
+    discovered="$discovered /mnt/ssd"
 
     if [ -f "$cfg" ]; then
         # 1) [deploy].extra_rw_paths —— TOML 数组，每个元素一行字符串

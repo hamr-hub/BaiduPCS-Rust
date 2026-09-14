@@ -1347,6 +1347,24 @@ impl<'a> ShareSyncExecutor<'a> {
         }
     }
 
+    /// 收走一次「已提交但被放弃」的转存任务（连带它派生的下载子任务）。
+    ///
+    /// `slot` 被 `take()` 清空，保证同一个 task_id 只收一次。`reason` 只进日志，
+    /// 用来在事后区分是重试、回退还是判终态触发的收尾。
+    ///
+    /// 为什么必须收：执行器对同一批内容重新提交前若不清理上一支，两支的下载子任务
+    /// 会同时挂在「进行中子任务」里 —— 旧的停在 paused、新的是 pending，用户看到
+    /// 的就是同一个文件两条重复项（issue #148）。
+    async fn discard_abandoned(&self, slot: &mut Option<String>, run_id: &str, reason: &str) {
+        if let Some(task_id) = slot.take() {
+            info!(
+                "share_sync_discard_abandoned: run_id={} task_id={} reason={}",
+                run_id, task_id, reason
+            );
+            self.hooks.discard_task(&task_id).await;
+        }
+    }
+
     /// 提交一组节点(可能是 1 个目录、N 个散文件、混合)的 transfer
     ///
     /// 这是阶段 4 二分递归的核心。

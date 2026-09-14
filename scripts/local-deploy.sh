@@ -290,6 +290,18 @@ ensure_config() {
         cp "$PROJECT_ROOT/config/app.toml.example" "$cfg"
     fi
     mkdir -p "$PROJECT_ROOT/downloads" "$PROJECT_ROOT/data"
+
+    # 🔥 同步 backend/config/app.toml —— backend 二进制用 CWD-相对路径读
+    # `config/app.toml`，而 systemd 入口 (run_backend_foreground) 在 exec 前
+    # `cd "$BACKEND_DIR"`，所以会读到 backend/config/app.toml 而不是项目根的。
+    # 不同步时如果 backend/config/ 下残留旧副本，就会出现"下载目录不存在"、
+    # "Read-only file system" 之类的错乱（fix 2026-09-14：当时 download_dir
+    # 还是 /mnt/ssd/BaiduDownload，被 ProtectSystem=strict 拦下）。
+    # .gitignore 已经忽略 /backend/config/，这里只是让两份副本保持一致，
+    # 单一真源仍是 $PROJECT_ROOT/config/app.toml。
+    if [ -d "$BACKEND_DIR/config" ]; then
+        cp -f "$cfg" "$BACKEND_DIR/config/app.toml"
+    fi
 }
 
 check_deps() {

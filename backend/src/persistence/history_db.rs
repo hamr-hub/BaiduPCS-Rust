@@ -1630,6 +1630,8 @@ let _ = conn.execute("ALTER TABLE folder_history ADD COLUMN backup_config_id TEX
             scan_completed: row.scan_completed != 0,
             scan_progress: row.scan_progress,
             pending_files,
+            // 历史库存的是已归档的终态文件夹，不会再走补任务/完成计数，故不建列
+            counted_fs_ids: std::collections::HashSet::new(),
             created_at: row.created_at,
             started_at: row.started_at,
             completed_at: row.completed_at,
@@ -2000,6 +2002,7 @@ mod tests {
             scan_completed: true,
             scan_progress: None,
             pending_files: Vec::new(),
+            counted_fs_ids: std::collections::HashSet::new(),
             created_at: 100,
             started_at: Some(100),
             completed_at: Some(200),

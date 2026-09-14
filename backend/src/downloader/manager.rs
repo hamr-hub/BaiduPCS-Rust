@@ -2,13 +2,15 @@ use crate::auth::UserAuth;
 use crate::autobackup::events::BackupTransferNotification;
 use crate::common::{ProxyConfig, RefreshCoordinator};
 use crate::downloader::{
-    calculate_task_max_chunks, ChunkScheduler, DownloadEngine, DownloadTask,
-    FolderDownloadManager, TaskScheduleInfo, TaskStatus, UrlHealthManager,
+    calculate_task_max_chunks, ChunkScheduler, DownloadEngine, DownloadTask, TaskScheduleInfo,
+    TaskStatus, FolderDownloadManager, UrlHealthManager,
 };
-use crate::persistence::{DownloadRecoveryInfo, PersistenceManager, TaskMetadata};
+use crate::task_slot_pool::{TaskSlotPool, TaskPriority};
+use crate::persistence::{
+    DownloadRecoveryInfo, PersistenceManager, TaskMetadata,
+};
 use crate::server::events::{DownloadEvent, ProgressThrottler, TaskEvent};
 use crate::server::websocket::WebSocketManager;
-use crate::task_slot_pool::{TaskPriority, TaskSlotPool};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -2176,7 +2178,7 @@ impl DownloadManager {
                     //    其他任务必须有全局空槽才能分配。
                     //    对于只能走全局槽位的任务，若 available_slots==0，放回队头并跳出：
                     //    避免对文件夹任务造成连锁阻塞。
-let mut available_slots = self.task_slot_pool.available_slots().await;
+                    let mut available_slots = self.task_slot_pool.available_slots().await;
                     let can_try_folder_fixed_slot =
                         needs_slot && is_folder_subtask && !is_backup;
 
@@ -2313,6 +2315,24 @@ let mut available_slots = self.task_slot_pool.available_slots().await;
                                 .task_slot_pool
                                 .allocate_fixed_slot_with_priority(&id, false, priority)
                                 .await;
+
+                            // 🔥 顶层任务（非文件夹子任务）拿不到固定位时，
+                            //    先回收一个「借了没用」的文件夹借调位再试一次。
+                            //
+                            //    这正是「新任务进来，借调方要还」这条规则的落点：顶层任务
+                            //    保底 1 个固定位的优先级高于任何文件夹的借调并行度。
+                            //
+                            //    文件夹子任务**不**走这里 —— 它们上面已经走过借调位路径，
+                            //    再去占不可归还的全局固定位会把后来的顶层任务挡在门外。
+                            if result.is_none()
+                                && !is_folder_subtask
+                                && self.try_reclaim_idle_borrowed_slot(&id).await
+                            {
+                                result = self
+                                    .task_slot_pool
+                                    .allocate_fixed_slot_with_priority(&id, false, priority)
+                                    .await;
+                            }
 
                             // 🔥 顶层任务（非文件夹子任务）拿不到固定位时，
                             //    先回收一个「借了没用」的文件夹借调位再试一次。
@@ -2600,6 +2620,9 @@ let mut available_slots = self.task_slot_pool.available_slots().await;
                                             }
                                         } else {
                                             // 分配失败，使用优先级方法放回队列
+                                            // 用 debug 而非 warn：等待队列监控每秒都会重试排队中的
+                                            // 任务，槽位满时这里必然每秒命中一次，warn 会把日志刷满、
+                                            // 把真正的告警淹掉（folder_manager 侧同类消息已是 debug）。
                                             debug!("后台监控：无法为任务 {} 分配槽位，放回等待队列", id);
                                             Self::add_to_queue_by_priority(
                                                 &waiting_queue,
@@ -2639,8 +2662,7 @@ let mut available_slots = self.task_slot_pool.available_slots().await;
                                     encryption_config_store_arc.clone(); // 🔥 用于根据 key_version 选择解密密钥
                                                                          // 🔥 auto_requeue 发送端和文件夹管理器引用
                                 let requeue_tx_cloned_monitor = requeue_tx_for_monitor.clone();
-                                let folder_manager_arc_clone =
-                                    folder_manager_arc_for_monitor.clone();
+                                let folder_manager_arc_clone = folder_manager_arc_for_monitor.clone();
                                 let app_config_arc_clone = app_config_arc.clone();
 
                                 tokio::spawn(async move {
@@ -3130,18 +3152,13 @@ let mut available_slots = self.task_slot_pool.available_slots().await;
                 let tasks_guard = tasks.read().await;
                 if let Some(task) = tasks_guard.get(&task_id) {
                     // 🔥 先在锁内读出后续要用到的字段，再尽快释放锁，避免发送通知时持锁过久
-                    let (group_id, total_size, is_backup, task_owner_uid_raw) = {
+                    let (group_id, fs_id, total_size, is_backup, task_owner_uid_raw) = {
                         let mut t = task.lock().await;
                         t.status = crate::downloader::TaskStatus::Failed;
                         t.error = Some(STALE_ERROR_MSG.to_string());
                         // 🔥 清除已释放的槽位ID，避免重试时误以为还持有槽位
                         t.slot_id = None;
-                        (
-                            t.group_id.clone(),
-                            t.total_size,
-                            t.is_backup,
-                            t.owner_uid.raw(),
-                        )
+                        (t.group_id.clone(), t.fs_id, t.total_size, t.is_backup, t.owner_uid.raw())
                     };
 
                     // 发送终态失败通知：备份任务走 BackupTransferNotification::Failed，
@@ -3202,7 +3219,7 @@ let mut available_slots = self.task_slot_pool.available_slots().await;
                     // 🔥 通知文件夹管理器子任务失败
                     if let Some(gid) = group_id {
                         chunk_scheduler
-                            .notify_subtask_failed(gid, task_id.clone(), total_size)
+                            .notify_subtask_failed(gid, task_id.clone(), fs_id, total_size)
                             .await;
                     }
                 }
@@ -3462,8 +3479,7 @@ let mut available_slots = self.task_slot_pool.available_slots().await;
                                 let waiting_queue_clone = waiting_queue.clone(); // 🔥 用于备份任务失败重试
                                                                                  // 🔥 auto_requeue 发送端和文件夹管理器引用
                                 let requeue_tx_cloned_trigger = requeue_tx_for_trigger.clone();
-                                let folder_manager_arc_clone_trig =
-                                    folder_manager_arc_for_trigger.clone();
+                                let folder_manager_arc_clone_trig = folder_manager_arc_for_trigger.clone();
                                 let app_config_arc_clone = app_config_arc.clone();
 
                                 tokio::spawn(async move {
@@ -3927,16 +3943,11 @@ let mut available_slots = self.task_slot_pool.available_slots().await;
                                                         t.uses_folder_fixed_slot = false;
                                                         // 🔥 通知文件夹管理器子任务失败
                                                         let group_id = t.group_id.clone();
+                                                        let fs_id = t.fs_id;
                                                         let total_size = t.total_size;
                                                         drop(t);
                                                         if let Some(gid) = group_id {
-                                                            chunk_scheduler_clone
-                                                                .notify_subtask_failed(
-                                                                    gid,
-                                                                    id_clone.clone(),
-                                                                    total_size,
-                                                                )
-                                                                .await;
+                                                            chunk_scheduler_clone.notify_subtask_failed(gid, id_clone.clone(), fs_id, total_size).await;
                                                         }
                                                     }
                                                     cancellation_tokens_clone
@@ -4018,16 +4029,11 @@ let mut available_slots = self.task_slot_pool.available_slots().await;
                                                 t.uses_folder_fixed_slot = false;
                                                 // 🔥 通知文件夹管理器子任务失败
                                                 let group_id = t.group_id.clone();
+                                                let fs_id = t.fs_id;
                                                 let total_size = t.total_size;
                                                 drop(t);
                                                 if let Some(gid) = group_id {
-                                                    chunk_scheduler_clone
-                                                        .notify_subtask_failed(
-                                                            gid,
-                                                            id_clone.clone(),
-                                                            total_size,
-                                                        )
-                                                        .await;
+                                                    chunk_scheduler_clone.notify_subtask_failed(gid, id_clone.clone(), fs_id, total_size).await;
                                                 }
                                             }
                                             cancellation_tokens_clone
@@ -7002,10 +7008,7 @@ let mut available_slots = self.task_slot_pool.available_slots().await;
     }
 
     /// 设置任务完成通知发送器（用于文件夹下载补充任务）
-    pub async fn set_task_completed_sender(
-        &self,
-        tx: tokio::sync::mpsc::UnboundedSender<(String, String, u64, bool)>,
-    ) {
+    pub async fn set_task_completed_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<(String, String, u64, u64, bool)>) {
         self.chunk_scheduler.set_task_completed_sender(tx).await;
     }
 

@@ -338,8 +338,8 @@ fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
 /// 生成待验证令牌（用于两步验证）
 fn generate_pending_token() -> String {
     use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let bytes: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
+    let mut rng = rand::rng();
+    let bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
     format!("pending_{}", hex::encode(bytes))
 }
 

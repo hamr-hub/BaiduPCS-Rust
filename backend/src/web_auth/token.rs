@@ -71,8 +71,8 @@ impl TokenService {
 
     /// 生成随机密钥
     fn generate_random_secret() -> String {
-        let mut rng = rand::thread_rng();
-        let bytes: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
         hex::encode(bytes)
     }
 
@@ -270,9 +270,9 @@ impl TokenService {
 
     /// 生成 Refresh Token
     fn generate_refresh_token(&self) -> String {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let random_bytes: Vec<u8> = (0..REFRESH_TOKEN_RANDOM_LENGTH)
-            .map(|_| rng.gen())
+            .map(|_| rng.random())
             .collect();
         format!("{}{}", REFRESH_TOKEN_PREFIX, hex::encode(random_bytes))
     }

@@ -69,7 +69,7 @@ fn backoff_delay(attempt: u32) -> Duration {
     let base_ms = (base_secs * 1000) as i64;
     let jitter_span = (base_ms as f64 * PCS_RETRY_JITTER_RATIO) as i64;
     let jitter = if jitter_span > 0 {
-        rand::thread_rng().gen_range(-jitter_span..=jitter_span)
+        rand::rng().random_range(-jitter_span..=jitter_span)
     } else {
         0
     };

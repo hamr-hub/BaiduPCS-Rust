@@ -4231,7 +4231,7 @@ impl NetdiskClient {
             .unwrap_or(DELETE_BATCH_JITTER_RATIO);
         let delta = (base as f64 * ratio) as i64;
         let offset = if delta > 0 {
-            rand::thread_rng().gen_range(-delta..=delta)
+            rand::rng().random_range(-delta..=delta)
         } else {
             0
         };
@@ -4250,7 +4250,7 @@ impl NetdiskClient {
         let scaled = base.saturating_mul(factor);
         let delta = (scaled / 4) as i64; // ±25% 抖动
         let offset = if delta > 0 {
-            rand::thread_rng().gen_range(-delta..=delta)
+            rand::rng().random_range(-delta..=delta)
         } else {
             0
         };
@@ -4439,8 +4439,8 @@ impl NetdiskClient {
                     6..=10 => (2000, 400),
                     _ => (5000, 1000),
                 };
-                let mut rng = rand::thread_rng();
-                let jitter = rng.gen_range(-(jitter_ms as i64)..=(jitter_ms as i64));
+                let mut rng = rand::rng();
+                let jitter = rng.random_range(-(jitter_ms as i64)..=(jitter_ms as i64));
                 ((base_ms as i64 + jitter).max(0)) as u64
             };
             if delay_ms > 0 {

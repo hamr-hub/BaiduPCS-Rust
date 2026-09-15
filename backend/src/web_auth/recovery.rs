@@ -21,7 +21,7 @@ impl RecoveryCodeManager {
     /// # Returns
     /// * 8 个 XXXX-XXXX 格式的恢复码
     pub fn generate_codes() -> Vec<String> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         (0..RECOVERY_CODE_COUNT)
             .map(|_| Self::generate_single_code(&mut rng))
             .collect()
@@ -32,11 +32,11 @@ impl RecoveryCodeManager {
         let chars: Vec<char> = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".chars().collect();
 
         let part1: String = (0..CODE_SEGMENT_LENGTH)
-            .map(|_| chars[rng.gen_range(0..chars.len())])
+            .map(|_| chars[rng.random_range(0..chars.len())])
             .collect();
 
         let part2: String = (0..CODE_SEGMENT_LENGTH)
-            .map(|_| chars[rng.gen_range(0..chars.len())])
+            .map(|_| chars[rng.random_range(0..chars.len())])
             .collect();
 
         format!("{}-{}", part1, part2)

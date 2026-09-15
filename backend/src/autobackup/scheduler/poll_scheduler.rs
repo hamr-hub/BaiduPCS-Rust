@@ -212,7 +212,7 @@ impl PollScheduler {
             // 计算下次触发时间
             let base_delay = Self::calculate_delay_to_scheduled_time(scheduled_time);
             // 加入 ±5 分钟的抖动
-            let jitter_secs = rand::thread_rng().gen_range(-300i64..=300i64);
+            let jitter_secs = rand::rng().random_range(-300i64..=300i64);
             let delay_secs = (base_delay.as_secs() as i64 + jitter_secs).max(1) as u64;
             let delay = Duration::from_secs(delay_secs);
 
@@ -280,10 +280,10 @@ impl PollScheduler {
     fn add_jitter(base: Duration, jitter_factor: f64) -> Duration {
         const MIN_INTERVAL_SECS: u64 = 10 * 60; // 最小 10 分钟，防止过于频繁
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let base_secs = base.as_secs_f64();
         let jitter_range = base_secs * jitter_factor;
-        let jitter = rng.gen_range(-jitter_range..=jitter_range);
+        let jitter = rng.random_range(-jitter_range..=jitter_range);
         let result_secs = (base_secs + jitter).max(MIN_INTERVAL_SECS as f64);
 
         Duration::from_secs_f64(result_secs)

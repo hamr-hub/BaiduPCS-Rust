@@ -747,6 +747,12 @@ impl<'a> SnapshotCollector<'a> {
             .any(|inc| is_path_ancestor_or_self(dir, inc))
     }
 
+    /// include_paths 精确选文件场景下，判断某个目录是否还需继续翻页。
+    ///
+    /// 当前并发 BFS 重构后**未挂回**这个短路优化（参考 `step 2` 注释），
+    /// 保留此方法与文档语义以备后续想恢复时直接复用。挂回时只需把 `BFS` 主循环
+    /// 改回串行、并把短路条件接到 `current_dir` 入队前的 `while` 分页判断。
+    #[allow(dead_code)]
     fn dir_needs_more_pages(&self, dir: &str, found_included_files: &BTreeSet<String>) -> bool {
         if self.include_paths.is_empty() {
             return true;

@@ -357,8 +357,8 @@ mod tests {
         assert!(!flag.load(Ordering::SeqCst));
         flag.store(true, Ordering::SeqCst);
         assert!(flag.load(Ordering::SeqCst));
-        // swap 语义：false → true 返回旧值 false
-        assert!(!flag.swap(false, Ordering::SeqCst));
+        // swap 语义：flag 当前为 true，swap(false) 把 flag 置 false 并返回旧值 true
+        assert!(flag.swap(false, Ordering::SeqCst));
         assert!(!flag.load(Ordering::SeqCst));
     }
 }

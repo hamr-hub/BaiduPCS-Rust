@@ -17,10 +17,10 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-/// 槽位过期警告阈值（2分钟未更新）
-pub const STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(120);
-/// 槽位过期释放阈值（5分钟未更新）
-pub const STALE_RELEASE_THRESHOLD: Duration = Duration::from_secs(300);
+/// 槽位过期警告阈值（20分钟未更新，未达到释放阈值但已偏久）
+pub const STALE_WARNING_THRESHOLD: Duration = Duration::from_secs(20 * 60);
+/// 槽位过期释放阈值（30分钟未更新）
+pub const STALE_RELEASE_THRESHOLD: Duration = Duration::from_secs(30 * 60);
 /// 清理任务执行间隔（30秒）
 pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -730,8 +730,8 @@ impl TaskSlotPool {
 
     /// 清理过期槽位
     ///
-    /// 检测超过 5 分钟未更新的槽位，自动释放并记录日志。
-    /// 超过 2 分钟但未达到 5 分钟的槽位会记录警告。
+    /// 检测超过 [`STALE_RELEASE_THRESHOLD`] 未更新的槽位，自动释放并记录日志。
+    /// 超过 [`STALE_WARNING_THRESHOLD`] 但未达到释放阈值的槽位会记录警告。
     ///
     /// # Returns
     /// 被释放的任务ID列表
@@ -752,7 +752,7 @@ impl TaskSlotPool {
                 let elapsed = now.duration_since(last_updated);
 
                 if elapsed >= STALE_RELEASE_THRESHOLD {
-                    // 超过5分钟，自动释放
+                    // 超过 STALE_RELEASE_THRESHOLD，自动释放
                     let task_id = slot.task_id.clone().unwrap_or_default();
                     let allocated_at = slot.allocated_at;
 
@@ -767,7 +767,7 @@ impl TaskSlotPool {
                     released_tasks.push(task_id);
                     slot.release();
                 } else if elapsed >= STALE_WARNING_THRESHOLD {
-                    // 超过2分钟，记录警告
+                    // 超过 STALE_WARNING_THRESHOLD 但未达到释放阈值，记录警告
                     let task_id = slot.task_id.as_deref().unwrap_or("unknown");
                     warned_tasks.push((slot.id, task_id.to_string(), elapsed));
                 }

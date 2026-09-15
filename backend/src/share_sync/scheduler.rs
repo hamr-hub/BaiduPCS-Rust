@@ -143,12 +143,12 @@ impl Drop for SubscriptionScheduler {
 /// 避免间隔逼近下限时抖动把实际间隔压到下限以下、增大风控压力。
 fn jitter(base_secs: u32, ratio: f64) -> u32 {
     use rand::Rng;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let delta = (base_secs as f64 * ratio) as i64;
     if delta <= 0 {
         return base_secs.max(MIN_POLL_INTERVAL_SECS);
     }
-    let offset = rng.gen_range(-delta..=delta);
+    let offset = rng.random_range(-delta..=delta);
     ((base_secs as i64 + offset).max(MIN_POLL_INTERVAL_SECS as i64) as u32).max(1)
 }
 

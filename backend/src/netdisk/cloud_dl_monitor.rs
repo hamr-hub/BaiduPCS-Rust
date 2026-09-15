@@ -1183,8 +1183,8 @@ impl CloudDlMonitor {
     ///
     /// 避免请求模式固定，降低风控风险
     fn add_jitter(&self, interval: Duration) -> Duration {
-        let mut rng = rand::thread_rng();
-        let jitter = 1.0 + rng.gen_range(-self.config.jitter_percent..self.config.jitter_percent);
+        let mut rng = rand::rng();
+        let jitter = 1.0 + rng.random_range(-self.config.jitter_percent..self.config.jitter_percent);
         Duration::from_secs_f64(interval.as_secs_f64() * jitter as f64)
     }
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::cloud_sync::{
     CloudSyncError, CloudSyncManager, Connection, CreateConnectionRequest, CreateJobRequest,
-    JobSummary, ListObjectsResult, TestConnectionResult, TransferJob, UpdateConnectionRequest,
+    JobSummary, ListObjectsResult, TestConnectionResult, TransferJob,
 };
 use crate::server::error::ApiError;
 use crate::server::state::AppState;

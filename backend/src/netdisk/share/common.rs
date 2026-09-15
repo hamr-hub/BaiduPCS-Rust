@@ -119,8 +119,8 @@ pub fn poll_delay_ms(attempt: u32) -> u64 {
         _ => (5000, 1000),
     };
 
-    let mut rng = rand::thread_rng();
-    let jitter = rng.gen_range(-jitter_ms..=jitter_ms);
+    let mut rng = rand::rng();
+    let jitter = rng.random_range(-jitter_ms..=jitter_ms);
     (base_ms + jitter).max(0) as u64
 }
 

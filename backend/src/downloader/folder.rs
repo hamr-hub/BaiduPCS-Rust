@@ -298,6 +298,42 @@ impl FolderDownload {
     }
 
     /// 标记为下载中
+    /// 登记「这个文件已经下完了」，并维持不变量：**已下完的文件不留在 pending_files 里**
+    ///
+    /// 这两件事必须绑在一起做，否则就是 issue #156 那条尾巴的形状：
+    /// `counted_fs_ids` 把重复**计数**挡住了，但文件还赖在 `pending_files` 里，
+    /// 补任务路径下一轮照样挑中它 → 全新 task_id、全新 WAL、整文件重下一遍。
+    /// 实测 182 文件 / 15.4GiB 的文件夹因此建了 891 个子任务、白烧 33.5GiB。
+    ///
+    /// 调用点收敛在「子任务成功完成」这一处（`FolderDownloadManager` 的完成监听器），
+    /// 因为不论子任务是从哪条启动路径起来的，成功后都必经那里——不必枚举启动路径。
+    ///
+    /// `fs_id == 0` 是异常数据，计数侧按 task_id 回退去重，这里同样不做任何处理：
+    /// 真按 0 去剪会一次剪掉所有异常文件，让文件夹永远收不了工。
+    pub fn mark_fs_id_completed(&mut self, fs_id: u64) {
+        if fs_id == 0 {
+            return;
+        }
+        self.counted_fs_ids.insert(fs_id);
+        self.pending_files.retain(|f| f.fs_id != fs_id);
+    }
+
+    /// 把「已下完但还赖在 pending 里」的文件一次性剪掉，用于恢复时自愈脏快照
+    ///
+    /// issue #156 修复之前写下的快照，pending_files 里带着已经下完的文件；重启恢复后
+    /// 补任务路径会照样挑中它们重下一遍。已完成的子任务重启后不在内存任务表里
+    /// （scheduler 完成时就把它移出了），按"活着的任务"去重兜不住这种情况，
+    /// 只有持久化的 `counted_fs_ids` 才是权威答案。
+    ///
+    /// 返回剪掉的条数，便于恢复日志说明自愈了多少。
+    pub fn prune_completed_from_pending(&mut self) -> usize {
+        let before = self.pending_files.len();
+        let counted = &self.counted_fs_ids;
+        self.pending_files
+            .retain(|f| f.fs_id == 0 || !counted.contains(&f.fs_id));
+        before - self.pending_files.len()
+    }
+
     pub fn mark_downloading(&mut self) {
         self.status = FolderStatus::Downloading;
         if self.started_at.is_none() {
@@ -381,6 +417,102 @@ impl FolderDownload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending(fs_id: u64, name: &str) -> PendingFile {
+        PendingFile {
+            fs_id,
+            filename: name.to_string(),
+            remote_path: format!("/remote/{}", name),
+            relative_path: name.to_string(),
+            size: 1024,
+        }
+    }
+
+    /// 🔥 issue #156 续（2026-09-18 日志复现）：文件下完后必须同时退出 pending 队列。
+    ///
+    /// 只 insert counted_fs_ids 而不剪 pending_files 时，补任务路径下一轮还会挑中它，
+    /// 重新建一个子任务把整个文件再下一遍 —— 实测 182 文件的文件夹建了 891 个子任务。
+    #[test]
+    fn test_completed_file_leaves_pending_queue() {
+        let mut folder = FolderDownload::new("/test".to_string(), PathBuf::from("./test"));
+        folder.pending_files = vec![pending(101, "a.mp4"), pending(102, "b.mp4")];
+
+        folder.mark_fs_id_completed(101);
+
+        assert!(
+            folder.counted_fs_ids.contains(&101),
+            "完成的文件必须登记进 counted_fs_ids"
+        );
+        assert!(
+            !folder.pending_files.iter().any(|f| f.fs_id == 101),
+            "完成的文件必须从 pending_files 剪掉，否则补任务路径会重复建任务、整文件重下"
+        );
+        assert!(
+            folder.pending_files.iter().any(|f| f.fs_id == 102),
+            "未完成的文件不能被误删"
+        );
+    }
+
+    /// 重复完成（同一文件被两条路径各下了一遍）时也要自愈：
+    /// 把残留在 pending 里的那份剪掉，否则循环会一直转下去。
+    #[test]
+    fn test_duplicate_completion_still_prunes_pending() {
+        let mut folder = FolderDownload::new("/test".to_string(), PathBuf::from("./test"));
+        folder.counted_fs_ids.insert(101);
+        folder.pending_files = vec![pending(101, "a.mp4")];
+
+        folder.mark_fs_id_completed(101);
+
+        assert!(
+            folder.pending_files.is_empty(),
+            "已完成过的文件再次完成时，仍必须把 pending 里的残留剪掉（脏快照自愈）"
+        );
+    }
+
+    /// fs_id == 0 是异常数据，计数侧按 task_id 回退去重。
+    /// 若这里按 0 去剪，会一次剪掉所有异常文件，文件夹永远凑不满 total_files。
+    #[test]
+    fn test_zero_fs_id_is_not_pruned() {
+        let mut folder = FolderDownload::new("/test".to_string(), PathBuf::from("./test"));
+        folder.pending_files = vec![pending(0, "x.bin"), pending(0, "y.bin")];
+
+        folder.mark_fs_id_completed(0);
+
+        assert_eq!(
+            folder.pending_files.len(),
+            2,
+            "fs_id==0 不能参与按 fs_id 的剪枝"
+        );
+        assert!(
+            !folder.counted_fs_ids.contains(&0),
+            "fs_id==0 不应进入 counted_fs_ids"
+        );
+    }
+
+    /// 恢复脏快照时自愈：pending 里残留的已完成文件必须被剪掉，
+    /// 否则重启后会把它们原样重下一遍（issue #156 续）。
+    #[test]
+    fn test_prune_completed_from_pending_heals_dirty_snapshot() {
+        let mut folder = FolderDownload::new("/test".to_string(), PathBuf::from("./test"));
+        folder.counted_fs_ids.insert(101);
+        folder.counted_fs_ids.insert(103);
+        folder.pending_files = vec![
+            pending(101, "done.mp4"),
+            pending(102, "todo.mp4"),
+            pending(0, "weird.bin"),
+            pending(103, "done2.mp4"),
+        ];
+
+        let pruned = folder.prune_completed_from_pending();
+
+        assert_eq!(pruned, 2, "应剪掉两个已完成的文件");
+        let left: Vec<u64> = folder.pending_files.iter().map(|f| f.fs_id).collect();
+        assert_eq!(
+            left,
+            vec![102, 0],
+            "只应留下未完成的文件；fs_id==0 必须放行（计数侧按 task_id 回退）"
+        );
+    }
 
     #[test]
     fn test_folder_download_creation() {

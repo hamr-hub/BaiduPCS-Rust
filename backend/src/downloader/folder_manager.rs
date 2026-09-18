@@ -906,6 +906,16 @@ impl FolderDownloadManager {
                     .pending_files
                     .retain(|f| !existing_fs_ids.contains(&f.fs_id));
 
+                // 🔥 issue #156 续：已下完的文件也必须剔除，否则 #156 之前写脏的快照
+                //    恢复后会把它们原样重下一遍（说明见 prune_completed_from_pending）。
+                let pruned = folder.prune_completed_from_pending();
+                if pruned > 0 {
+                    warn!(
+                        "文件夹 {} 恢复时剪掉 {} 个已下完却仍留在 pending 队列的文件（脏快照自愈）",
+                        folder_id, pruned
+                    );
+                }
+
                 // 🔥 只挑选文件，**不从 pending_files 摘除**
                 //
                 // 子任务在真正启动之前是不落盘的（`add_task` / `add_task_paused` 都只往
@@ -1480,6 +1490,10 @@ impl FolderDownloadManager {
                                 // 仍要登记 task_id：否则这个已完成任务会被 active_sum 再算一遍
                                 folder.counted_task_ids.insert(task_id.clone());
                                 folder.subtask_retry_counts.remove(&task_id);
+                                // 🔥 自愈：能走到这个分支，说明该文件还赖在 pending_files 里
+                                //    （否则补任务路径不会再挑中它）。就地剪掉把循环斩断——
+                                //    也让 #156 之前写脏的旧快照在重启后恢复正常。
+                                folder.mark_fs_id_completed(fs_id);
                                 // 🔥 失败对账不能漏：同一个文件的上一个任务可能已经耗尽重试
                                 //    额度被计进 failed_count，之后这个任务把它下成了。若不在这里
                                 //    抵消，文件明明都在盘上，文件夹却会以"N 个文件下载失败"收场。
@@ -1489,9 +1503,20 @@ impl FolderDownloadManager {
                             } else if is_success {
                                 // 🔥 成功且未计数：递增 completed_count
                                 folder.counted_task_ids.insert(task_id.clone());
-                                if fs_id != 0 {
-                                    folder.counted_fs_ids.insert(fs_id);
-                                }
+                                // 🔥 issue #156 续：登记完成 + 把文件剪出 pending_files，
+                                //    两件事绑在 mark_fs_id_completed 里一起做（说明见该方法）。
+                                //
+                                //    起因：drop_pending_file_after_persist 全项目只有
+                                //    start_task_internal 一个调用点，而 start_waiting_queue_monitor /
+                                //    setup_waiting_queue_trigger 各自内联复制了一份启动逻辑、都没带上它。
+                                //    经这两条路径起来的子任务下完后，文件永远留在 pending_files，
+                                //    补任务循环下一轮又挑中它 → 全新 task_id、全新 WAL、整文件重下，
+                                //    直到某次凑巧走了常规路径才断开。
+                                //
+                                //    收在这里的理由：每个下载成功的子任务都必经本分支（scheduler 的
+                                //    task_completed 通道驱动），与它从哪条路径启动无关 —— 不必枚举
+                                //    启动路径，将来新增第 N 条也不会复发。
+                                folder.mark_fs_id_completed(fs_id);
                                 folder.subtask_retry_counts.remove(&task_id);
                                 folder.completed_count += 1;
                                 folder.completed_downloaded_size += file_size;
@@ -1847,24 +1872,33 @@ impl FolderDownloadManager {
                     // 保证不会重复建任务。
                     let existing_fs_ids: std::collections::HashSet<u64> =
                         tasks.iter().map(|t| t.fs_id).collect();
+                    // 🔥 issue #156 续：已下完的文件直接**挡掉**，不再只是打日志。
+                    //
+                    //    existing_fs_ids 只认"内存里还活着的任务"，而子任务一完成就被
+                    //    scheduler 移出内存任务表，它兜不住已完成的文件；真正管这件事的是
+                    //    「已下完的文件不在 pending 里」这个不变量，已在成功完成处收口。
+                    //    这里再按持久化的 counted_fs_ids 拦一道：万一将来又有哪条路径把
+                    //    已完成的文件塞回 pending，最坏结果是本轮少补一个任务（下一轮自愈），
+                    //    而不是整文件重下一遍。fs_id==0 是异常数据，计数侧按 task_id 回退，
+                    //    这里也必须放行，否则这类文件夹永远收不了工。
                     let files: Vec<_> = folder
                         .pending_files
                         .iter()
                         .filter(|f| !existing_fs_ids.contains(&f.fs_id))
+                        .filter(|f| {
+                            let already_done =
+                                f.fs_id != 0 && folder.counted_fs_ids.contains(&f.fs_id);
+                            if already_done {
+                                warn!(
+                                    "文件夹 {} 把已完成过的文件重新排进了补任务队列 (fs_id={}, path={})，已拦截",
+                                    group_id, f.fs_id, f.relative_path
+                                );
+                            }
+                            !already_done
+                        })
                         .take(available)
                         .cloned()
                         .collect();
-                    // 🔥 观测点（issue #156）：已经下完过的文件又被排进补任务队列
-                    //    说明有路径把它重新塞回了 pending_files。计数那边已按 fs_id 去重，
-                    //    但重复下载本身仍然烧流量，这条日志用来定位是哪条路径干的。
-                    for f in &files {
-                        if folder.counted_fs_ids.contains(&f.fs_id) {
-                            warn!(
-                                "文件夹 {} 把已完成过的文件重新排进了补任务队列 (fs_id={}, path={})，将会重复下载",
-                                group_id, f.fs_id, f.relative_path
-                            );
-                        }
-                    }
                     (files, folder.local_root.clone(), folder.remote_root.clone(), folder.owner_uid)
                 };
 
@@ -4127,22 +4161,25 @@ impl FolderDownloadManager {
             // 保证不会重复建任务。
             let existing_fs_ids: std::collections::HashSet<u64> =
                 tasks.iter().map(|t| t.fs_id).collect();
+            // 🔥 已下完的文件直接挡掉（issue #156 续），理由见另一条补任务路径的同名过滤
             let files: Vec<_> = folder
                 .pending_files
                 .iter()
                 .filter(|f| !existing_fs_ids.contains(&f.fs_id))
+                .filter(|f| {
+                    let already_done =
+                        f.fs_id != 0 && folder.counted_fs_ids.contains(&f.fs_id);
+                    if already_done {
+                        warn!(
+                            "文件夹 {} 把已完成过的文件重新排进了补任务队列 (fs_id={}, path={})，已拦截",
+                            folder_id, f.fs_id, f.relative_path
+                        );
+                    }
+                    !already_done
+                })
                 .take(needed)
                 .cloned()
                 .collect();
-            // 🔥 观测点（issue #156），说明见另一条补任务路径的同名循环
-            for f in &files {
-                if folder.counted_fs_ids.contains(&f.fs_id) {
-                    warn!(
-                        "文件夹 {} 把已完成过的文件重新排进了补任务队列 (fs_id={}, path={})，将会重复下载",
-                        folder_id, f.fs_id, f.relative_path
-                    );
-                }
-            }
             if files.is_empty() {
                 return Ok(RefillBatch::default());
             }

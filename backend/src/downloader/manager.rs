@@ -2793,6 +2793,20 @@ impl DownloadManager {
                                                         "后台监控：注册任务到持久化管理器失败: {}",
                                                         e
                                                     );
+                                                } else {
+                                                    // 🔥 任务已落盘 → 把对应文件从 pending_files 摘掉，
+                                                    //    与 start_task_internal 保持一致。
+                                                    //
+                                                    //    本函数内联复制了一份启动逻辑，历史上漏了这一步：
+                                                    //    经本路径起来的子任务下完后文件仍赖在 pending_files，
+                                                    //    补任务循环会反复重建任务、整文件重下（issue #156 续）。
+                                                    //    真正的兜底在 folder_manager 的成功完成分支，这里补齐
+                                                    //    只是让"建了任务还没下完"的窗口期也保持不变量。
+                                                    if let Some(ref gid) = group_id {
+                                                        if let Some(ref fm) = folder_manager_for_task {
+                                                            fm.drop_pending_file_after_persist(gid, fs_id).await;
+                                                        }
+                                                    }
                                                 }
 
                                                 // 🔥 修复：从持久化管理器获取已完成的分片，并标记到 ChunkManager（实现真正的断点续传）
@@ -3558,6 +3572,20 @@ impl DownloadManager {
                                                         "0延迟启动：注册任务到持久化管理器失败: {}",
                                                         e
                                                     );
+                                                } else {
+                                                    // 🔥 任务已落盘 → 把对应文件从 pending_files 摘掉，
+                                                    //    与 start_task_internal 保持一致。
+                                                    //
+                                                    //    本函数内联复制了一份启动逻辑，历史上漏了这一步：
+                                                    //    经本路径起来的子任务下完后文件仍赖在 pending_files，
+                                                    //    补任务循环会反复重建任务、整文件重下（issue #156 续）。
+                                                    //    真正的兜底在 folder_manager 的成功完成分支，这里补齐
+                                                    //    只是让"建了任务还没下完"的窗口期也保持不变量。
+                                                    if let Some(ref gid) = group_id {
+                                                        if let Some(ref fm) = folder_manager_for_task {
+                                                            fm.drop_pending_file_after_persist(gid, fs_id).await;
+                                                        }
+                                                    }
                                                 }
 
                                                 // 🔥 修复：从持久化管理器获取已完成的分片，并标记到 ChunkManager（实现真正的断点续传）

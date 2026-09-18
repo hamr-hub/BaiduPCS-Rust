@@ -41,10 +41,13 @@ pub const MAX_AUTO_REQUEUE: u32 = 5;
 
 /// 🔥 启动阶段（prepare / register）失败重试上限
 ///
-/// 三条启动链路统一使用：
-/// - `start_task_internal` 主流程（handle_task_failure）
-/// - `start_waiting_queue_monitor` 后台监控（handle_task_failure）
-/// - 0 延迟触发器（内联失败处理）
+/// 三条启动链路统一使用，且都走同一个收尾函数 `handle_task_failure`：
+/// - `start_task_internal` 主流程
+/// - `start_waiting_queue_monitor` 后台监控
+/// - `setup_waiting_queue_trigger` 0 延迟触发器
+///
+/// 0 延迟触发器过去内联了一份自己的失败处理，已和公共实现漂移（重排丢优先级、
+/// 终态不发失败事件、不落 update_task_error），现已收敛。
 ///
 /// 文件夹子任务或备份任务在启动阶段累计失败 `MAX_START_RETRIES` 次后，不再无限重入等待队列，
 /// 改为标记为 `Failed` 以避免死循环 / 队列堵塞。普通单文件任务从第 1 次失败即标记 Failed。
@@ -93,6 +96,32 @@ pub enum DownloadAggregateOutcome {
     ArchivedFailed,
     /// 内存与历史库均查不到（真正取消/丢失）。
     NotFound,
+}
+
+/// `spawn_started_task` 需要的全部依赖，从 `DownloadManager` 一次性克隆出来
+///
+/// 等待队列的两条启动链路（后台监控轮询 / 0 延迟触发器）都在 `tokio::spawn` 里跑，
+/// 拿不到 `&self`，历史上因此各自把十几个 Arc 一个个 clone 进闭包、再把启动逻辑
+/// 整段复制一遍。把这些句柄打包成一个可 Clone 的结构体，两条链路就能共用同一份实现。
+#[derive(Clone)]
+struct TaskStartDeps {
+    tasks: Arc<RwLock<HashMap<String, Arc<Mutex<DownloadTask>>>>>,
+    cancellation_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    waiting_queue: Arc<RwLock<VecDeque<String>>>,
+    engine: Arc<DownloadEngine>,
+    chunk_scheduler: ChunkScheduler,
+    persistence_manager: Option<Arc<Mutex<PersistenceManager>>>,
+    ws_manager: Arc<RwLock<Option<Arc<WebSocketManager>>>>,
+    folder_progress_tx: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    backup_notification_tx:
+        Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<BackupTransferNotification>>>>,
+    task_slot_pool: Arc<TaskSlotPool>,
+    folder_manager: Arc<RwLock<Option<Arc<FolderDownloadManager>>>>,
+    app_config: Arc<RwLock<Option<Arc<RwLock<crate::config::AppConfig>>>>>,
+    snapshot_manager: Arc<RwLock<Option<Arc<crate::encryption::snapshot::SnapshotManager>>>>,
+    encryption_config_store: Arc<RwLock<Option<Arc<crate::encryption::EncryptionConfigStore>>>>,
+    requeue_tx: mpsc::UnboundedSender<AutoRequeueRequest>,
+    max_retries: u32,
 }
 
 /// 下载管理器
@@ -1001,6 +1030,8 @@ impl DownloadManager {
         // 🔥 备份任务终态失败需要走 BackupTransferNotification::Failed，
         //    避免和 publish_event() 的"备份任务跳过普通下载事件"约定冲突。
         backup_notification_tx: Option<tokio::sync::mpsc::UnboundedSender<BackupTransferNotification>>,
+        // 🔥 文件夹子任务终态失败必须回告 FolderDownloadManager（见函数尾部说明）
+        chunk_scheduler: ChunkScheduler,
     ) {
         // 🔥 一次性读取需要的字段，避免持锁过久
         let (group_id, is_backup, slot_id, is_borrowed_slot, uses_folder_fixed_slot, start_retry_count) = {
@@ -1128,6 +1159,29 @@ impl DownloadManager {
             if let Err(e) = pm.lock().await.update_task_error(&task_id, error_msg) {
                 warn!("更新下载任务错误信息失败: {}", e);
             }
+        }
+
+        // 🔥 文件夹子任务终态失败必须回告 FolderDownloadManager
+        //
+        //    子任务在**启动阶段**（prepare / register）就失败时，调度器从来没接手过它，
+        //    也就永远不会在 task_completed 通道上发它的终态；notify_subtask_failed 是
+        //    唯一的回告途径（它发的正是同一条通道，success=false）。
+        //
+        //    漏掉这一步的后果和 MAX_AUTO_REQUEUE 文档里描述的一模一样：子任务停在
+        //    Failed，而文件夹的 completed + skipped + failed 永远凑不满 total_files，
+        //    整个文件夹卡在 downloading 收不了工。
+        //
+        //    历史上只有 0 延迟触发器那份内联失败处理做了回告，本函数（start_task_internal /
+        //    后台监控 / auto_requeue 终态三条路径共用）一直漏着——调用点注释甚至已经写了
+        //    "并通过 notify_subtask_failed 通知文件夹管理器"，实现却没跟上。
+        if let Some(ref gid) = group_id {
+            let (fs_id, total_size) = {
+                let t = task.lock().await;
+                (t.fs_id, t.total_size)
+            };
+            chunk_scheduler
+                .notify_subtask_failed(gid.clone(), task_id.clone(), fs_id, total_size)
+                .await;
         }
 
         // 移除取消令牌
@@ -1277,6 +1331,7 @@ impl DownloadManager {
                     Arc::clone(&self.task_slot_pool),
                     Arc::clone(&self.folder_manager),
                     self.backup_notification_tx.read().await.clone(),
+                    self.chunk_scheduler.clone(),
                 )
                     .await;
                 return Ok(());
@@ -1575,6 +1630,491 @@ impl DownloadManager {
     ///
     /// 该方法会检查任务是否有槽位，有槽位才启动探测
     /// 任务探测完成后直接注册到调度器，不再需要预注册机制
+    /// 打包 `spawn_started_task` 所需依赖（见 [`TaskStartDeps`]）
+    fn task_start_deps(&self) -> TaskStartDeps {
+        TaskStartDeps {
+            tasks: self.tasks.clone(),
+            cancellation_tokens: self.cancellation_tokens.clone(),
+            waiting_queue: self.waiting_queue.clone(),
+            engine: self.engine.clone(),
+            chunk_scheduler: self.chunk_scheduler.clone(),
+            persistence_manager: self.persistence_manager.clone(),
+            ws_manager: self.ws_manager.clone(),
+            folder_progress_tx: self.folder_progress_tx.clone(),
+            backup_notification_tx: self.backup_notification_tx.clone(),
+            task_slot_pool: self.task_slot_pool.clone(),
+            folder_manager: self.folder_manager.clone(),
+            app_config: self.app_config.clone(),
+            snapshot_manager: self.snapshot_manager.clone(),
+            encryption_config_store: self.encryption_config_store.clone(),
+            requeue_tx: self.requeue_tx.clone(),
+            max_retries: self.max_retries,
+        }
+    }
+
+    /// 启动一个**已经拿到槽位**的任务：prepare -> register -> 交给调度器跑。
+    ///
+    /// 三条启动链路里，`start_waiting_queue_monitor`（后台监控保底轮询）和
+    /// `setup_waiting_queue_trigger`（0 延迟触发器）曾各自内联复制了一份完全相同的
+    /// 实现，只有日志前缀不同。复制带来的代价是实打实的：
+    ///
+    /// - `drop_pending_file_after_persist` 当初只加进了 `start_task_internal` 一份，
+    ///   另外两份漏掉 -> 文件夹已下完的文件永远留在 pending 队列，被反复重建子任务、
+    ///   整文件重下（issue #156 续，实测单个文件夹白烧 33.5GiB）。
+    /// - `handle_task_failure` 抽取后只替换了后台监控那份，0 延迟那份继续内联，
+    ///   于是重排丢优先级、终态不发失败事件、也不落 update_task_error。
+    ///
+    /// 现在两条链路共用本函数，差异只剩两个日志标签，不会再出现「修了一份漏两份」。
+    /// `start_task_internal` 仍是独立实现（它是 `&self` 方法，调用语境不同）。
+    ///
+    /// `path_label` 用于路径级日志（如「后台监控：注册任务失败」），
+    /// `task_label` 用于任务级日志（如「后台任务 {id} 文件大小 ...」）。
+    fn spawn_started_task(
+        deps: TaskStartDeps,
+        id: String,
+        task: Arc<Mutex<DownloadTask>>,
+        // 调用方已把它登记进 cancellation_tokens，这里只负责传给引擎和调度器
+        cancellation_token: CancellationToken,
+        path_label: &'static str,
+        task_label: &'static str,
+    ) {
+        // 保持与原内联实现一致的局部名，便于对照历史改动
+        let engine_clone = deps.engine.clone();
+        let task_clone = task;
+        let chunk_scheduler_clone = deps.chunk_scheduler.clone();
+        // 🔥 失败路径要用它回告文件夹管理器（见 handle_task_failure 尾部说明）
+        let chunk_scheduler_for_failure = deps.chunk_scheduler.clone();
+        let id_clone = id;
+        let cancellation_tokens_clone = deps.cancellation_tokens.clone();
+        let persistence_manager_clone = deps.persistence_manager.clone();
+        let ws_manager_arc_clone = deps.ws_manager.clone();
+        let folder_progress_tx_arc_clone = deps.folder_progress_tx.clone();
+        let backup_notification_tx_arc_clone = deps.backup_notification_tx.clone();
+        let waiting_queue_clone = deps.waiting_queue.clone();
+        let task_slot_pool_clone = deps.task_slot_pool.clone();
+        let tasks_clone = deps.tasks.clone();
+        let snapshot_manager_arc_clone = deps.snapshot_manager.clone();
+        let encryption_config_store_arc_clone = deps.encryption_config_store.clone();
+        let requeue_tx_cloned = deps.requeue_tx.clone();
+        let folder_manager_arc_clone = deps.folder_manager.clone();
+        let app_config_arc_clone = deps.app_config.clone();
+        let max_retries = deps.max_retries;
+
+        tokio::spawn(async move {
+            // 获取 WebSocket 管理器和文件夹进度发送器
+            let ws_manager = ws_manager_arc_clone.read().await.clone();
+            let folder_progress_tx =
+                folder_progress_tx_arc_clone.read().await.clone();
+            let backup_notification_tx =
+                backup_notification_tx_arc_clone.read().await.clone();
+            let snapshot_manager = snapshot_manager_arc_clone.read().await.clone(); // 🔥 获取快照管理器
+            let encryption_config_store = encryption_config_store_arc_clone.read().await.clone(); // 🔥 获取加密配置存储
+            // 🔥 文件夹管理器（构造 TaskScheduleInfo 时使用）
+            let folder_manager_for_task = folder_manager_arc_clone.read().await.clone();
+            let prepare_result = engine_clone
+                .prepare_for_scheduling(
+                    task_clone.clone(),
+                    cancellation_token.clone(),
+                )
+                .await;
+
+            // 探测完成后，先检查是否被取消
+            if cancellation_token.is_cancelled() {
+                info!("{path_label}:任务 {} 在探测完成后发现已被取消", id_clone);
+                return;
+            }
+
+            match prepare_result {
+                Ok((
+                       client,
+                       cookie,
+                       referer,
+                       url_health,
+                       output_path,
+                       chunk_size,
+                       chunk_manager,
+                       speed_calc,
+                   )) => {
+                    // 获取文件总大小、远程路径和 fs_id
+                    // 🔥 同时读取 is_borrowed_slot / uses_folder_fixed_slot，用于下方 prepare 后 touch 的 owner 判定
+                    let (
+                        total_size,
+                        remote_path,
+                        fs_id,
+                        local_path,
+                        group_id,
+                        group_root,
+                        relative_path,
+                        is_backup,
+                        backup_config_id,
+                        transfer_task_id,
+                        is_borrowed_slot,
+                        uses_folder_fixed_slot,
+                        task_owner_uid,
+                    ) = {
+                        let t = task_clone.lock().await;
+                        (
+                            t.total_size,
+                            t.remote_path.clone(),
+                            t.fs_id,
+                            t.local_path.clone(),
+                            t.group_id.clone(),
+                            t.group_root.clone(),
+                            t.relative_path.clone(),
+                            t.is_backup,
+                            t.backup_config_id.clone(),
+                            t.transfer_task_id.clone(),
+                            t.is_borrowed_slot,
+                            t.uses_folder_fixed_slot,
+                            //
+                            t.owner_uid,
+                        )
+                    };
+
+                    // 获取分片数
+                    let total_chunks = {
+                        let cm = chunk_manager.lock().await;
+                        cm.chunk_count()
+                    };
+
+                    // 🔥 prepare_for_scheduling 完成后立即刷新槽位
+                    //   touch owner 必须与"任务实际持有的槽位类型"对应：
+                    //   - 文件夹 fixed/borrowed 槽位 → pool owner = group_id
+                    //   - 普通全局 fixed / backup 槽位 → pool owner = task_id
+                    {
+                        let prepare_touch_id = if (uses_folder_fixed_slot
+                            || is_borrowed_slot)
+                            && group_id.is_some()
+                        {
+                            group_id.clone().unwrap()
+                        } else {
+                            id_clone.clone()
+                        };
+                        task_slot_pool_clone.touch_slot(&prepare_touch_id).await;
+                    }
+
+                    // 🔥 发送状态变更事件：pending → downloading
+                    // 此时 prepare_for_scheduling 已完成，任务状态已变为 Downloading
+                    if is_backup {
+                        // 备份任务：发送到 backup_notification_tx
+                        use crate::autobackup::events::TransferTaskType;
+                        if let Some(ref tx) = backup_notification_tx {
+                            let notification = BackupTransferNotification::StatusChanged {
+                                task_id: id_clone.clone(),
+                                task_type: TransferTaskType::Download,
+                                old_status: crate::autobackup::events::TransferTaskStatus::Pending,
+                                new_status: crate::autobackup::events::TransferTaskStatus::Transferring,
+                            };
+                            let _ = tx.send(notification);
+                        }
+                    } else if let Some(ref ws) = ws_manager {
+                        // 普通任务：发送到 WebSocket
+                        ws.send_if_subscribed(
+                            TaskEvent::Download(DownloadEvent::StatusChanged {
+                                task_id: id_clone.clone(),
+                                old_status: "pending".to_string(),
+                                new_status: "downloading".to_string(),
+                                group_id: group_id.clone(),
+                                is_backup,
+                                error: None,
+
+                                owner_uid: Some(task_owner_uid.raw()),
+                            }),
+                            group_id.clone(),
+                        );
+                    }
+
+                    // 🔥 检测是否为加密文件，并获取 key_version
+                    let (is_encrypted, encryption_key_version) = {
+                        let filename = local_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("");
+
+                        // 通过文件名检测是否为加密文件
+                        let is_encrypted = DownloadTask::detect_encrypted_filename(filename);
+
+                        // 如果是加密文件，尝试从 snapshot_manager 获取 key_version
+                        let key_version = if is_encrypted {
+                            if let Some(ref snapshot_mgr) = snapshot_manager {
+                                match snapshot_mgr.find_by_encrypted_name(filename) {
+                                    Ok(Some(snapshot_info)) => {
+                                        debug!(
+                                            "{task_label} {} 从映射表获取 key_version: {}",
+                                            id_clone, snapshot_info.key_version
+                                        );
+                                        Some(snapshot_info.key_version)
+                                    }
+                                    Ok(None) => {
+                                        debug!("{task_label} {} 在映射表中未找到加密信息", id_clone);
+                                        None
+                                    }
+                                    Err(e) => {
+                                        warn!("{task_label} {} 查询映射表失败: {}", id_clone, e);
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        (if is_encrypted { Some(true) } else { None }, key_version)
+                    };
+
+                    // 🔥 注册任务到持久化管理器
+                    // 显式传 task.owner_uid
+                    if let Some(ref pm) = persistence_manager_clone {
+                        if let Err(e) = pm.lock().await.register_download_task(
+                            id_clone.clone(),
+                            fs_id,
+                            remote_path.clone(),
+                            local_path.clone(),
+                            total_size,
+                            chunk_size,
+                            total_chunks,
+                            group_id.clone(),
+                            group_root.clone(),
+                            relative_path.clone(),
+                            is_backup,
+                            backup_config_id.clone(),
+                            is_encrypted,
+                            encryption_key_version,
+                            transfer_task_id.clone(),
+                            Some(task_owner_uid.raw()),
+                        ) {
+                            warn!(
+                                "{path_label}：注册任务到持久化管理器失败: {}",
+                                e
+                            );
+                        } else {
+                            // 🔥 任务已落盘 → 把对应文件从 pending_files 摘掉，
+                            //    与 start_task_internal 保持一致。
+                            //
+                            //    本函数内联复制了一份启动逻辑，历史上漏了这一步：
+                            //    经本路径起来的子任务下完后文件仍赖在 pending_files，
+                            //    补任务循环会反复重建任务、整文件重下（issue #156 续）。
+                            //    真正的兜底在 folder_manager 的成功完成分支，这里补齐
+                            //    只是让"建了任务还没下完"的窗口期也保持不变量。
+                            if let Some(ref gid) = group_id {
+                                if let Some(ref fm) = folder_manager_for_task {
+                                    fm.drop_pending_file_after_persist(gid, fs_id).await;
+                                }
+                            }
+                        }
+
+                        // 🔥 修复：从持久化管理器获取已完成的分片，并标记到 ChunkManager（实现真正的断点续传）
+                        if let Some(completed_chunks) = pm.lock().await.get_completed_chunks(&id_clone) {
+                            let mut cm = chunk_manager.lock().await;
+                            let mut completed_count = 0;
+                            for chunk_index in completed_chunks.iter() {
+                                cm.mark_completed(chunk_index);
+                                completed_count += 1;
+                            }
+                            if completed_count > 0 {
+                                info!(
+                                    "{task_label} {} 恢复了 {} 个已完成分片，将跳过这些分片的下载",
+                                    id_clone, completed_count
+                                );
+                            }
+                        }
+                        // 🔥 恢复分片内部分进度（分片内断点续传）
+                        if let Some(partial_progress) = pm.lock().await.get_partial_progress(&id_clone) {
+                            let mut cm = chunk_manager.lock().await;
+                            let mut partial_count = 0;
+                            for (chunk_index, bytes_downloaded) in &partial_progress {
+                                cm.update_bytes_downloaded(*chunk_index, *bytes_downloaded);
+                                partial_count += 1;
+                            }
+                            if partial_count > 0 {
+                                info!(
+                                    "{task_label} {} 恢复了 {} 个分片的部分进度（分片内断点续传）",
+                                    id_clone, partial_count
+                                );
+                            }
+                        }
+                    }
+
+                    let max_concurrent_chunks =
+                        calculate_task_max_chunks(total_size);
+                    info!(
+                        "{task_label} {} 文件大小 {} 字节, 最大并发分片数: {}",
+                        id_clone, total_size, max_concurrent_chunks
+                    );
+
+                    // 为速度异常检测保存需要的引用
+                    let url_health_for_detection = url_health.clone();
+                    let client_for_detection = client.read().unwrap().clone();
+                    let cancellation_token_for_detection =
+                        cancellation_token.clone();
+                    let chunk_scheduler_for_detection =
+                        chunk_scheduler_clone.clone();
+                    let app_config_for_detection =
+                        app_config_arc_clone.clone();
+
+                    // 🔥 获取任务的槽位信息
+                    let (slot_id, is_borrowed_slot) = {
+                        let t = task_clone.lock().await;
+                        (t.slot_id, t.is_borrowed_slot)
+                    };
+
+                    // 创建任务级共享槽位刷新节流器（所有分片共享，防止分片切换重置计时）
+                    let touch_id = group_id.clone().unwrap_or_else(|| id_clone.clone());
+                    let slot_touch_throttler = Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
+                        task_slot_pool_clone.clone(), touch_id,
+                    ));
+
+                    // 🔥 构造 HTTP/2 降级触发器闭包：根据信号增减 engine 内部计数
+                    let engine_for_trigger = engine_clone.clone();
+                    let http11_trigger_arc: crate::downloader::engine::H2DowngradeTrigger =
+                        Arc::new(move |signal| match signal {
+                            crate::downloader::engine::H2DowngradeSignal::ZeroFailureFrameError => {
+                                if engine_for_trigger.report_h2_zero_failure() {
+                                    engine_for_trigger.trigger_http11_downgrade();
+                                }
+                            }
+                            crate::downloader::engine::H2DowngradeSignal::DataReceived => {
+                                engine_for_trigger.reset_h2_zero_failure_counter();
+                            }
+                        });
+
+                    let task_info = TaskScheduleInfo {
+                        task_id: id_clone.clone(),
+                        task: task_clone.clone(),
+                        chunk_manager,
+                        speed_calc,
+                        client,
+                        cookie,
+                        referer,
+                        url_health,
+                        output_path,
+                        chunk_size,
+                        total_size,
+                        cancellation_token: cancellation_token.clone(),
+                        active_chunk_count: Arc::new(AtomicUsize::new(0)),
+                        // 🔥 任务级连续分片失败计数器，达阀触发 auto_requeue
+                        consecutive_chunk_failures: Arc::new(AtomicU32::new(0)),
+                        max_concurrent_chunks,
+                        persistence_manager: persistence_manager_clone
+                            .clone(),
+                        ws_manager: ws_manager.clone(),
+                        progress_throttler: Arc::new(
+                            ProgressThrottler::default(),
+                        ),
+                        folder_progress_tx: folder_progress_tx.clone(),
+                        backup_notification_tx: backup_notification_tx.clone(),
+                        // 🔥 任务位借调机制字段
+                        slot_id,
+                        is_borrowed_slot,
+                        task_slot_pool: Some(task_slot_pool_clone.clone()),
+                        // 🔥 加密服务（用于下载完成后解密）- 由调度器根据 encryption_config_store 动态创建
+                        encryption_service: None,
+                        // 🔥 快照管理器（用于查询加密文件映射，获取原始文件名）
+                        snapshot_manager: snapshot_manager.clone(),
+                        // 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
+                        encryption_config_store: encryption_config_store.clone(),
+                        // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
+                        manager_tasks: Some(tasks_clone.clone()),
+                        // 🔥 链接级重试次数（从配置读取）
+                        max_retries,
+                        // 🔥 代理故障回退管理器
+                        fallback_mgr: engine_clone.fallback_mgr.clone(),
+                        // 🔥 任务级共享槽位刷新节流器
+                        slot_touch_throttler,
+                        // 🔥 auto_requeue 发送端
+                        requeue_tx: Some(requeue_tx_cloned.clone()),
+                        // 🔥 HTTP/2 降级触发器
+                        http11_trigger: Some(http11_trigger_arc),
+                        // 🔥 文件夹管理器引用
+                        folder_manager: folder_manager_for_task.clone(),
+                    };
+
+                    // 注册任务到调度器
+                    match chunk_scheduler_clone
+                        .register_task(task_info)
+                        .await
+                    {
+                        Ok(()) => {
+                            // 注册成功，启动速度异常检测循环和线程停滞检测循环
+                            info!(
+                                "{task_label} {} 注册成功，启动CDN链接检测",
+                                id_clone
+                            );
+
+                            // 🔥 成功注册即视为"启动成功"，清零 start_retry_count
+                            {
+                                let mut t = task_clone.lock().await;
+                                if t.start_retry_count > 0 {
+                                    debug!(
+                                        "{path_label}：任务 {} 启动成功，重置 start_retry_count {} -> 0",
+                                        id_clone, t.start_retry_count
+                                    );
+                                    t.start_retry_count = 0;
+                                }
+                            }
+
+                            Self::spawn_cdn_detection_loops(
+                                engine_clone.clone(),
+                                remote_path,
+                                total_size,
+                                url_health_for_detection,
+                                Arc::new(chunk_scheduler_for_detection),
+                                client_for_detection,
+                                cancellation_token_for_detection,
+                                app_config_for_detection,
+                                &id_clone,
+                            )
+                                .await;
+                        }
+                        Err(e) => {
+                            let error_msg = e.to_string();
+                            error!("{path_label}：注册任务失败: {}", error_msg);
+
+                            // 统一处理任务失败逻辑（typed rollback）
+                            Self::handle_task_failure(
+                                id_clone,
+                                task_clone,
+                                error_msg,
+                                waiting_queue_clone,
+                                cancellation_tokens_clone,
+                                ws_manager,
+                                persistence_manager_clone,
+                                tasks_clone,
+                                task_slot_pool_clone.clone(),
+                                folder_manager_arc_clone.clone(),
+                                backup_notification_tx,
+                                chunk_scheduler_for_failure,
+                            )
+                                .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    error!("{path_label}：准备任务失败: {}", error_msg);
+
+                    // 统一处理任务失败逻辑（typed rollback）
+                    Self::handle_task_failure(
+                        id_clone,
+                        task_clone,
+                        error_msg,
+                        waiting_queue_clone,
+                        cancellation_tokens_clone,
+                        ws_manager,
+                        persistence_manager_clone,
+                        tasks_clone,
+                        task_slot_pool_clone.clone(),
+                        folder_manager_arc_clone.clone(),
+                        backup_notification_tx,
+                        chunk_scheduler_for_failure,
+                    )
+                        .await;
+                }
+            }
+        });
+    }
     async fn start_task_internal(&self, task_id: &str) -> Result<()> {
         let task = self
             .tasks
@@ -1626,6 +2166,8 @@ impl DownloadManager {
         let engine = self.engine.clone();
         let task_clone = task.clone();
         let chunk_scheduler = self.chunk_scheduler.clone();
+        // 🔥 失败路径要用它回告文件夹管理器（见 handle_task_failure 尾部说明）
+        let chunk_scheduler_for_failure = self.chunk_scheduler.clone();
         let task_id_clone = task_id.to_string();
         let cancellation_tokens = self.cancellation_tokens.clone();
         let persistence_manager = self.persistence_manager.clone();
@@ -2017,6 +2559,7 @@ impl DownloadManager {
                                 task_slot_pool_clone.clone(),
                                 folder_manager_arc_clone.clone(),
                                 backup_notification_tx,
+                                chunk_scheduler_for_failure,
                             )
                                 .await;
 
@@ -2041,6 +2584,7 @@ impl DownloadManager {
                         task_slot_pool_clone.clone(),
                         folder_manager_arc_clone.clone(),
                         backup_notification_tx,
+                        chunk_scheduler_for_failure,
                     )
                         .await;
 
@@ -2381,24 +2925,13 @@ impl DownloadManager {
     /// 这确保了当活跃任务自然完成时，等待队列中的任务能被自动启动
     /// 🔥 改用任务槽可用性检查，并在启动前分配槽位
     fn start_waiting_queue_monitor(&self) {
+        // 🔥 启动逻辑与 0 延迟触发器共用 spawn_started_task，依赖打包在这里
+        let deps_for_start = self.task_start_deps();
         let waiting_queue = self.waiting_queue.clone();
-        let chunk_scheduler = self.chunk_scheduler.clone();
         let tasks = self.tasks.clone();
         let cancellation_tokens = self.cancellation_tokens.clone();
-        let engine = self.engine.clone();
         let task_slot_pool = self.task_slot_pool.clone();
-        let persistence_manager = self.persistence_manager.clone();
-        let ws_manager_arc = self.ws_manager.clone();
-        let folder_progress_tx_arc = self.folder_progress_tx.clone();
-        let backup_notification_tx_arc = self.backup_notification_tx.clone();
-        let snapshot_manager_arc = self.snapshot_manager.clone(); // 🔥 用于查询加密文件映射
-        let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于根据 key_version 选择解密密钥
-        let max_retries = self.max_retries;
-        // 🔥 auto_requeue 发送端和文件夹管理器引用
-        let requeue_tx_for_monitor = self.requeue_tx.clone();
         let folder_manager_arc_for_monitor = self.folder_manager.clone();
-        // 🔥 CDN 检测循环需要读取 [download.cdn_refresh] 配置
-        let app_config_arc = self.app_config.clone();
         // 不再 capture self.owner_uid。
         // 共享 manager 设计下 self.owner_uid 不可靠（同一个 Arc 服务多个账号）。
         // 事件归属一律读 `task.owner_uid`（已在内层 spawn 后从 task 读出 task_owner_uid）。
@@ -2584,438 +3117,15 @@ impl DownloadManager {
                                     .await
                                     .insert(id.clone(), cancellation_token.clone());
 
-                                // 启动任务（简化版，直接在这里处理）
-                                let engine_clone = engine.clone();
-                                let task_clone = task.clone();
-                                let chunk_scheduler_clone = chunk_scheduler.clone();
-                                let id_clone = id.clone();
-                                let cancellation_tokens_clone = cancellation_tokens.clone();
-                                let persistence_manager_clone = persistence_manager.clone();
-                                let ws_manager_arc_clone = ws_manager_arc.clone();
-                                let folder_progress_tx_arc_clone = folder_progress_tx_arc.clone();
-                                let backup_notification_tx_arc_clone = backup_notification_tx_arc.clone();
-                                let waiting_queue_clone = waiting_queue.clone();
-                                let task_slot_pool_clone = task_slot_pool.clone();
-                                let tasks_clone = tasks.clone(); // 🔥 用于 handle_task_failure 的优先级队列插入
-                                let snapshot_manager_arc_clone = snapshot_manager_arc.clone(); // 🔥 用于查询加密文件映射
-                                let encryption_config_store_arc_clone = encryption_config_store_arc.clone(); // 🔥 用于根据 key_version 选择解密密钥
-                                // 🔥 auto_requeue 发送端和文件夹管理器引用
-                                let requeue_tx_cloned_monitor = requeue_tx_for_monitor.clone();
-                                let folder_manager_arc_clone = folder_manager_arc_for_monitor.clone();
-                                let app_config_arc_clone = app_config_arc.clone();
-
-                                tokio::spawn(async move {
-                                    // 获取 WebSocket 管理器和文件夹进度发送器
-                                    let ws_manager = ws_manager_arc_clone.read().await.clone();
-                                    let folder_progress_tx =
-                                        folder_progress_tx_arc_clone.read().await.clone();
-                                    let backup_notification_tx =
-                                        backup_notification_tx_arc_clone.read().await.clone();
-                                    let snapshot_manager = snapshot_manager_arc_clone.read().await.clone(); // 🔥 获取快照管理器
-                                    let encryption_config_store = encryption_config_store_arc_clone.read().await.clone(); // 🔥 获取加密配置存储
-                                    // 🔥 文件夹管理器（构造 TaskScheduleInfo 时使用）
-                                    let folder_manager_for_task = folder_manager_arc_clone.read().await.clone();
-                                    let prepare_result = engine_clone
-                                        .prepare_for_scheduling(
-                                            task_clone.clone(),
-                                            cancellation_token.clone(),
-                                        )
-                                        .await;
-
-                                    // 探测完成后，先检查是否被取消
-                                    if cancellation_token.is_cancelled() {
-                                        info!("后台监控:任务 {} 在探测完成后发现已被取消", id_clone);
-                                        return;
-                                    }
-
-                                    match prepare_result {
-                                        Ok((
-                                               client,
-                                               cookie,
-                                               referer,
-                                               url_health,
-                                               output_path,
-                                               chunk_size,
-                                               chunk_manager,
-                                               speed_calc,
-                                           )) => {
-                                            // 获取文件总大小、远程路径和 fs_id
-                                            // 🔥 同时读取 is_borrowed_slot / uses_folder_fixed_slot，用于下方 prepare 后 touch 的 owner 判定
-                                            let (
-                                                total_size,
-                                                remote_path,
-                                                fs_id,
-                                                local_path,
-                                                group_id,
-                                                group_root,
-                                                relative_path,
-                                                is_backup,
-                                                backup_config_id,
-                                                transfer_task_id,
-                                                is_borrowed_slot,
-                                                uses_folder_fixed_slot,
-                                                task_owner_uid,
-                                            ) = {
-                                                let t = task_clone.lock().await;
-                                                (
-                                                    t.total_size,
-                                                    t.remote_path.clone(),
-                                                    t.fs_id,
-                                                    t.local_path.clone(),
-                                                    t.group_id.clone(),
-                                                    t.group_root.clone(),
-                                                    t.relative_path.clone(),
-                                                    t.is_backup,
-                                                    t.backup_config_id.clone(),
-                                                    t.transfer_task_id.clone(),
-                                                    t.is_borrowed_slot,
-                                                    t.uses_folder_fixed_slot,
-                                                    //
-                                                    t.owner_uid,
-                                                )
-                                            };
-
-                                            // 获取分片数
-                                            let total_chunks = {
-                                                let cm = chunk_manager.lock().await;
-                                                cm.chunk_count()
-                                            };
-
-                                            // 🔥 prepare_for_scheduling 完成后立即刷新槽位
-                                            //   touch owner 必须与"任务实际持有的槽位类型"对应：
-                                            //   - 文件夹 fixed/borrowed 槽位 → pool owner = group_id
-                                            //   - 普通全局 fixed / backup 槽位 → pool owner = task_id
-                                            {
-                                                let prepare_touch_id = if (uses_folder_fixed_slot
-                                                    || is_borrowed_slot)
-                                                    && group_id.is_some()
-                                                {
-                                                    group_id.clone().unwrap()
-                                                } else {
-                                                    id_clone.clone()
-                                                };
-                                                task_slot_pool_clone.touch_slot(&prepare_touch_id).await;
-                                            }
-
-                                            // 🔥 发送状态变更事件：pending → downloading
-                                            // 此时 prepare_for_scheduling 已完成，任务状态已变为 Downloading
-                                            if is_backup {
-                                                // 备份任务：发送到 backup_notification_tx
-                                                use crate::autobackup::events::TransferTaskType;
-                                                if let Some(ref tx) = backup_notification_tx {
-                                                    let notification = BackupTransferNotification::StatusChanged {
-                                                        task_id: id_clone.clone(),
-                                                        task_type: TransferTaskType::Download,
-                                                        old_status: crate::autobackup::events::TransferTaskStatus::Pending,
-                                                        new_status: crate::autobackup::events::TransferTaskStatus::Transferring,
-                                                    };
-                                                    let _ = tx.send(notification);
-                                                }
-                                            } else if let Some(ref ws) = ws_manager {
-                                                // 普通任务：发送到 WebSocket
-                                                ws.send_if_subscribed(
-                                                    TaskEvent::Download(DownloadEvent::StatusChanged {
-                                                        task_id: id_clone.clone(),
-                                                        old_status: "pending".to_string(),
-                                                        new_status: "downloading".to_string(),
-                                                        group_id: group_id.clone(),
-                                                        is_backup,
-                                                        error: None,
-
-                                                        owner_uid: Some(task_owner_uid.raw()),
-                                                    }),
-                                                    group_id.clone(),
-                                                );
-                                            }
-
-                                            // 🔥 检测是否为加密文件，并获取 key_version
-                                            let (is_encrypted, encryption_key_version) = {
-                                                let filename = local_path
-                                                    .file_name()
-                                                    .and_then(|n| n.to_str())
-                                                    .unwrap_or("");
-
-                                                // 通过文件名检测是否为加密文件
-                                                let is_encrypted = DownloadTask::detect_encrypted_filename(filename);
-
-                                                // 如果是加密文件，尝试从 snapshot_manager 获取 key_version
-                                                let key_version = if is_encrypted {
-                                                    if let Some(ref snapshot_mgr) = snapshot_manager {
-                                                        match snapshot_mgr.find_by_encrypted_name(filename) {
-                                                            Ok(Some(snapshot_info)) => {
-                                                                debug!(
-                                                                    "后台任务 {} 从映射表获取 key_version: {}",
-                                                                    id_clone, snapshot_info.key_version
-                                                                );
-                                                                Some(snapshot_info.key_version)
-                                                            }
-                                                            Ok(None) => {
-                                                                debug!("后台任务 {} 在映射表中未找到加密信息", id_clone);
-                                                                None
-                                                            }
-                                                            Err(e) => {
-                                                                warn!("后台任务 {} 查询映射表失败: {}", id_clone, e);
-                                                                None
-                                                            }
-                                                        }
-                                                    } else {
-                                                        None
-                                                    }
-                                                } else {
-                                                    None
-                                                };
-
-                                                (if is_encrypted { Some(true) } else { None }, key_version)
-                                            };
-
-                                            // 🔥 注册任务到持久化管理器
-                                            // 显式传 task.owner_uid
-                                            if let Some(ref pm) = persistence_manager_clone {
-                                                if let Err(e) = pm.lock().await.register_download_task(
-                                                    id_clone.clone(),
-                                                    fs_id,
-                                                    remote_path.clone(),
-                                                    local_path.clone(),
-                                                    total_size,
-                                                    chunk_size,
-                                                    total_chunks,
-                                                    group_id.clone(),
-                                                    group_root.clone(),
-                                                    relative_path.clone(),
-                                                    is_backup,
-                                                    backup_config_id.clone(),
-                                                    is_encrypted,
-                                                    encryption_key_version,
-                                                    transfer_task_id.clone(),
-                                                    Some(task_owner_uid.raw()),
-                                                ) {
-                                                    warn!(
-                                                        "后台监控：注册任务到持久化管理器失败: {}",
-                                                        e
-                                                    );
-                                                } else {
-                                                    // 🔥 任务已落盘 → 把对应文件从 pending_files 摘掉，
-                                                    //    与 start_task_internal 保持一致。
-                                                    //
-                                                    //    本函数内联复制了一份启动逻辑，历史上漏了这一步：
-                                                    //    经本路径起来的子任务下完后文件仍赖在 pending_files，
-                                                    //    补任务循环会反复重建任务、整文件重下（issue #156 续）。
-                                                    //    真正的兜底在 folder_manager 的成功完成分支，这里补齐
-                                                    //    只是让"建了任务还没下完"的窗口期也保持不变量。
-                                                    if let Some(ref gid) = group_id {
-                                                        if let Some(ref fm) = folder_manager_for_task {
-                                                            fm.drop_pending_file_after_persist(gid, fs_id).await;
-                                                        }
-                                                    }
-                                                }
-
-                                                // 🔥 修复：从持久化管理器获取已完成的分片，并标记到 ChunkManager（实现真正的断点续传）
-                                                if let Some(completed_chunks) = pm.lock().await.get_completed_chunks(&id_clone) {
-                                                    let mut cm = chunk_manager.lock().await;
-                                                    let mut completed_count = 0;
-                                                    for chunk_index in completed_chunks.iter() {
-                                                        cm.mark_completed(chunk_index);
-                                                        completed_count += 1;
-                                                    }
-                                                    if completed_count > 0 {
-                                                        info!(
-                                                            "后台任务 {} 恢复了 {} 个已完成分片，将跳过这些分片的下载",
-                                                            id_clone, completed_count
-                                                        );
-                                                    }
-                                                }
-                                                // 🔥 恢复分片内部分进度（分片内断点续传）
-                                                if let Some(partial_progress) = pm.lock().await.get_partial_progress(&id_clone) {
-                                                    let mut cm = chunk_manager.lock().await;
-                                                    let mut partial_count = 0;
-                                                    for (chunk_index, bytes_downloaded) in &partial_progress {
-                                                        cm.update_bytes_downloaded(*chunk_index, *bytes_downloaded);
-                                                        partial_count += 1;
-                                                    }
-                                                    if partial_count > 0 {
-                                                        info!(
-                                                            "后台任务 {} 恢复了 {} 个分片的部分进度（分片内断点续传）",
-                                                            id_clone, partial_count
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            let max_concurrent_chunks =
-                                                calculate_task_max_chunks(total_size);
-                                            info!(
-                                                "后台任务 {} 文件大小 {} 字节, 最大并发分片数: {}",
-                                                id_clone, total_size, max_concurrent_chunks
-                                            );
-
-                                            // 为速度异常检测保存需要的引用
-                                            let url_health_for_detection = url_health.clone();
-                                            let client_for_detection = client.read().unwrap().clone();
-                                            let cancellation_token_for_detection =
-                                                cancellation_token.clone();
-                                            let chunk_scheduler_for_detection =
-                                                chunk_scheduler_clone.clone();
-                                            let app_config_for_detection =
-                                                app_config_arc_clone.clone();
-
-                                            // 🔥 获取任务的槽位信息
-                                            let (slot_id, is_borrowed_slot) = {
-                                                let t = task_clone.lock().await;
-                                                (t.slot_id, t.is_borrowed_slot)
-                                            };
-
-                                            // 创建任务级共享槽位刷新节流器（所有分片共享，防止分片切换重置计时）
-                                            let touch_id = group_id.clone().unwrap_or_else(|| id_clone.clone());
-                                            let slot_touch_throttler = Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
-                                                task_slot_pool_clone.clone(), touch_id,
-                                            ));
-
-                                            // 🔥 构造 HTTP/2 降级触发器闭包：根据信号增减 engine 内部计数
-                                            let engine_for_trigger = engine_clone.clone();
-                                            let http11_trigger_arc: crate::downloader::engine::H2DowngradeTrigger =
-                                                Arc::new(move |signal| match signal {
-                                                    crate::downloader::engine::H2DowngradeSignal::ZeroFailureFrameError => {
-                                                        if engine_for_trigger.report_h2_zero_failure() {
-                                                            engine_for_trigger.trigger_http11_downgrade();
-                                                        }
-                                                    }
-                                                    crate::downloader::engine::H2DowngradeSignal::DataReceived => {
-                                                        engine_for_trigger.reset_h2_zero_failure_counter();
-                                                    }
-                                                });
-
-                                            let task_info = TaskScheduleInfo {
-                                                task_id: id_clone.clone(),
-                                                task: task_clone.clone(),
-                                                chunk_manager,
-                                                speed_calc,
-                                                client,
-                                                cookie,
-                                                referer,
-                                                url_health,
-                                                output_path,
-                                                chunk_size,
-                                                total_size,
-                                                cancellation_token: cancellation_token.clone(),
-                                                active_chunk_count: Arc::new(AtomicUsize::new(0)),
-                                                // 🔥 任务级连续分片失败计数器，达阀触发 auto_requeue
-                                                consecutive_chunk_failures: Arc::new(AtomicU32::new(0)),
-                                                max_concurrent_chunks,
-                                                persistence_manager: persistence_manager_clone
-                                                    .clone(),
-                                                ws_manager: ws_manager.clone(),
-                                                progress_throttler: Arc::new(
-                                                    ProgressThrottler::default(),
-                                                ),
-                                                folder_progress_tx: folder_progress_tx.clone(),
-                                                backup_notification_tx: backup_notification_tx.clone(),
-                                                // 🔥 任务位借调机制字段
-                                                slot_id,
-                                                is_borrowed_slot,
-                                                task_slot_pool: Some(task_slot_pool_clone.clone()),
-                                                // 🔥 加密服务（用于下载完成后解密）- 由调度器根据 encryption_config_store 动态创建
-                                                encryption_service: None,
-                                                // 🔥 快照管理器（用于查询加密文件映射，获取原始文件名）
-                                                snapshot_manager: snapshot_manager.clone(),
-                                                // 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
-                                                encryption_config_store: encryption_config_store.clone(),
-                                                // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
-                                                manager_tasks: Some(tasks_clone.clone()),
-                                                // 🔥 链接级重试次数（从配置读取）
-                                                max_retries,
-                                                // 🔥 代理故障回退管理器
-                                                fallback_mgr: engine_clone.fallback_mgr.clone(),
-                                                // 🔥 任务级共享槽位刷新节流器
-                                                slot_touch_throttler,
-                                                // 🔥 auto_requeue 发送端
-                                                requeue_tx: Some(requeue_tx_cloned_monitor.clone()),
-                                                // 🔥 HTTP/2 降级触发器
-                                                http11_trigger: Some(http11_trigger_arc),
-                                                // 🔥 文件夹管理器引用
-                                                folder_manager: folder_manager_for_task.clone(),
-                                            };
-
-                                            // 注册任务到调度器
-                                            match chunk_scheduler_clone
-                                                .register_task(task_info)
-                                                .await
-                                            {
-                                                Ok(()) => {
-                                                    // 注册成功，启动速度异常检测循环和线程停滞检测循环
-                                                    info!(
-                                                        "后台任务 {} 注册成功，启动CDN链接检测",
-                                                        id_clone
-                                                    );
-
-                                                    // 🔥 成功注册即视为"启动成功"，清零 start_retry_count
-                                                    {
-                                                        let mut t = task_clone.lock().await;
-                                                        if t.start_retry_count > 0 {
-                                                            debug!(
-                                                                "后台监控：任务 {} 启动成功，重置 start_retry_count {} -> 0",
-                                                                id_clone, t.start_retry_count
-                                                            );
-                                                            t.start_retry_count = 0;
-                                                        }
-                                                    }
-
-                                                    Self::spawn_cdn_detection_loops(
-                                                        engine_clone.clone(),
-                                                        remote_path,
-                                                        total_size,
-                                                        url_health_for_detection,
-                                                        Arc::new(chunk_scheduler_for_detection),
-                                                        client_for_detection,
-                                                        cancellation_token_for_detection,
-                                                        app_config_for_detection,
-                                                        &id_clone,
-                                                    )
-                                                        .await;
-                                                }
-                                                Err(e) => {
-                                                    let error_msg = e.to_string();
-                                                    error!("后台监控：注册任务失败: {}", error_msg);
-
-                                                    // 统一处理任务失败逻辑（typed rollback）
-                                                    Self::handle_task_failure(
-                                                        id_clone,
-                                                        task_clone,
-                                                        error_msg,
-                                                        waiting_queue_clone,
-                                                        cancellation_tokens_clone,
-                                                        ws_manager,
-                                                        persistence_manager_clone,
-                                                        tasks_clone,
-                                                        task_slot_pool_clone.clone(),
-                                                        folder_manager_arc_clone.clone(),
-                                                        backup_notification_tx,
-                                                    )
-                                                        .await;
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let error_msg = e.to_string();
-                                            error!("后台监控：准备任务失败: {}", error_msg);
-
-                                            // 统一处理任务失败逻辑（typed rollback）
-                                            Self::handle_task_failure(
-                                                id_clone,
-                                                task_clone,
-                                                error_msg,
-                                                waiting_queue_clone,
-                                                cancellation_tokens_clone,
-                                                ws_manager,
-                                                persistence_manager_clone,
-                                                tasks_clone,
-                                                task_slot_pool_clone.clone(),
-                                                folder_manager_arc_clone.clone(),
-                                                backup_notification_tx,
-                                            )
-                                                .await;
-                                        }
-                                    }
-                                });
+                                // 启动任务：与另一条等待队列链路共用同一份实现（见 spawn_started_task）
+                                Self::spawn_started_task(
+                                    deps_for_start.clone(),
+                                    id.clone(),
+                                    task.clone(),
+                                    cancellation_token.clone(),
+                                    "后台监控",
+                                    "后台任务",
+                                );
                             } else {
                                 // 任务不存在，跳过
                                 warn!("后台监控：任务 {} 不存在，跳过", id);
@@ -3157,6 +3267,8 @@ impl DownloadManager {
     /// 当调度器检测到任务完成时，会通过 channel 发送信号，
     /// 这里的监听循环会立即响应并启动等待队列中的任务
     fn setup_waiting_queue_trigger(&self) {
+        // 🔥 启动逻辑与后台监控共用 spawn_started_task，依赖打包在这里
+        let deps_for_start = self.task_start_deps();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         // 设置触发器到调度器
@@ -3167,23 +3279,10 @@ impl DownloadManager {
 
         // 启动监听循环
         let waiting_queue = self.waiting_queue.clone();
-        let chunk_scheduler = self.chunk_scheduler.clone();
         let tasks = self.tasks.clone();
         let cancellation_tokens = self.cancellation_tokens.clone();
-        let engine = self.engine.clone();
         let task_slot_pool = self.task_slot_pool.clone();
-        let persistence_manager = self.persistence_manager.clone();
-        let ws_manager_arc = self.ws_manager.clone();
-        let folder_progress_tx_arc = self.folder_progress_tx.clone();
-        let backup_notification_tx_arc = self.backup_notification_tx.clone();
-        let snapshot_manager_arc = self.snapshot_manager.clone(); // 🔥 用于查询加密文件映射
-        let encryption_config_store_arc = self.encryption_config_store.clone(); // 🔥 用于根据 key_version 选择解密密钥
-        let max_retries = self.max_retries;
-        // 🔥 auto_requeue 发送端和文件夹管理器引用
-        let requeue_tx_for_trigger = self.requeue_tx.clone();
         let folder_manager_arc_for_trigger = self.folder_manager.clone();
-        // 🔥 CDN 检测循环需要读取 [download.cdn_refresh] 配置
-        let app_config_arc = self.app_config.clone();
         // 不再 capture self.owner_uid。
         // 共享 manager 设计下 self.owner_uid 不可靠（同一个 Arc 服务多个账号）。
         // 事件归属一律读 `task.owner_uid`（已在内层 spawn 后从 task 读出 task_owner_uid）。
@@ -3363,549 +3462,15 @@ impl DownloadManager {
                                     .await
                                     .insert(id.clone(), cancellation_token.clone());
 
-                                // 启动任务
-                                let engine_clone = engine.clone();
-                                let task_clone = task.clone();
-                                let chunk_scheduler_clone = chunk_scheduler.clone();
-                                let id_clone = id.clone();
-                                let cancellation_tokens_clone = cancellation_tokens.clone();
-                                let persistence_manager_clone = persistence_manager.clone();
-                                let ws_manager_arc_clone = ws_manager_arc.clone();
-                                let folder_progress_tx_arc_clone = folder_progress_tx_arc.clone();
-                                let backup_notification_tx_arc_clone = backup_notification_tx_arc.clone();
-                                let task_slot_pool_clone = task_slot_pool.clone();
-                                let snapshot_manager_arc_clone = snapshot_manager_arc.clone(); // 🔥 用于查询加密文件映射
-                                let encryption_config_store_arc_clone = encryption_config_store_arc.clone(); // 🔥 用于根据 key_version 选择解密密钥
-                                let tasks_clone = tasks.clone(); // 🔥 用于任务完成时立即清理
-                                let waiting_queue_clone = waiting_queue.clone(); // 🔥 用于备份任务失败重试
-                                // 🔥 auto_requeue 发送端和文件夹管理器引用
-                                let requeue_tx_cloned_trigger = requeue_tx_for_trigger.clone();
-                                let folder_manager_arc_clone_trig = folder_manager_arc_for_trigger.clone();
-                                let app_config_arc_clone = app_config_arc.clone();
-
-                                tokio::spawn(async move {
-                                    // 获取 WebSocket 管理器和文件夹进度发送器
-                                    let ws_manager = ws_manager_arc_clone.read().await.clone();
-                                    let folder_progress_tx =
-                                        folder_progress_tx_arc_clone.read().await.clone();
-                                    let backup_notification_tx =
-                                        backup_notification_tx_arc_clone.read().await.clone();
-                                    let snapshot_manager = snapshot_manager_arc_clone.read().await.clone(); // 🔥 获取快照管理器
-                                    let encryption_config_store = encryption_config_store_arc_clone.read().await.clone(); // 🔥 获取加密配置存储
-                                    // 🔥 文件夹管理器（构造 TaskScheduleInfo 时使用）
-                                    let folder_manager_for_task = folder_manager_arc_clone_trig.read().await.clone();
-
-                                    let prepare_result = engine_clone
-                                        .prepare_for_scheduling(
-                                            task_clone.clone(),
-                                            cancellation_token.clone(),
-                                        )
-                                        .await;
-
-                                    if cancellation_token.is_cancelled() {
-                                        info!("0延迟启动: 任务 {} 在探测完成后发现已被取消", id_clone);
-                                        return;
-                                    }
-
-                                    match prepare_result {
-                                        Ok((
-                                               client,
-                                               cookie,
-                                               referer,
-                                               url_health,
-                                               output_path,
-                                               chunk_size,
-                                               chunk_manager,
-                                               speed_calc,
-                                           )) => {
-                                            // 获取文件总大小、远程路径和 fs_id
-                                            // 🔥 同时读取 is_borrowed_slot / uses_folder_fixed_slot，用于下方 prepare 后 touch 的 owner 判定
-                                            let (
-                                                total_size,
-                                                remote_path,
-                                                fs_id,
-                                                local_path,
-                                                group_id,
-                                                group_root,
-                                                relative_path,
-                                                is_backup,
-                                                backup_config_id,
-                                                transfer_task_id,
-                                                is_borrowed_slot,
-                                                uses_folder_fixed_slot,
-                                                task_owner_uid,
-                                            ) = {
-                                                let t = task_clone.lock().await;
-                                                (
-                                                    t.total_size,
-                                                    t.remote_path.clone(),
-                                                    t.fs_id,
-                                                    t.local_path.clone(),
-                                                    t.group_id.clone(),
-                                                    t.group_root.clone(),
-                                                    t.relative_path.clone(),
-                                                    t.is_backup,
-                                                    t.backup_config_id.clone(),
-                                                    t.transfer_task_id.clone(),
-                                                    t.is_borrowed_slot,
-                                                    t.uses_folder_fixed_slot,
-                                                    //
-                                                    t.owner_uid,
-                                                )
-                                            };
-
-                                            // 获取分片数
-                                            let total_chunks = {
-                                                let cm = chunk_manager.lock().await;
-                                                cm.chunk_count()
-                                            };
-
-                                            // 🔥 prepare_for_scheduling 完成后立即刷新槽位
-                                            //   touch owner 必须与"任务实际持有的槽位类型"对应：
-                                            //   - 文件夹 fixed/borrowed 槽位 → pool owner = group_id
-                                            //   - 普通全局 fixed / backup 槽位 → pool owner = task_id
-                                            {
-                                                let prepare_touch_id = if (uses_folder_fixed_slot
-                                                    || is_borrowed_slot)
-                                                    && group_id.is_some()
-                                                {
-                                                    group_id.clone().unwrap()
-                                                } else {
-                                                    id_clone.clone()
-                                                };
-                                                task_slot_pool_clone.touch_slot(&prepare_touch_id).await;
-                                            }
-
-                                            // 🔥 发送状态变更事件：pending → downloading
-                                            // 此时 prepare_for_scheduling 已完成，任务状态已变为 Downloading
-                                            if is_backup {
-                                                // 备份任务：发送到 backup_notification_tx
-                                                use crate::autobackup::events::TransferTaskType;
-                                                if let Some(ref tx) = backup_notification_tx {
-                                                    let notification = BackupTransferNotification::StatusChanged {
-                                                        task_id: id_clone.clone(),
-                                                        task_type: TransferTaskType::Download,
-                                                        old_status: crate::autobackup::events::TransferTaskStatus::Pending,
-                                                        new_status: crate::autobackup::events::TransferTaskStatus::Transferring,
-                                                    };
-                                                    let _ = tx.send(notification);
-                                                }
-                                            } else if let Some(ref ws) = ws_manager {
-                                                // 普通任务：发送到 WebSocket
-                                                ws.send_if_subscribed(
-                                                    TaskEvent::Download(DownloadEvent::StatusChanged {
-                                                        task_id: id_clone.clone(),
-                                                        old_status: "pending".to_string(),
-                                                        new_status: "downloading".to_string(),
-                                                        group_id: group_id.clone(),
-                                                        is_backup,
-                                                        error: None,
-
-                                                        owner_uid: Some(task_owner_uid.raw()),
-                                                    }),
-                                                    group_id.clone(),
-                                                );
-                                            }
-
-                                            // 🔥 检测是否为加密文件，并获取 key_version
-                                            let (is_encrypted, encryption_key_version) = {
-                                                let filename = local_path
-                                                    .file_name()
-                                                    .and_then(|n| n.to_str())
-                                                    .unwrap_or("");
-
-                                                // 通过文件名检测是否为加密文件
-                                                let is_encrypted = DownloadTask::detect_encrypted_filename(filename);
-
-                                                // 如果是加密文件，尝试从 snapshot_manager 获取 key_version
-                                                let key_version = if is_encrypted {
-                                                    if let Some(ref snapshot_mgr) = snapshot_manager {
-                                                        match snapshot_mgr.find_by_encrypted_name(filename) {
-                                                            Ok(Some(snapshot_info)) => {
-                                                                debug!(
-                                                                    "0延迟任务 {} 从映射表获取 key_version: {}",
-                                                                    id_clone, snapshot_info.key_version
-                                                                );
-                                                                Some(snapshot_info.key_version)
-                                                            }
-                                                            Ok(None) => {
-                                                                debug!("0延迟任务 {} 在映射表中未找到加密信息", id_clone);
-                                                                None
-                                                            }
-                                                            Err(e) => {
-                                                                warn!("0延迟任务 {} 查询映射表失败: {}", id_clone, e);
-                                                                None
-                                                            }
-                                                        }
-                                                    } else {
-                                                        None
-                                                    }
-                                                } else {
-                                                    None
-                                                };
-
-                                                (if is_encrypted { Some(true) } else { None }, key_version)
-                                            };
-
-                                            // 🔥 注册任务到持久化管理器
-                                            // 显式传 task.owner_uid.raw()
-                                            if let Some(ref pm) = persistence_manager_clone {
-                                                if let Err(e) = pm.lock().await.register_download_task(
-                                                    id_clone.clone(),
-                                                    fs_id,
-                                                    remote_path.clone(),
-                                                    local_path.clone(),
-                                                    total_size,
-                                                    chunk_size,
-                                                    total_chunks,
-                                                    group_id.clone(),
-                                                    group_root.clone(),
-                                                    relative_path.clone(),
-                                                    is_backup,
-                                                    backup_config_id.clone(),
-                                                    is_encrypted,
-                                                    encryption_key_version,
-                                                    transfer_task_id.clone(),
-                                                    Some(task_owner_uid.raw()),
-                                                ) {
-                                                    warn!(
-                                                        "0延迟启动：注册任务到持久化管理器失败: {}",
-                                                        e
-                                                    );
-                                                } else {
-                                                    // 🔥 任务已落盘 → 把对应文件从 pending_files 摘掉，
-                                                    //    与 start_task_internal 保持一致。
-                                                    //
-                                                    //    本函数内联复制了一份启动逻辑，历史上漏了这一步：
-                                                    //    经本路径起来的子任务下完后文件仍赖在 pending_files，
-                                                    //    补任务循环会反复重建任务、整文件重下（issue #156 续）。
-                                                    //    真正的兜底在 folder_manager 的成功完成分支，这里补齐
-                                                    //    只是让"建了任务还没下完"的窗口期也保持不变量。
-                                                    if let Some(ref gid) = group_id {
-                                                        if let Some(ref fm) = folder_manager_for_task {
-                                                            fm.drop_pending_file_after_persist(gid, fs_id).await;
-                                                        }
-                                                    }
-                                                }
-
-                                                // 🔥 修复：从持久化管理器获取已完成的分片，并标记到 ChunkManager（实现真正的断点续传）
-                                                if let Some(completed_chunks) = pm.lock().await.get_completed_chunks(&id_clone) {
-                                                    let mut cm = chunk_manager.lock().await;
-                                                    let mut completed_count = 0;
-                                                    for chunk_index in completed_chunks.iter() {
-                                                        cm.mark_completed(chunk_index);
-                                                        completed_count += 1;
-                                                    }
-                                                    if completed_count > 0 {
-                                                        info!(
-                                                            "0延迟任务 {} 恢复了 {} 个已完成分片，将跳过这些分片的下载",
-                                                            id_clone, completed_count
-                                                        );
-                                                    }
-                                                }
-                                                // 🔥 恢复分片内部分进度（分片内断点续传）
-                                                if let Some(partial_progress) = pm.lock().await.get_partial_progress(&id_clone) {
-                                                    let mut cm = chunk_manager.lock().await;
-                                                    let mut partial_count = 0;
-                                                    for (chunk_index, bytes_downloaded) in &partial_progress {
-                                                        cm.update_bytes_downloaded(*chunk_index, *bytes_downloaded);
-                                                        partial_count += 1;
-                                                    }
-                                                    if partial_count > 0 {
-                                                        info!(
-                                                            "0延迟任务 {} 恢复了 {} 个分片的部分进度（分片内断点续传）",
-                                                            id_clone, partial_count
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            let max_concurrent_chunks =
-                                                calculate_task_max_chunks(total_size);
-                                            info!(
-                                                "0延迟任务 {} 文件大小 {} 字节, 最大并发分片数: {}",
-                                                id_clone, total_size, max_concurrent_chunks
-                                            );
-
-                                            let url_health_for_detection = url_health.clone();
-                                            let client_for_detection = client.read().unwrap().clone();
-                                            let cancellation_token_for_detection =
-                                                cancellation_token.clone();
-                                            let chunk_scheduler_for_detection =
-                                                chunk_scheduler_clone.clone();
-                                            let app_config_for_detection =
-                                                app_config_arc_clone.clone();
-
-                                            // 🔥 获取任务的槽位信息
-                                            let (slot_id, is_borrowed_slot) = {
-                                                let t = task_clone.lock().await;
-                                                (t.slot_id, t.is_borrowed_slot)
-                                            };
-
-                                            // 🔥 创建任务级共享槽位刷新节流器（所有分片共享，防止分片切换重置计时）
-                                            let touch_id = group_id.clone().unwrap_or_else(|| id_clone.clone());
-                                            let slot_touch_throttler = Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(
-                                                task_slot_pool_clone.clone(), touch_id,
-                                            ));
-
-                                            // 🔥 构造 HTTP/2 降级触发器闭包：根据信号增减 engine 内部计数
-                                            let engine_for_trigger = engine_clone.clone();
-                                            let http11_trigger_arc: crate::downloader::engine::H2DowngradeTrigger =
-                                                Arc::new(move |signal| match signal {
-                                                    crate::downloader::engine::H2DowngradeSignal::ZeroFailureFrameError => {
-                                                        if engine_for_trigger.report_h2_zero_failure() {
-                                                            engine_for_trigger.trigger_http11_downgrade();
-                                                        }
-                                                    }
-                                                    crate::downloader::engine::H2DowngradeSignal::DataReceived => {
-                                                        engine_for_trigger.reset_h2_zero_failure_counter();
-                                                    }
-                                                });
-
-                                            let task_info = TaskScheduleInfo {
-                                                task_id: id_clone.clone(),
-                                                task: task_clone.clone(),
-                                                chunk_manager,
-                                                speed_calc,
-                                                client,
-                                                cookie,
-                                                referer,
-                                                url_health,
-                                                output_path,
-                                                chunk_size,
-                                                total_size,
-                                                cancellation_token: cancellation_token.clone(),
-                                                active_chunk_count: Arc::new(AtomicUsize::new(0)),
-                                                // 🔥 任务级连续分片失败计数器，达阀触发 auto_requeue
-                                                consecutive_chunk_failures: Arc::new(AtomicU32::new(0)),
-                                                max_concurrent_chunks,
-                                                persistence_manager: persistence_manager_clone
-                                                    .clone(),
-                                                ws_manager: ws_manager.clone(),
-                                                progress_throttler: Arc::new(
-                                                    ProgressThrottler::default(),
-                                                ),
-                                                folder_progress_tx: folder_progress_tx.clone(),
-                                                backup_notification_tx: backup_notification_tx.clone(),
-                                                // 🔥 任务位借调机制字段
-                                                slot_id,
-                                                is_borrowed_slot,
-                                                task_slot_pool: Some(task_slot_pool_clone.clone()),
-                                                // 🔥 加密服务（用于下载完成后解密）- 由调度器根据 encryption_config_store 动态创建
-                                                encryption_service: None,
-                                                // 🔥 快照管理器（用于查询加密文件映射，获取原始文件名）
-                                                snapshot_manager: snapshot_manager.clone(),
-                                                // 🔥 加密配置存储（用于根据 key_version 选择正确的解密密钥）
-                                                encryption_config_store: encryption_config_store.clone(),
-                                                // 🔥 Manager 任务列表引用（用于任务完成时立即清理）
-                                                manager_tasks: Some(tasks_clone.clone()),
-                                                // 🔥 链接级重试次数（从配置读取）
-                                                max_retries,
-                                                // 🔥 代理故障回退管理器
-                                                fallback_mgr: engine_clone.fallback_mgr.clone(),
-                                                // 🔥 任务级共享槽位刷新节流器
-                                                slot_touch_throttler,
-                                                // 🔥 auto_requeue 发送端
-                                                requeue_tx: Some(requeue_tx_cloned_trigger.clone()),
-                                                // 🔥 HTTP/2 降级触发器
-                                                http11_trigger: Some(http11_trigger_arc),
-                                                // 🔥 文件夹管理器引用
-                                                folder_manager: folder_manager_for_task.clone(),
-                                            };
-
-                                            match chunk_scheduler_clone
-                                                .register_task(task_info)
-                                                .await
-                                            {
-                                                Ok(()) => {
-                                                    info!(
-                                                        "0延迟任务 {} 注册成功，启动CDN链接检测",
-                                                        id_clone
-                                                    );
-
-                                                    // 🔥 成功注册即视为"启动成功"，清零 start_retry_count
-                                                    {
-                                                        let mut t = task_clone.lock().await;
-                                                        if t.start_retry_count > 0 {
-                                                            debug!(
-                                                                "0延迟启动：任务 {} 启动成功，重置 start_retry_count {} -> 0",
-                                                                id_clone, t.start_retry_count
-                                                            );
-                                                            t.start_retry_count = 0;
-                                                        }
-                                                    }
-
-                                                    Self::spawn_cdn_detection_loops(
-                                                        engine_clone.clone(),
-                                                        remote_path,
-                                                        total_size,
-                                                        url_health_for_detection,
-                                                        Arc::new(chunk_scheduler_for_detection),
-                                                        client_for_detection,
-                                                        cancellation_token_for_detection,
-                                                        app_config_for_detection,
-                                                        &id_clone,
-                                                    )
-                                                        .await;
-                                                }
-                                                Err(e) => {
-                                                    error!("0延迟启动：注册任务失败: {}", e);
-                                                    // 🔥 typed rollback：按 3 种持有方式释放槽位
-                                                    let (
-                                                        slot_id,
-                                                        is_borrowed_slot,
-                                                        uses_folder_fixed_slot,
-                                                        is_backup,
-                                                        is_folder_subtask,
-                                                        retry_count,
-                                                        group_id_for_release,
-                                                    ) = {
-                                                        let t = task_clone.lock().await;
-                                                        (
-                                                            t.slot_id,
-                                                            t.is_borrowed_slot,
-                                                            t.uses_folder_fixed_slot,
-                                                            t.is_backup,
-                                                            t.group_id.is_some(),
-                                                            t.start_retry_count,
-                                                            t.group_id.clone(),
-                                                        )
-                                                    };
-                                                    Self::release_task_slot_by_kind_static(
-                                                        &id_clone,
-                                                        group_id_for_release.as_deref(),
-                                                        slot_id,
-                                                        is_borrowed_slot,
-                                                        uses_folder_fixed_slot,
-                                                        &task_slot_pool_clone,
-                                                        &folder_manager_arc_clone_trig,
-                                                    ).await;
-
-                                                    // 🔥 最大重试次数限制（与公共常量保持一致）
-                                                    // 🔥 备份任务或文件夹子任务：检查重试次数后决定是否重试
-                                                    if (is_backup || is_folder_subtask) && retry_count < MAX_START_RETRIES {
-                                                        warn!(
-                                                            "0延迟启动：任务 {} 注册失败（{}），放回等待队列等待重试 (重试 {}/{})",
-                                                            id_clone, e, retry_count + 1, MAX_START_RETRIES
-                                                        );
-                                                        {
-                                                            let mut t = task_clone.lock().await;
-                                                            t.status = TaskStatus::Pending;
-                                                            t.slot_id = None;
-                                                            t.is_borrowed_slot = false;
-                                                            t.uses_folder_fixed_slot = false;
-                                                            t.error = Some(e.to_string());
-                                                            t.start_retry_count += 1;
-                                                        }
-                                                        waiting_queue_clone.write().await.push_back(id_clone.clone());
-                                                    } else {
-                                                        if retry_count >= MAX_START_RETRIES {
-                                                            error!(
-                                                                "0延迟启动：任务 {} 重试次数已达上限 ({})，标记为失败",
-                                                                id_clone, MAX_START_RETRIES
-                                                            );
-                                                        }
-                                                        let mut t = task_clone.lock().await;
-                                                        t.mark_failed(e.to_string());
-                                                        t.slot_id = None;
-                                                        t.is_borrowed_slot = false;
-                                                        t.uses_folder_fixed_slot = false;
-                                                        // 🔥 通知文件夹管理器子任务失败
-                                                        let group_id = t.group_id.clone();
-                                                        let fs_id = t.fs_id;
-                                                        let total_size = t.total_size;
-                                                        drop(t);
-                                                        if let Some(gid) = group_id {
-                                                            chunk_scheduler_clone.notify_subtask_failed(gid, id_clone.clone(), fs_id, total_size).await;
-                                                        }
-                                                    }
-                                                    cancellation_tokens_clone
-                                                        .write()
-                                                        .await
-                                                        .remove(&id_clone);
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("0延迟启动：准备任务失败: {}", e);
-                                            // 🔥 typed rollback：按 3 种持有方式释放槽位
-                                            let (
-                                                slot_id,
-                                                is_borrowed_slot,
-                                                uses_folder_fixed_slot,
-                                                is_backup,
-                                                is_folder_subtask,
-                                                retry_count,
-                                                group_id_for_release,
-                                            ) = {
-                                                let t = task_clone.lock().await;
-                                                (
-                                                    t.slot_id,
-                                                    t.is_borrowed_slot,
-                                                    t.uses_folder_fixed_slot,
-                                                    t.is_backup,
-                                                    t.group_id.is_some(),
-                                                    t.start_retry_count,
-                                                    t.group_id.clone(),
-                                                )
-                                            };
-                                            Self::release_task_slot_by_kind_static(
-                                                &id_clone,
-                                                group_id_for_release.as_deref(),
-                                                slot_id,
-                                                is_borrowed_slot,
-                                                uses_folder_fixed_slot,
-                                                &task_slot_pool_clone,
-                                                &folder_manager_arc_clone_trig,
-                                            ).await;
-
-                                            // 🔥 最大重试次数限制（与公共常量保持一致）
-                                            // 🔥 备份任务或文件夹子任务：检查重试次数后决定是否重试
-                                            if (is_backup || is_folder_subtask) && retry_count < MAX_START_RETRIES {
-                                                warn!(
-                                                    "0延迟启动：任务 {} 准备失败（{}），放回等待队列等待重试 (重试 {}/{}, is_backup={}, is_folder_subtask={})",
-                                                    id_clone, e, retry_count + 1, MAX_START_RETRIES, is_backup, is_folder_subtask
-                                                );
-                                                {
-                                                    let mut t = task_clone.lock().await;
-                                                    t.status = TaskStatus::Pending;
-                                                    t.slot_id = None;
-                                                    t.is_borrowed_slot = false;
-                                                    t.uses_folder_fixed_slot = false;
-                                                    t.error = Some(e.to_string());
-                                                    t.start_retry_count += 1;
-                                                }
-                                                // 放回等待队列末尾
-                                                waiting_queue_clone.write().await.push_back(id_clone.clone());
-                                            } else {
-                                                // 普通单文件任务或重试次数已达上限：标记失败
-                                                if retry_count >= MAX_START_RETRIES {
-                                                    error!(
-                                                        "0延迟启动：任务 {} 重试次数已达上限 ({})，标记为失败",
-                                                        id_clone, MAX_START_RETRIES
-                                                    );
-                                                }
-                                                let mut t = task_clone.lock().await;
-                                                t.mark_failed(e.to_string());
-                                                t.slot_id = None;
-                                                t.is_borrowed_slot = false;
-                                                t.uses_folder_fixed_slot = false;
-                                                // 🔥 通知文件夹管理器子任务失败
-                                                let group_id = t.group_id.clone();
-                                                let fs_id = t.fs_id;
-                                                let total_size = t.total_size;
-                                                drop(t);
-                                                if let Some(gid) = group_id {
-                                                    chunk_scheduler_clone.notify_subtask_failed(gid, id_clone.clone(), fs_id, total_size).await;
-                                                }
-                                            }
-                                            cancellation_tokens_clone
-                                                .write()
-                                                .await
-                                                .remove(&id_clone);
-                                        }
-                                    }
-                                });
+                                // 启动任务：与另一条等待队列链路共用同一份实现（见 spawn_started_task）
+                                Self::spawn_started_task(
+                                    deps_for_start.clone(),
+                                    id.clone(),
+                                    task.clone(),
+                                    cancellation_token.clone(),
+                                    "0延迟启动",
+                                    "0延迟任务",
+                                );
                             } else {
                                 // 任务不存在，跳过
                                 warn!("0延迟启动：任务 {} 不存在，跳过", id);

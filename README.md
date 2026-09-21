@@ -277,7 +277,17 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 ## 📋 最新版本
 
-### v2.2.3 (当前版本)
+### v2.2.4 (当前版本)
+
+**维护版本**：堵住**已下完的文件仍反复重建子任务、整文件重下烧流量**（建议所有用户升级）；并把等待队列两条启动链路收敛成一份实现，补齐启动阶段失败对文件夹的回告。
+
+**问题修复：**
+- 🐛 **下载·已完成文件反复重建子任务整文件重下（重要）**：`v2.2.3` 挡住了重复计数，但经等待队列路径起来的子任务下完后仍留在 `pending_files`，补任务循环继续整文件重下。实测 182 文件 / 15.4GiB 建了 891 个子任务、白烧 33.5GiB。现完成时登记并剪掉待办，恢复脏快照自愈，补任务再按 `counted_fs_ids` 拦截
+- 🐛 **下载·启动阶段失败不回告导致文件夹卡死**：prepare / register 失败时漏回告文件夹管理器，子任务 Failed 了整夹却永远凑不齐终态。现三条启动路径统一回告
+
+**工程：** 等待队列后台监控与 0 延迟触发器收敛为同一份启动实现，避免再出现「修一份漏两份」。
+
+### v2.2.3
 
 **维护版本**：修复文件夹下载**重复计数、永远到不了终态、同一批文件反复重下把流量烧光**（issue #156，建议所有用户升级），并堵住分片「部分数据」续传黏在坏链接上的流量黑洞。
 
@@ -834,9 +844,9 @@ open http://localhost:18888
 从 [Releases](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 下载对应架构的压缩包（Apple Silicon 选 `macos-arm64`，Intel 选 `macos-x86_64`）：
 
 ```bash
-# 1. 解压（以 v2.2.3 为例）
-unzip BaiduPCS-Rust-v2.2.3-macos-arm64.zip
-cd BaiduPCS-Rust-v2.2.3-macos-arm64
+# 1. 解压（以 v2.2.4 为例）
+unzip BaiduPCS-Rust-v2.2.4-macos-arm64.zip
+cd BaiduPCS-Rust-v2.2.4-macos-arm64
 
 # 2. 解除 Gatekeeper 隔离标记（必需）
 xattr -dr com.apple.quarantine .

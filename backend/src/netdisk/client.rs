@@ -286,19 +286,13 @@ impl NetdiskClient {
 
         if let Some(cookie_header) = cookies {
             if let Ok(cookie_str) = cookie_header.to_str() {
-                info!("Cookie Jar 内容 [{}]:", context);
-                // 按分号分割并打印每个 Cookie
+                debug!("Cookie Jar 内容 [{}] - {} 个 Cookie:", context, cookie_str.split("; ").count());
+                // 仅打印每个 Cookie 的名称与长度,绝不打 value(避免 BDUSS/STOKEN 泄漏)
                 for cookie in cookie_str.split("; ") {
-                    if cookie.split_once('=').is_some() {
-                        // 对于敏感 Cookie，只显示名称和值的前几个字符
-                        if cookie.len() > 50 {
-                            info!("  {}...", &cookie[..50]);
-                        } else {
-                            info!("  {}", cookie);
-                        }
+                    if let Some((name, value)) = cookie.split_once('=') {
+                        debug!("  {} (长度 {})", name, value.len());
                     }
                 }
-                info!("  总共 {} 个 Cookie", cookie_str.split("; ").count());
             }
         } else {
             warn!("Cookie Jar 为空 [{}]", context);
@@ -468,25 +462,25 @@ impl NetdiskClient {
                     );
 
                     if name.eq_ignore_ascii_case("BDUSS") && value_preview.trim().is_empty() {
-                        warn!("{}: 收到清空 BDUSS 的 Set-Cookie！完整内容: {}", step, s);
+                        // 仅记录 cookie 名 + 状态,绝不打印 Set-Cookie 原始内容(避免 BDUSS 泄漏)
+                        warn!("{}: 收到清空 BDUSS 的 Set-Cookie（name=BDUSS, value_len=0）", step);
                     }
 
                     if name == "PANPSC" {
                         if let Some((_, full_value)) = kv.split_once('=') {
                             if full_value.is_empty() {
-                                warn!("{}: PANPSC Cookie 值为空！完整 Set-Cookie: {}", step, s);
+                                warn!("{}: PANPSC Cookie 值为空（Set-Cookie 收到空值）", step);
                             } else {
                                 let mut panpsc = panpsc_storage.lock().await;
                                 *panpsc = Some(full_value.to_string());
-                                info!(
-                                    "{}: 提取到 PANPSC Cookie 值 (长度={}): {}...",
+                                debug!(
+                                    "{}: 已提取 PANPSC Cookie (长度 {})",
                                     step,
-                                    full_value.len(),
-                                    &full_value[..full_value.len().min(20)]
+                                    full_value.len()
                                 );
                             }
                         } else {
-                            warn!("{}: PANPSC Set-Cookie 格式错误，未找到 '=': {}", step, s);
+                            warn!("{}: PANPSC Set-Cookie 格式错误（未找到键值分隔符）", step);
                         }
                     }
                 }
@@ -501,9 +495,9 @@ impl NetdiskClient {
             // 打印响应体长度（用于调试）
             info!("{}: 响应体长度: {} 字节", step, body.len());
 
-            // 打印 /api/loginStatus 的完整响应
+            // /api/loginStatus 完整响应只在 debug 级别打印（响应可能含敏感状态）
             if step.contains("/api/loginStatus") {
-                info!("{}: 完整响应内容: {}", step, body);
+                debug!("{}: /api/loginStatus 响应（长度 {}）", step, body.len());
             }
 
             // 若返回登录页则说明 BDUSS 失效

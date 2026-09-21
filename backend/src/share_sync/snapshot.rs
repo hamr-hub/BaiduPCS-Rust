@@ -741,39 +741,10 @@ impl<'a> SnapshotCollector<'a> {
         // include 目录下一层就截断：深层内容从未被扫描，exclude 过滤与
         // subtree_pruned 标记都无从发生，后续整目录 fs_id 直传会让百度服务端
         // 把被排除的深层内容原样递归复制回来。
-        // `item_allowed` / `dir_needs_more_pages` 均有同款后代判断，三者语义须一致。
+        // `item_allowed` 同款后代判断，语义须一致。
         self.include_paths
             .iter()
             .any(|inc| is_path_ancestor_or_self(dir, inc))
-    }
-
-    /// include_paths 精确选文件场景下，判断某个目录是否还需继续翻页。
-    ///
-    /// 当前并发 BFS 重构后**未挂回**这个短路优化（参考 `step 2` 注释），
-    /// 保留此方法与文档语义以备后续想恢复时直接复用。挂回时只需把 `BFS` 主循环
-    /// 改回串行、并把短路条件接到 `current_dir` 入队前的 `while` 分页判断。
-    #[allow(dead_code)]
-    fn dir_needs_more_pages(&self, dir: &str, found_included_files: &BTreeSet<String>) -> bool {
-        if self.include_paths.is_empty() {
-            return true;
-        }
-
-        // If the selected include path is this directory or an ancestor of it,
-        // the user selected a whole subtree, so we must scan all pages.
-        if self
-            .include_paths
-            .iter()
-            .any(|inc| is_path_ancestor_or_self(dir, inc))
-        {
-            return true;
-        }
-
-        // Otherwise this directory is only being scanned to find exact file
-        // include paths below it. Once every requested descendant file has been
-        // found, continuing to page through thousands of siblings is wasted work.
-        self.include_paths
-            .iter()
-            .any(|inc| is_path_ancestor_or_self(inc, dir) && !found_included_files.contains(inc))
     }
 }
 

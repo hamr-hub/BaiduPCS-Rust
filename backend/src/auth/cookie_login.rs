@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// 从原始 Cookie 字符串解析各字段
 ///
@@ -151,9 +151,9 @@ impl CookieLoginAuth {
 
         let json: Value = resp.json().await.context("Failed to parse user info")?;
 
-        info!(
-            "网盘API返回: {}",
-            serde_json::to_string_pretty(&json).unwrap_or_default()
+        debug!(
+            "网盘API返回(user_info): keys={:?}",
+            json["user_info"].as_object().map(|o| o.keys().collect::<Vec<_>>())
         );
 
         // 非零 errno 表示 BDUSS 无效或已过期

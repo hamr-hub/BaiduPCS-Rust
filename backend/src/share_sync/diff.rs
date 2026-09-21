@@ -104,11 +104,7 @@ pub fn diff_snapshots(prev: Option<&ShareSnapshot>, curr: &ShareSnapshot) -> Sha
         }
     }
 
-    // 稳定排序（按 path）
-    added.sort_by(|a, b| a.path.cmp(&b.path));
-    modified.sort_by(|a, b| a.old.path.cmp(&b.old.path));
-    removed.sort_by(|a, b| a.path.cmp(&b.path));
-
+    // prev_map / curr_map 是 BTreeMap,迭代顺序已按 path 排序,无需额外 sort_by
     ShareDiff {
         added,
         removed,

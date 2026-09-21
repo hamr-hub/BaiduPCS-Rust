@@ -45,3 +45,5 @@ logs/
 ._*
 Thumbs.db
 desktop.ini
+.meta.yaml
+**/._.DS_Store

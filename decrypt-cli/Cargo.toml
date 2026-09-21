@@ -33,10 +33,6 @@ base64 = "0.21"
 proptest = "1.4"
 # 临时文件
 tempfile = "3.10"
-# ZIP 处理
-zip = { version = "0.6", default-features = false, features = ["deflate"] }
-# 正则表达式
-regex = "1.10"
 
 [[bin]]
 name = "decrypt-cli"

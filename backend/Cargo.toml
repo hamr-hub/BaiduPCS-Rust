@@ -13,7 +13,6 @@ tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 # 异步运行时
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-tokio-tungstenite = "0.21"
 
 # HTTP客户端
 # 使用 rustls-tls 替代 native-tls，避免 OpenSSL 依赖问题（特别是交叉编译）

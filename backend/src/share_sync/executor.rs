@@ -2844,22 +2844,6 @@ fn max_category(a: ErrorCategory, b: ErrorCategory) -> ErrorCategory {
     }
 }
 
-#[allow(dead_code)]
-fn _suppress_unused() {
-    let _ = (
-        NetdiskTarget {
-            remote_path: String::new(),
-            save_fs_id: 0,
-            conflict_strategy: None,
-        },
-        LocalTarget {
-            local_path: PathBuf::new(),
-            conflict_strategy: None,
-            mode: crate::share_sync::config::LocalSyncMode::ShareDirect,
-        },
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

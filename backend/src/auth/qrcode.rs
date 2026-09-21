@@ -452,7 +452,7 @@ impl QRCodeAuth {
 
         // 打印响应头，查看是否有 Set-Cookie
         if let Some(cookies) = resp.headers().get("set-cookie") {
-            info!("响应中的 Set-Cookie: {:?}", cookies);
+            debug!("响应中的 Set-Cookie header 数量: {}", cookies.to_str().map(|s| s.split(';').count()).unwrap_or(0));
         }
 
         let json: Value = resp
@@ -460,28 +460,21 @@ impl QRCodeAuth {
             .await
             .context("Failed to parse status response")?;
 
-        // 打印完整的响应内容，用于调试
-        info!(
-            "轮询接口返回: {}",
-            serde_json::to_string_pretty(&json).unwrap_or_default()
-        );
-
         // 解析 channel_v 中的状态
         // channel_v 是一个 JSON 字符串，需要再次解析
         let channel_v_str = json["channel_v"].as_str().unwrap_or("{}");
 
-        info!("channel_v 原始字符串: {}", channel_v_str);
+        debug!("channel_v 长度: {}", channel_v_str.len());
 
         let channel_v: Value =
             serde_json::from_str(channel_v_str).unwrap_or_else(|_| serde_json::json!({}));
 
         let status = channel_v["status"].as_i64().unwrap_or(0);
         let v_code = channel_v["v"].as_str().unwrap_or("");
-        info!(
-            "扫码状态: status = {}, v = {}, 完整 channel_v: {}",
+        debug!(
+            "扫码状态: status = {}, v 长度 = {}",
             status,
-            v_code,
-            serde_json::to_string_pretty(&channel_v).unwrap_or_default()
+            v_code.len()
         );
 
         // 判断登录状态的正确逻辑：
@@ -621,10 +614,9 @@ impl QRCodeAuth {
 
         let json: Value = resp.json().await.context("Failed to parse user info")?;
 
-        // 打印返回的JSON，用于调试
-        info!(
-            "网盘API返回: {}",
-            serde_json::to_string_pretty(&json).unwrap_or_default()
+        debug!(
+            "网盘API返回(user_info): keys={:?}",
+            json["user_info"].as_object().map(|o| o.keys().collect::<Vec<_>>())
         );
 
         // 用户信息在 user_info 字段下

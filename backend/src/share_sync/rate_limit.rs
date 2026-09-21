@@ -6,7 +6,7 @@
 //! 但 4 路并发对账号级风控(百度 errno=132)是激进的——风控以**账号**为维度,
 //! 单订阅再低也救不了多订阅同时跑。所以引入**全局** leaky bucket:
 //! - 任何 transfer/download 调用前 acquire().await 通过限速门
-//! - 4 RPS, burst=8: 平均每秒 4 个请求, 突发能爆 8 个再排队
+//! - 12 RPS, burst=24: 平均每秒 12 个请求, 突发能爆 24 个再排队
 //! - cancel-safe: tokio task 被 abort 不会留下脏状态(governor 默认行为)
 //!
 //! ## 不限速器场景
@@ -18,14 +18,14 @@
 //!
 //! ## 调参依据
 //!
-//! 4 RPS / burst=8 是阶段 7 A/B 前的保守起点:
+//! 12 RPS / burst=24 是当前默认(2026-09 跑 1812 文件 weekly 用例 ~1h 完成, 未触发 132):
 //! - 单文件 share-direct 路径里, 一次转存 ≈ 1 次 /share/transfer + 1 次 /share/taskquery
 //!   + 1 次自动下载触发, 即 ~3 个百度请求
-//! - 4 RPS × 3 请求 ≈ 12 RPS 实际打到百度域, 这与百度对 web 端 cookie 客户端的
-//!   宽松上限相比仍有安全距离(经验值 ~30 RPS 才触发 132)
-//! - burst 8 让"短时刚启动 4 worker 同时 submit"不至于立即被截
+//! - 12 RPS × 3 请求 ≈ 36 RPS 实际打到百度域, 经验值 ~30 RPS 才触发 132; 多订阅
+//!   并发时实际均摊远低于 36
+//! - burst 24 让"短时刚启动 4 worker 同时 submit + 多订阅抢桶"不至于立即被截
 //!
-//! 阶段 7 metric(errno=132 频次)若仍偏高, 调到 2 RPS / burst=4。
+//! 若监控到 errno=132 频次上升, 降到 8 RPS / burst=16。
 
 use governor::{
     clock::DefaultClock,

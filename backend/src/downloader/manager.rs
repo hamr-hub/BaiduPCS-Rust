@@ -40,6 +40,18 @@ pub const REQUEUE_COOLDOWN_SECS: i64 = 60;
 /// 改为标记为 `Failed` 以避免死循环 / 队列堵塞。普通单文件任务从第 1 次失败即标记 Failed。
 pub const MAX_START_RETRIES: u32 = 3;
 
+/// 🔥 `auto_requeue_task` 退回重排次数上限
+///
+/// 单个任务被 auto_requeue 退回重排的累计次数。耗尽后不再退回重排，真正置为 Failed，
+/// 让上层（文件夹重试 / 用户）接手 —— 否则某些失败原因（如远端拒绝响应）会让任务
+/// 整个文件夹永远到不了终态。
+///
+/// 置为 Failed 后，文件夹层面的 `MAX_SUBTASK_AUTO_RETRIES` 会再给几次机会，
+/// 仍失败才计入 `failed_count`，文件夹得以正常收尾。
+///
+/// (R-fix 2026-09-23: 467a3c3 refactor 漏删该常量但保留调用点，此处恢复。)
+pub const MAX_AUTO_REQUEUE: u32 = 5;
+
 /// 🔥 自动退回队列请求（scheduler → manager 消息）
 ///
 /// scheduler 不能直接调 `manager.auto_requeue_task`（manager 在 scheduler
@@ -5760,6 +5772,8 @@ impl DownloadManager {
             decrypt_epoch: 0,
             // 🔥 R22: 解密原子提交标志（历史任务已是 Completed，无关运行时收尾）
             decrypt_committed: false,
+            // 🔥 收尾/解密协程已 spawn 标记（历史任务无遗留协程，从 false 开始）
+            finalize_spawned: false,
         })
     }
 

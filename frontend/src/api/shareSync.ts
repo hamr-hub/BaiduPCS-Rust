@@ -107,6 +107,8 @@ export interface RunRecord {
   skipped_count: number
   overwritten_count: number
   error: string | null
+  /** 运行阶段（'scanning' | 'transferring' | 'finalizing' 等）；仅运行中有值,终态由后端置空 */
+  phase?: string | null
 }
 
 export interface RunItemRecord {
@@ -136,6 +138,8 @@ export interface RunDetail {
   skipped_count: number
   overwritten_count: number
   error: string | null
+  /** 运行阶段（'scanning' | 'transferring' | 'finalizing' 等）；仅运行中有值,终态由后端置空 */
+  phase?: string | null
   items: RunItemRecord[]
   item_total_count: number
   item_page: number
@@ -233,6 +237,19 @@ export type ShareSyncWsEvent =
   eta_seconds?: number | null
   /** 文件夹子文件行指向文件夹那一行的 `folder:{id}`；顶层行缺省 */
   parent_task_id?: string | null
+  owner_uid?: number
+}
+  | {
+  /** 扫描阶段进度（scanning phase）— 由后端 ShareSyncEvent::ScanProgress 对齐 */
+  type: 'scan_progress'
+  run_id: string
+  subscription_id: string
+  dirs_done: number
+  dirs_pending: number
+  files_seen: number
+  current_dir: string
+  attempt: number
+  cached_hits: number
   owner_uid?: number
 }
 

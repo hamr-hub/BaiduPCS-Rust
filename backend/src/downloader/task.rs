@@ -211,6 +211,18 @@ pub struct DownloadTask {
     /// 一旦置位永不回退（任务即将进入 Completed 终态，回退无意义）。
     #[serde(skip)]
     pub decrypt_committed: bool,
+
+    /// 🔥 收尾/解密协程已 spawn 标记
+    ///
+    /// 用于在 `auto_requeue_task` 退回重排前检查：若任务已经进入收尾/解密窗口
+    /// （已下完、已 spawn 收尾协程、已进入 Decrypting），则不退回重排，
+    /// 避免双 finalize 抢同一临时文件 / 新旧写者并发写同一文件导致"大小对但内容坏"。
+    ///
+    /// 仅 `#[serde(skip)]`：纯运行时状态，重启后从 false 开始也安全（重启不会有遗留协程）。
+    ///
+    /// (R-fix 2026-09-23: 905dbaa 同步上游 v2.1.6 时漏删该字段但保留多处读写，此处恢复。)
+    #[serde(skip)]
+    pub finalize_spawned: bool,
 }
 
 impl DownloadTask {
@@ -263,6 +275,8 @@ impl DownloadTask {
             decrypt_epoch: 0,
             // 🔥 解密原子提交标志初始化
             decrypt_committed: false,
+            // 🔥 收尾/解密协程已 spawn 标记初始化
+            finalize_spawned: false,
         }
     }
 

@@ -1,9 +1,19 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+
+// 读 package.json 的 version,经 define 在编译期注入到 __APP_VERSION__ 全局常量
+// (R-fix 2026-09-23: 之前漏加 define,导致 src/utils/version.ts 报 TS2552)
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const pkg = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8')) as { version: string }
 
 // https://vitejs.dev/config/
 export default defineConfig({
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
   plugins: [vue()],
   resolve: {
     alias: {

@@ -1,5 +1,6 @@
 # Rust
 /backend/target/
+/decrypt-cli/target/
 **/*.rs.bk
 *.pdb
 .pids/

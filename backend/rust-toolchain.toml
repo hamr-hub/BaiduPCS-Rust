@@ -1,3 +1,6 @@
+# 使用 stable 通道而非固定版本号：
+# 1) 本机 rustup 客户端下载指定历史版本必超时（curl 同一文件正常），锁死版本号会导致 cargo 无法拉取工具链
+# 2) stable 当前即 1.99.0，且能持续跟进上游安全更新
 [toolchain]
-channel = "1.87.0"
+channel = "stable"
 components = ["rustfmt", "clippy"]

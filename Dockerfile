@@ -1,8 +1,13 @@
 # 多阶段构建 Dockerfile
+# 容器内所有包源均走国内镜像，避免直连 deb.debian.org / registry.npmjs.org / crates.io 超时
+
 # Stage 1: 前端构建
-FROM node:18-alpine AS frontend-builder
+FROM node:22-alpine AS frontend-builder
 
 WORKDIR /app/frontend
+
+# 使用国内 npm 镜像
+RUN npm config set registry https://registry.npmmirror.com
 
 # 复制前端依赖文件
 COPY frontend/package*.json ./
@@ -17,9 +22,29 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: 后端构建
-FROM rust:1.87-slim AS backend-builder
+FROM rust:1.99-slim AS backend-builder
 
 WORKDIR /app
+
+# 使用国内 apt 镜像（rust 官方镜像基于 Debian）
+# 注意：必须连协议一起替换。Debian 源文件里是 http://，而本机明文 HTTP 出站被拦截，
+# 只换域名会得到不可达的 http://mirrors.aliyun.com
+RUN sed -i -e 's|http://deb.debian.org|https://mirrors.aliyun.com|g' \
+           -e 's|http://security.debian.org|https://mirrors.aliyun.com|g' \
+           /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i -e 's|http://deb.debian.org|https://mirrors.aliyun.com|g' \
+           -e 's|http://security.debian.org|https://mirrors.aliyun.com|g' \
+           /etc/apt/sources.list
+
+# 使用国内 crates.io 镜像，否则 cargo 拉依赖会卡在 crates.io
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+RUN mkdir -p /usr/local/cargo && printf '%s\n' \
+    '[source.crates-io]' \
+    'replace-with = "tuna"' \
+    '' \
+    '[source.tuna]' \
+    'registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"' \
+    > /usr/local/cargo/config.toml
 
 # 安装构建依赖
 RUN apt-get update && apt-get install -y \
@@ -46,6 +71,14 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 
 WORKDIR /app
+
+# 使用国内 apt 镜像（同样需要连协议一起替换，见 backend-builder 阶段说明）
+RUN sed -i -e 's|http://deb.debian.org|https://mirrors.aliyun.com|g' \
+           -e 's|http://security.debian.org|https://mirrors.aliyun.com|g' \
+           /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i -e 's|http://deb.debian.org|https://mirrors.aliyun.com|g' \
+           -e 's|http://security.debian.org|https://mirrors.aliyun.com|g' \
+           /etc/apt/sources.list
 
 # 安装运行时依赖
 RUN apt-get update && apt-get install -y \

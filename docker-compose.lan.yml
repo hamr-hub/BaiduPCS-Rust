@@ -1,0 +1,57 @@
+# 局域网部署配置（不暴露公网）
+# 用法: docker compose -f docker-compose.lan.yml up -d
+#
+# 与 docker-compose.yml 的差异:
+#   1. 端口只绑定局域网 IP，不绑 0.0.0.0，公网 IPv6 入口不开放
+#   2. 下载目录挂载到宿主机 /home/hyx/Downloads
+#
+# ⚠️ 认证相关漏洞已于 2026-10-06 修复（web_auth 中间件改为白名单并挂到顶层路由、
+#    update_config/totp_verify 等端点补会话校验、pending_token 真实校验、
+#    X-Forwarded-For 不再无条件采信）。即便如此，**对公网开放前仍必须先在
+#    设置页启用「密码 + 双因素认证」**——默认 mode=none 时本服务对能访问到它的
+#    任何人不设防。
+
+services:
+  baidu-netdisk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: baidu-netdisk-rust
+    image: baidu-netdisk-rust:latest
+    ports:
+      # 只监听内网网卡；公网 IPv6 地址不绑定
+      - "192.168.1.6:18888:18888"
+    volumes:
+      - ./config:/app/config
+      # 下载目录：宿主机 /home/hyx/Downloads -> 容器 /app/downloads
+      - /home/hyx/Downloads:/app/downloads
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./wal:/app/wal
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+      - BAIDUPCS_RATE_LIMIT_RPS=8
+      - BAIDUPCS_RATE_LIMIT_BURST=16
+      - BAIDUPCS_RATE_LIMIT_ENABLED=1
+    restart: unless-stopped
+    networks:
+      - baidu-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18888/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+networks:
+  baidu-network:
+    driver: bridge

@@ -43,6 +43,13 @@ pub struct WebAuthConfig {
     pub enabled: bool,
     /// 认证模式
     pub mode: AuthMode,
+    /// 是否信任 `X-Forwarded-For` / `X-Real-IP` 头
+    ///
+    /// 仅当服务部署在**可信**反向代理之后时才可开启：
+    /// 直连公网时任何人都能伪造这两个头，限流按伪造 IP 记账等同于没有限流。
+    /// 缺省（false）时使用 TCP 对端地址作为客户端 IP。
+    #[serde(default)]
+    pub trust_forwarded_for: bool,
 }
 
 impl Default for WebAuthConfig {
@@ -50,6 +57,7 @@ impl Default for WebAuthConfig {
         Self {
             enabled: false,
             mode: AuthMode::None,
+            trust_forwarded_for: false,
         }
     }
 }

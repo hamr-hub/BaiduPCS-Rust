@@ -281,14 +281,33 @@ async fn main() -> anyhow::Result<()> {
     info!("Web 认证状态初始化完成 (模式: {:?})", config.web_auth.mode);
 
     // 配置中间件层
+    //
+    // CORS 白名单取自 config 的 server.cors_origins：
+    // 之前这里硬编码 allow_origin(Any)，配置项形同虚设——公网部署时
+    // 任何网站都能对本服务发起跨源请求。含 "*" 时才放行全部。
+    let cors_layer = {
+        let origins = app_state.config.read().await.server.cors_origins.clone();
+        let wildcard = origins.iter().any(|o| o.trim() == "*");
+        let mut layer = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+        if wildcard {
+            info!("CORS: 允许任意来源（server.cors_origins = [\"*\"]）");
+            layer = layer.allow_origin(Any);
+        } else if origins.is_empty() {
+            info!("CORS: 未配置允许来源，仅同源访问");
+        } else {
+            info!("CORS: 允许来源 {:?}", origins);
+            let parsed: Vec<axum::http::HeaderValue> = origins
+                .iter()
+                .filter_map(|o| o.parse::<axum::http::HeaderValue>().ok())
+                .collect();
+            layer = layer.allow_origin(parsed);
+        }
+        layer
+    };
+
     let middleware = ServiceBuilder::new()
         .layer(TraceLayer::new_for_http()) // HTTP 请求日志
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        );
+        .layer(cors_layer);
 
     // API 路由
     let api_routes = Router::new()
@@ -702,12 +721,7 @@ async fn main() -> anyhow::Result<()> {
             app_state.clone(),
             server::middleware::readonly_middleware,
         ))
-        .with_state(app_state.clone())
-        // 🔥 应用 Web 认证中间件到所有 API 路由
-        .layer(middleware::from_fn_with_state(
-            web_auth_state.clone(),
-            web_auth::web_auth_middleware,
-        ));
+        .with_state(app_state.clone());
 
     // 🔥 Web 访问认证 API 路由（使用独立的 WebAuthState）
     let web_auth_routes = Router::new()
@@ -764,12 +778,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 构建完整应用
+    //
+    // Web 认证中间件挂在**最外层**：必须同时覆盖 /api/v1 与 /api/v1/web-auth
+    // 两个子路由——只挂在其中一个上，另一个就完全不设防（历史缺陷）。
     let app = Router::new()
         .nest("/api/v1", api_routes)
         .nest("/api/v1/web-auth", web_auth_routes)
         .route("/health", get(health_check))
         .fallback_service(static_service)
-        .layer(middleware);
+        .layer(middleware)
+        .layer(middleware::from_fn_with_state(
+            web_auth_state.clone(),
+            web_auth::web_auth_middleware,
+        ));
 
     // 🔥 绑定端口并启动服务器
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -782,7 +803,11 @@ async fn main() -> anyhow::Result<()> {
     info!("前端页面: http://{}/", addr);
 
     // 🔥 使用 select! 监听关闭信号，支持优雅关闭
-    let server = axum::serve(listener, app);
+    //    with_connect_info 让登录限流能拿到真实对端地址（而非可伪造的 X-Forwarded-For）
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    );
 
     tokio::select! {
         result = server => {

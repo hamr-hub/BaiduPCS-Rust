@@ -40,6 +40,9 @@ const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000] // 指数退避
 const HEARTBEAT_INTERVAL = 30000 // 30秒心跳
 const HEARTBEAT_TIMEOUT = 60000 // 60秒超时
 
+// Web 认证 access token 的本地存储键（与 api/client.ts 保持一致）
+const WEB_AUTH_ACCESS_TOKEN_KEY = 'web_auth_access_token'
+
 class WebSocketClient {
   private static instance: WebSocketClient | null = null
 
@@ -85,6 +88,9 @@ class WebSocketClient {
 
   /**
    * 获取 WebSocket URL
+   *
+   * 浏览器无法为 WebSocket 握手设置 Authorization 头，因此令牌通过
+   * `?token=` 查询参数传递（后端仅对 /api/v1/ws 这一条路径接受该形式）。
    */
   private getWsUrl(): string {
     const isDev = import.meta.env?.DEV ?? false
@@ -92,7 +98,12 @@ class WebSocketClient {
     const host = window.location.host
     // 开发环境走 Vite 代理 /ws -> 8080；生产环境同域直连
     const path = isDev ? '/ws/api/v1/ws' : '/api/v1/ws'
-    return `${protocol}//${host}${path}`
+    const token = localStorage.getItem(WEB_AUTH_ACCESS_TOKEN_KEY)
+    if (!token) {
+      // 未登录时不发起连接；此时后端会拒绝握手
+      return `${protocol}//${host}${path}`
+    }
+    return `${protocol}//${host}${path}?token=${encodeURIComponent(token)}`
   }
 
   /**

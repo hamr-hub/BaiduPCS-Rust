@@ -11,9 +11,16 @@ use crate::web_auth::rate_limiter::RateLimiter;
 use crate::web_auth::store::AuthStore;
 use crate::web_auth::token::TokenService;
 use crate::web_auth::types::{AuthCredentials, AuthMode, WebAuthConfig};
+use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
+
+/// 待验证令牌有效期（秒）——密码通过后，签发 TOTP 两步登录的临时凭证
+const PENDING_TOKEN_TTL_SECS: i64 = 300;
+
+/// 待验证令牌最大存量，防止未完成的两步登录堆积
+const PENDING_TOKEN_MAX_ENTRIES: usize = 64;
 
 /// Web 认证状态
 ///
@@ -29,6 +36,10 @@ pub struct WebAuthState {
     pub rate_limiter: Arc<RateLimiter>,
     /// 凭证存储
     pub auth_store: Arc<AuthStore>,
+    /// 两步登录的待验证令牌：token -> 过期时间戳（秒）
+    ///
+    /// 第一步（密码）成功后签发，第二步（TOTP）必须携带且只能消费一次。
+    pub pending_tokens: Arc<DashMap<String, i64>>,
 }
 
 impl WebAuthState {
@@ -51,7 +62,54 @@ impl WebAuthState {
             token_service: Arc::new(TokenService::new(jwt_secret)),
             rate_limiter: Arc::new(RateLimiter::new()),
             auth_store,
+            pending_tokens: Arc::new(DashMap::new()),
         }
+    }
+
+    /// 签发待验证令牌（密码 + TOTP 两步登录的第一步）
+    pub fn issue_pending_token(&self) -> String {
+        use rand::Rng;
+
+        self.purge_expired_pending_tokens();
+
+        // 存量超限时丢弃最早的条目，防止无限增长
+        while self.pending_tokens.len() >= PENDING_TOKEN_MAX_ENTRIES {
+            let Some(oldest) = self
+                .pending_tokens
+                .iter()
+                .min_by_key(|entry| *entry.value())
+                .map(|entry| entry.key().clone())
+            else {
+                break;
+            };
+            self.pending_tokens.remove(&oldest);
+        }
+
+        let bytes: Vec<u8> = (0..32).map(|_| rand::rng().random()).collect();
+        let token = format!("pending_{}", hex::encode(bytes));
+        let now = chrono::Utc::now().timestamp();
+        self.pending_tokens
+            .insert(token.clone(), now + PENDING_TOKEN_TTL_SECS);
+        token
+    }
+
+    /// 消费待验证令牌：存在且未过期则消费成功（单次有效）
+    pub fn consume_pending_token(&self, token: &str) -> bool {
+        match self.pending_tokens.remove(token) {
+            Some((_, expires_at)) => chrono::Utc::now().timestamp() <= expires_at,
+            None => false,
+        }
+    }
+
+    /// 清理已过期的待验证令牌
+    pub fn purge_expired_pending_tokens(&self) {
+        let now = chrono::Utc::now().timestamp();
+        self.pending_tokens.retain(|_, expires_at| *expires_at > now);
+    }
+
+    /// 当前未过期的待验证令牌数量
+    pub fn pending_token_count(&self) -> usize {
+        self.pending_tokens.len()
     }
 
     /// 启动清理任务
@@ -190,6 +248,7 @@ mod tests {
         let new_config = WebAuthConfig {
             enabled: true,
             mode: AuthMode::Password,
+            trust_forwarded_for: false,
         };
         state.update_config(new_config).await;
 
@@ -198,6 +257,56 @@ mod tests {
             .token_service
             .is_refresh_token_valid(&pair.refresh_token));
         assert_eq!(state.get_auth_mode().await, AuthMode::Password);
+    }
+
+    #[tokio::test]
+    async fn test_pending_token_single_use() {
+        let state = create_test_state();
+
+        let token = state.issue_pending_token();
+        assert_eq!(state.pending_token_count(), 1);
+
+        // 伪造的令牌无法消费
+        assert!(!state.consume_pending_token("pending_deadbeef"));
+        assert!(!state.consume_pending_token(""));
+
+        // 真实令牌可消费一次
+        assert!(state.consume_pending_token(&token));
+        // 二次使用失败（单次有效）
+        assert!(!state.consume_pending_token(&token));
+        assert_eq!(state.pending_token_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pending_token_expired() {
+        let state = create_test_state();
+
+        // 直接塞一个已过期的令牌
+        state
+            .pending_tokens
+            .insert("pending_expired".to_string(), chrono::Utc::now().timestamp() - 1);
+        assert!(!state.consume_pending_token("pending_expired"));
+    }
+
+    #[tokio::test]
+    async fn test_pending_tokens_purge_and_cap() {
+        let state = create_test_state();
+
+        // 塞入超过上限的过期令牌，应被清理
+        for i in 0..(PENDING_TOKEN_MAX_ENTRIES * 2) {
+            state.pending_tokens.insert(
+                format!("pending_old_{}", i),
+                chrono::Utc::now().timestamp() - 60,
+            );
+        }
+        state.purge_expired_pending_tokens();
+        assert_eq!(state.pending_token_count(), 0);
+
+        // 连续签发不会无限增长
+        for _ in 0..(PENDING_TOKEN_MAX_ENTRIES * 2) {
+            state.issue_pending_token();
+        }
+        assert!(state.pending_token_count() <= PENDING_TOKEN_MAX_ENTRIES);
     }
 
     #[tokio::test]

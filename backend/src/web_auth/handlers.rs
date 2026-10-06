@@ -15,14 +15,18 @@ use crate::web_auth::{
     WebAuthState,
 };
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 use tracing::{debug, info, warn};
+
+use super::middleware::{
+    AuthErrorResponse, OptionalAuthenticatedUser, WEB_AUTH_EXPIRED_STATUS,
+};
 
 // ============================================================================
 // Request/Response Types
@@ -313,34 +317,102 @@ impl ErrorResponse {
 // Helper Functions
 // ============================================================================
 
-/// 从请求中提取客户端 IP
-fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
-    // 尝试从 X-Forwarded-For 获取
-    if let Some(forwarded) = headers.get("x-forwarded-for") {
-        if let Ok(value) = forwarded.to_str() {
-            if let Some(ip) = value.split(',').next() {
-                return ip.trim().to_string();
+/// 从请求中提取客户端 IP（用于登录限流记账）
+///
+/// 默认使用 TCP 对端地址。`X-Forwarded-For` / `X-Real-IP` 只有在
+/// `web_auth.trust_forwarded_for = true`（即确有可信反向代理）时才采信——
+/// 直连公网时这两个头可被任意伪造，照单全收等于限流形同虚设。
+fn extract_client_ip(
+    headers: &axum::http::HeaderMap,
+    peer: Option<SocketAddr>,
+    trust_forwarded_for: bool,
+) -> String {
+    if trust_forwarded_for {
+        if let Some(forwarded) = headers.get("x-forwarded-for") {
+            if let Ok(value) = forwarded.to_str() {
+                if let Some(ip) = value.split(',').next() {
+                    let ip = ip.trim();
+                    if !ip.is_empty() {
+                        return ip.to_string();
+                    }
+                }
+            }
+        }
+
+        if let Some(real_ip) = headers.get("x-real-ip") {
+            if let Ok(value) = real_ip.to_str() {
+                let ip = value.trim();
+                if !ip.is_empty() {
+                    return ip.to_string();
+                }
             }
         }
     }
 
-    // 尝试从 X-Real-IP 获取
-    if let Some(real_ip) = headers.get("x-real-ip") {
-        if let Ok(value) = real_ip.to_str() {
-            return value.trim().to_string();
+    // 兜底：对端地址（IPv6 只取前 4 组，够用且不泄露接口标识）
+    match peer {
+        Some(SocketAddr::V4(addr)) => addr.ip().to_string(),
+        Some(SocketAddr::V6(addr)) => {
+            let segments = addr.ip().segments();
+            format!(
+                "{:x}:{:x}:{:x}:{:x}::",
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3]
+            )
         }
+        None => "unknown".to_string(),
     }
-
-    // 默认返回 unknown
-    "unknown".to_string()
 }
 
-/// 生成待验证令牌（用于两步验证）
-fn generate_pending_token() -> String {
-    use rand::Rng;
-    let mut rng = rand::rng();
-    let bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
-    format!("pending_{}", hex::encode(bytes))
+/// 敏感端点（改认证配置 / 设置密码 / 启用停用 2FA）的统一鉴权闸门
+///
+/// 中间件已经挡掉未认证请求，这里是第二道防线：中间件一旦被移动到别处或
+/// 绕过，这些 handler 自身仍然要求会话，不会退化成「任何人都能关掉全站认证」。
+///
+/// 规则：
+/// 1. **尚未设置密码**（首次部署引导）：放行，否则没人能完成初始配置
+/// 2. **认证模式为 None**（运维显式关闭了认证）：放行——此时整个服务本就没有
+///    任何保护，且必须保留管理员重新打开认证的入口
+/// 3. 其余情况：必须有有效会话
+///
+/// 返回 `Some(response)` 表示拒绝，调用方直接返回它。
+async fn require_session(
+    state: &Arc<WebAuthState>,
+    user: &OptionalAuthenticatedUser,
+) -> Option<Response> {
+    let (auth_mode, has_password) = {
+        let config = state.config.read().await;
+        let credentials = state.credentials.read().await;
+        (config.mode, credentials.has_password())
+    };
+
+    if !has_password || auth_mode == AuthMode::None {
+        return None;
+    }
+
+    if user.is_authenticated() {
+        return None;
+    }
+
+    Some(
+        (
+            StatusCode::from_u16(WEB_AUTH_EXPIRED_STATUS).unwrap_or(StatusCode::UNAUTHORIZED),
+            Json(AuthErrorResponse::web_auth_expired("该操作需要先登录")),
+        )
+            .into_response(),
+    )
+}
+
+/// 读取客户端 IP（登录与 TOTP 端点共用）
+async fn client_ip_of(
+    state: &Arc<WebAuthState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: &axum::http::HeaderMap,
+) -> String {
+    let trust_forwarded_for = state.config.read().await.trust_forwarded_for;
+    extract_client_ip(headers, peer.map(|ci| ci.0), trust_forwarded_for)
 }
 
 // ============================================================================
@@ -360,10 +432,12 @@ fn generate_pending_token() -> String {
 /// 4. 恢复码登录：提供 recovery_code（可选 pending_token）
 pub async fn login(
     State(state): State<Arc<WebAuthState>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    let client_ip = extract_client_ip(&headers);
+    let trust_forwarded_for = state.config.read().await.trust_forwarded_for;
+    let client_ip = extract_client_ip(&headers, peer.map(|ci| ci.0), trust_forwarded_for);
     debug!("Login attempt from IP: {}", client_ip);
 
     // 检查是否被速率限制
@@ -561,7 +635,19 @@ async fn handle_password_totp_login(
     req: &LoginRequest,
 ) -> (StatusCode, Json<LoginResponse>) {
     // 如果有 pending_token，说明是第二步（TOTP 验证）
-    if let Some(_pending_token) = &req.pending_token {
+    //
+    // pending_token 必须是本服务在第一步（密码校验通过）签发的、且未使用过的：
+    // 否则攻击者只要带上任意字符串就能跳过密码直接进入 TOTP 环节。
+    if let Some(pending_token) = &req.pending_token {
+        if !state.consume_pending_token(pending_token) {
+            state.rate_limiter.record_failure(client_ip);
+            warn!("Invalid or expired pending_token: IP={}", client_ip);
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(LoginResponse::error("请先验证密码")),
+            );
+        }
+
         // 验证 TOTP
         let totp_code = match &req.totp_code {
             Some(c) => c,
@@ -644,8 +730,8 @@ async fn handle_password_totp_login(
 
         match PasswordManager::verify_password(password, password_hash) {
             Ok(true) => {
-                // 密码正确，返回 pending_token，要求 TOTP 验证
-                let pending_token = generate_pending_token();
+                // 密码正确，签发 pending_token，要求 TOTP 验证
+                let pending_token = state.issue_pending_token();
                 debug!("Password verified, requiring TOTP: IP={}", client_ip);
                 (
                     StatusCode::OK,
@@ -676,11 +762,22 @@ async fn handle_recovery_code_login(
     let auth_mode = state.get_auth_mode().await;
 
     // 如果是 PasswordTotp 模式，需要先验证密码（通过 pending_token）
-    if auth_mode == AuthMode::PasswordTotp && pending_token.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(LoginResponse::error("请先验证密码")),
-        );
+    // pending_token 必须真实且未使用过——只判断 is_none() 等于没有校验
+    if auth_mode == AuthMode::PasswordTotp {
+        let Some(pending_token) = pending_token else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(LoginResponse::error("请先验证密码")),
+            );
+        };
+        if !state.consume_pending_token(pending_token) {
+            state.rate_limiter.record_failure(client_ip);
+            warn!("Invalid or expired pending_token (recovery): IP={}", client_ip);
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(LoginResponse::error("请先验证密码")),
+            );
+        }
     }
 
     // 验证恢复码
@@ -883,8 +980,14 @@ pub async fn get_config(State(state): State<Arc<WebAuthState>>) -> impl IntoResp
 /// 更新认证配置，配置变更时使所有会话失效
 pub async fn update_config(
     State(state): State<Arc<WebAuthState>>,
+    user: OptionalAuthenticatedUser,
     Json(req): Json<UpdateConfigRequest>,
 ) -> impl IntoResponse {
+    // 必须已登录：否则任何人都能 PUT {"mode":"none"} 关掉全站认证
+    if let Some(denied) = require_session(&state, &user).await {
+        return denied;
+    }
+
     let mut config = state.config.read().await.clone();
     let old_mode = config.mode;
 
@@ -999,8 +1102,14 @@ async fn persist_web_auth_config(config: &crate::web_auth::WebAuthConfig) -> Res
 /// POST /api/v1/web-auth/password/set
 pub async fn set_password(
     State(state): State<Arc<WebAuthState>>,
+    user: OptionalAuthenticatedUser,
     Json(req): Json<SetPasswordRequest>,
 ) -> impl IntoResponse {
+    // 已设置密码后，改密码必须登录（引导期无密码时放行）
+    if let Some(denied) = require_session(&state, &user).await {
+        return denied;
+    }
+
     // 验证密码强度
     if let Err(e) = PasswordManager::validate_strength(&req.password) {
         return (StatusCode::BAD_REQUEST, Json(ErrorResponse::from_error(&e))).into_response();
@@ -1081,7 +1190,15 @@ pub async fn set_password(
 /// POST /api/v1/web-auth/totp/setup
 ///
 /// 生成新的 TOTP 密钥和 QR 码
-pub async fn totp_setup(State(_state): State<Arc<WebAuthState>>) -> impl IntoResponse {
+pub async fn totp_setup(
+    State(state): State<Arc<WebAuthState>>,
+    user: OptionalAuthenticatedUser,
+) -> impl IntoResponse {
+    // 2FA 密钥只能由已登录的管理员生成
+    if let Some(denied) = require_session(&state, &user).await {
+        return denied;
+    }
+
     let secret = TOTPManager::generate_secret();
     let issuer = "BaiduPCS-Rust";
     let account = "admin";
@@ -1116,8 +1233,29 @@ pub async fn totp_setup(State(_state): State<Arc<WebAuthState>>) -> impl IntoRes
 /// 验证 TOTP 码并启用双因素认证
 pub async fn totp_verify(
     State(state): State<Arc<WebAuthState>>,
+    user: OptionalAuthenticatedUser,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<TotpVerifyRequest>,
 ) -> impl IntoResponse {
+    // 该端点会用请求体里的 secret 覆盖已存储的 2FA 密钥——未授权即可永久接管账号
+    if let Some(denied) = require_session(&state, &user).await {
+        return denied;
+    }
+
+    // 6 位验证码只有 100 万种组合，必须限流，否则可被在线爆破
+    let client_ip = client_ip_of(&state, peer, &headers).await;
+    if let Some(remaining) = state.rate_limiter.is_locked(&client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::bad_request(&format!(
+                "尝试过于频繁，请在 {} 秒后重试",
+                remaining
+            ))),
+        )
+            .into_response();
+    }
+
     let secret = match &req.secret {
         Some(s) => s.clone(),
         None => {
@@ -1170,6 +1308,7 @@ pub async fn totp_verify(
             }
 
             info!("TOTP enabled successfully");
+            state.rate_limiter.reset(&client_ip);
             (
                 StatusCode::OK,
                 Json(RegenerateCodesResponse {
@@ -1178,11 +1317,15 @@ pub async fn totp_verify(
             )
                 .into_response()
         }
-        Ok(false) | Err(_) => (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse::unauthorized("TOTP 验证失败")),
-        )
-            .into_response(),
+        Ok(false) | Err(_) => {
+            state.rate_limiter.record_failure(&client_ip);
+            warn!("TOTP setup verification failed: IP={}", client_ip);
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::unauthorized("TOTP 验证失败")),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1193,8 +1336,28 @@ pub async fn totp_verify(
 /// 禁用双因素认证（需要 TOTP 码或恢复码验证）
 pub async fn totp_disable(
     State(state): State<Arc<WebAuthState>>,
+    user: OptionalAuthenticatedUser,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<TotpDisableRequest>,
 ) -> impl IntoResponse {
+    if let Some(denied) = require_session(&state, &user).await {
+        return denied;
+    }
+
+    // 验证用的 TOTP 码同样可被爆破，必须限流
+    let client_ip = client_ip_of(&state, peer, &headers).await;
+    if let Some(remaining) = state.rate_limiter.is_locked(&client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::bad_request(&format!(
+                "尝试过于频繁，请在 {} 秒后重试",
+                remaining
+            ))),
+        )
+            .into_response();
+    }
+
     let credentials = state.credentials.read().await;
 
     // 验证 TOTP 码或恢复码
@@ -1212,14 +1375,26 @@ pub async fn totp_disable(
         false
     };
 
+    // 恢复码必须立即作废：否则同一个码可以反复用来关闭 2FA
+    let used_recovery_code_index = req.recovery_code.as_ref().and_then(|code| {
+        RecoveryCodeManager::verify_code(code, &credentials.recovery_codes)
+    });
+
     drop(credentials);
 
     if !verified {
+        state.rate_limiter.record_failure(&client_ip);
         return (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse::unauthorized("验证失败")),
         )
             .into_response();
+    }
+
+    if let Some(index) = used_recovery_code_index {
+        if let Err(e) = state.auth_store.mark_recovery_code_used(index).await {
+            warn!("Failed to mark recovery code as used: {}", e);
+        }
     }
 
     // 清除 TOTP 配置
@@ -1239,6 +1414,7 @@ pub async fn totp_disable(
     }
 
     info!("TOTP disabled successfully");
+    state.rate_limiter.reset(&client_ip);
     (
         StatusCode::OK,
         Json(SuccessResponse::with_message("双因素认证已禁用")),
@@ -1257,8 +1433,28 @@ pub async fn totp_disable(
 /// 重新生成恢复码（需要 TOTP 验证）
 pub async fn regenerate_recovery_codes(
     State(state): State<Arc<WebAuthState>>,
+    user: OptionalAuthenticatedUser,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RegenerateCodesRequest>,
 ) -> impl IntoResponse {
+    if let Some(denied) = require_session(&state, &user).await {
+        return denied;
+    }
+
+    // 该端点用 TOTP 码换一整套新恢复码，同样需要限流
+    let client_ip = client_ip_of(&state, peer, &headers).await;
+    if let Some(remaining) = state.rate_limiter.is_locked(&client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::bad_request(&format!(
+                "尝试过于频繁，请在 {} 秒后重试",
+                remaining
+            ))),
+        )
+            .into_response();
+    }
+
     let credentials = state.credentials.read().await;
 
     // 验证 TOTP 码
@@ -1299,6 +1495,7 @@ pub async fn regenerate_recovery_codes(
             }
 
             info!("Recovery codes regenerated successfully");
+            state.rate_limiter.reset(&client_ip);
             (
                 StatusCode::OK,
                 Json(RegenerateCodesResponse {
@@ -1307,10 +1504,72 @@ pub async fn regenerate_recovery_codes(
             )
                 .into_response()
         }
-        Ok(false) | Err(_) => (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse::unauthorized("TOTP 验证失败")),
-        )
-            .into_response(),
+        Ok(false) | Err(_) => {
+            state.rate_limiter.record_failure(&client_ip);
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse::unauthorized("TOTP 验证失败")),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn peer_v4() -> Option<SocketAddr> {
+        Some("203.0.113.7:54321".parse().unwrap())
+    }
+
+    /// 回归测试：直连公网时不得采信 X-Forwarded-For，否则限流可被逐次轮换 IP 绕过
+    #[test]
+    fn test_client_ip_ignores_forwarded_headers_by_default() {
+        let headers = headers_with(&[
+            ("x-forwarded-for", "1.2.3.4"),
+            ("x-real-ip", "5.6.7.8"),
+        ]);
+        let ip = extract_client_ip(&headers, peer_v4(), false);
+        assert_eq!(ip, "203.0.113.7");
+    }
+
+    #[test]
+    fn test_client_ip_trusts_forwarded_headers_when_configured() {
+        let headers = headers_with(&[("x-forwarded-for", "1.2.3.4, 9.9.9.9")]);
+        assert_eq!(extract_client_ip(&headers, peer_v4(), true), "1.2.3.4");
+        assert_eq!(extract_client_ip(&headers, peer_v4(), false), "203.0.113.7");
+    }
+
+    #[test]
+    fn test_client_ip_falls_back_when_no_peer() {
+        let ip = extract_client_ip(&HeaderMap::new(), None, false);
+        assert_eq!(ip, "unknown");
+    }
+
+    #[test]
+    fn test_client_ip_truncates_ipv6() {
+        let peer = Some("[2001:db8:85a3:8d3:1319:8a2e:370:7348]:443".parse().unwrap());
+        let ip = extract_client_ip(&HeaderMap::new(), peer, false);
+        assert_eq!(ip, "2001:db8:85a3:8d3::");
+    }
+
+    /// 伪造的空 XFF 不得覆盖真实对端地址
+    #[test]
+    fn test_client_ip_ignores_empty_forwarded_value() {
+        let headers = headers_with(&[("x-forwarded-for", "   ")]);
+        assert_eq!(extract_client_ip(&headers, peer_v4(), true), "203.0.113.7");
     }
 }

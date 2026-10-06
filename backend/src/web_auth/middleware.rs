@@ -20,7 +20,7 @@ use crate::web_auth::types::{AuthMode, TokenClaims};
 use axum::{
     body::Body,
     extract::State,
-    http::{header, Request, StatusCode},
+    http::{header, Method, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -38,7 +38,7 @@ const ACCESS_TOKEN_COOKIE: &str = "web_auth_access_token";
 /// Web 认证专用 HTTP 状态码
 /// 使用 419 (Page Expired / Session Expired) 来区分 Web 认证失败和百度账号认证失败
 /// 百度账号认证失败使用标准 401，Web 认证失败使用 419
-const WEB_AUTH_EXPIRED_STATUS: u16 = 419;
+pub const WEB_AUTH_EXPIRED_STATUS: u16 = 419;
 
 /// 认证错误响应
 #[derive(Debug, Serialize)]
@@ -58,73 +58,50 @@ impl AuthErrorResponse {
     }
 }
 
-/// 需要绕过认证的路径前缀
-/// 注意：由于中间件应用在嵌套路由上，路径是相对于 /api/v1 的
-const AUTH_BYPASS_PREFIXES: &[&str] = &[
-    "/web-auth/", // Web 认证相关端点（相对路径）
-    "/auth/",     // 百度认证相关端点（二维码登录等）
-    "/ws",        // WebSocket 端点
-    // 完整路径（用于非嵌套路由）
-    "/api/v1/web-auth/",
-    "/api/v1/auth/",
-    "/api/v1/ws",
-    "/health",
+/// 无需认证即可访问的**只读**端点
+///
+/// 登录页需要据此渲染当前认证状态；仅返回若干布尔值，不含任何凭据。
+/// 注意 `PUT /api/v1/web-auth/config`（改认证模式）**不在**此列。
+const PUBLIC_READ_PATHS: &[&str] = &[
+    "/api/v1/web-auth/status",
+    "/api/v1/web-auth/config",
 ];
 
-/// 需要绕过认证的精确路径
-const AUTH_BYPASS_EXACT: &[&str] = &[
-    // 相对路径（用于嵌套路由）
-    "/web-auth/status",
-    "/web-auth/login",
-    "/web-auth/refresh",
-    // 完整路径（用于非嵌套路由）
-    "/api/v1/web-auth/status",
+/// 无需认证即可访问的**登录类**端点（凭据本身就在请求体中）
+const PUBLIC_LOGIN_PATHS: &[&str] = &[
     "/api/v1/web-auth/login",
     "/api/v1/web-auth/refresh",
 ];
 
-/// 检查路径是否需要绕过认证
-fn should_bypass_auth(path: &str) -> bool {
-    // 检查精确匹配
-    if AUTH_BYPASS_EXACT.contains(&path) {
-        return true;
-    }
+/// WebSocket 路径
+///
+/// 浏览器无法为 WebSocket 握手设置自定义 Header，因此令牌通过
+/// 查询参数 `?token=` 传递，仅此一条路径做特例放行（仍需校验令牌）。
+const WS_PATH: &str = "/api/v1/ws";
 
-    // 检查前缀匹配
-    for prefix in AUTH_BYPASS_PREFIXES {
-        if path.starts_with(prefix) {
-            return true;
-        }
-    }
-
-    // 静态资源（非 API 路径，且不是相对 API 路径）
-    // 相对路径以 / 开头但不以 /api/ 开头
+/// 检查请求是否可匿名访问
+///
+/// 设计原则：默认拒绝。白名单按「方法 + 精确路径」双重匹配，
+/// 其余 `/api/` 下的所有端点（含百度账号、配置、本地文件、加密密钥等）
+/// 一律要求已认证会话。绝不能改成前缀匹配——一旦前缀过宽，鉴权会被整体绕过。
+fn is_public_request(method: &Method, path: &str) -> bool {
+    // 静态资源与 SPA 路由（不属于 /api/ 前缀）公开
     if !path.starts_with("/api/") {
-        // 检查是否是嵌套路由的相对路径（以 / 开头的 API 端点）
-        // 这些路径应该需要认证
-        let api_relative_paths = [
-            "/files",
-            "/downloads",
-            "/uploads",
-            "/transfers",
-            "/fs/",
-            "/config",
-            "/autobackup/",
-            "/encryption/",
-            "/system/",
-        ];
-
-        for api_path in api_relative_paths {
-            if path.starts_with(api_path) {
-                return false;
-            }
-        }
-
-        // 其他非 API 路径（静态资源）
         return true;
     }
 
-    false
+    // 健康检查
+    if path == "/health" {
+        return true;
+    }
+
+    match *method {
+        // 只读状态查询
+        Method::GET | Method::HEAD => PUBLIC_READ_PATHS.contains(&path),
+        // 登录 / 刷新
+        Method::POST => PUBLIC_LOGIN_PATHS.contains(&path),
+        _ => false,
+    }
 }
 
 /// 从请求中提取 Access Token
@@ -160,7 +137,54 @@ fn extract_access_token(request: &Request<Body>) -> Option<String> {
         }
     }
 
+    // 3. WebSocket 路径：浏览器无法设置握手 Header，令牌走查询参数
+    if request.uri().path() == WS_PATH {
+        if let Some(query) = request.uri().query() {
+            for pair in query.split('&') {
+                if let Some(value) = pair.strip_prefix("token=") {
+                    let token = urldecode(value);
+                    if !token.is_empty() {
+                        return Some(token);
+                    }
+                }
+            }
+        }
+    }
+
     None
+}
+
+/// 最小化 URL 解码（仅处理 `%XX`，避免为一个小功能引入额外依赖）
+fn urldecode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex_pair = &input[i + 1..i + 3];
+                match u8::from_str_radix(hex_pair, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Web 认证中间件
@@ -179,8 +203,8 @@ pub async fn web_auth_middleware(
     let path = request.uri().path();
     let method = request.method().clone();
 
-    // 检查是否需要绕过认证
-    if should_bypass_auth(path) {
+    // 白名单请求直接放行（登录/刷新/状态查询/健康检查/静态资源）
+    if is_public_request(&method, path) {
         debug!("Auth bypass for path: {} {}", method, path);
         return next.run(request).await;
     }
@@ -327,53 +351,118 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_bypass_auth_exact_paths() {
-        // 相对路径（嵌套路由）
-        assert!(should_bypass_auth("/web-auth/status"));
-        assert!(should_bypass_auth("/web-auth/login"));
-        assert!(should_bypass_auth("/web-auth/refresh"));
-        // 完整路径
-        assert!(should_bypass_auth("/api/v1/web-auth/status"));
-        assert!(should_bypass_auth("/api/v1/web-auth/login"));
-        assert!(should_bypass_auth("/api/v1/web-auth/refresh"));
+    fn test_public_read_endpoints() {
+        assert!(is_public_request(&Method::GET, "/health"));
+        assert!(is_public_request(&Method::GET, "/api/v1/web-auth/status"));
+        assert!(is_public_request(&Method::GET, "/api/v1/web-auth/config"));
     }
 
     #[test]
-    fn test_should_bypass_auth_prefixes() {
-        // 相对路径（嵌套路由）
-        assert!(should_bypass_auth("/web-auth/config"));
-        assert!(should_bypass_auth("/auth/qrcode/generate"));
-        assert!(should_bypass_auth("/auth/qrcode/status"));
-        assert!(should_bypass_auth("/ws"));
-        // 完整路径
-        assert!(should_bypass_auth("/api/v1/web-auth/config"));
-        assert!(should_bypass_auth("/api/v1/auth/qrcode/generate"));
-        assert!(should_bypass_auth("/health"));
-        assert!(should_bypass_auth("/api/v1/ws"));
+    fn test_public_login_endpoints() {
+        assert!(is_public_request(&Method::POST, "/api/v1/web-auth/login"));
+        assert!(is_public_request(&Method::POST, "/api/v1/web-auth/refresh"));
+    }
+
+    /// 关键回归：改认证模式的 PUT 与只读 GET 同路径，写操作必须要求认证
+    #[test]
+    fn test_update_auth_config_requires_auth() {
+        assert!(!is_public_request(&Method::PUT, "/api/v1/web-auth/config"));
+        assert!(!is_public_request(&Method::POST, "/api/v1/web-auth/config"));
+        assert!(!is_public_request(&Method::DELETE, "/api/v1/web-auth/config"));
+        // 近似路径不得命中白名单
+        assert!(!is_public_request(&Method::GET, "/api/v1/web-auth/config/x"));
     }
 
     #[test]
-    fn test_should_bypass_auth_static_resources() {
-        assert!(should_bypass_auth("/"));
-        assert!(should_bypass_auth("/index.html"));
-        assert!(should_bypass_auth("/assets/main.js"));
-        assert!(should_bypass_auth("/favicon.ico"));
+    fn test_static_resources_are_public() {
+        for method in [Method::GET, Method::HEAD, Method::POST] {
+            assert!(is_public_request(&method, "/"));
+            assert!(is_public_request(&method, "/index.html"));
+            assert!(is_public_request(&method, "/assets/main.js"));
+            assert!(is_public_request(&method, "/favicon.ico"));
+            // SPA 前端路由
+            assert!(is_public_request(&method, "/settings"));
+        }
+    }
+
+    /// 公网暴露的回归测试：以下端点一旦出现在白名单里就是全线失守
+    #[test]
+    fn test_baidu_auth_endpoints_require_auth() {
+        // /api/v1/auth/user 会返回 BDUSS 与完整 Cookie 串
+        for method in [Method::GET, Method::POST] {
+            assert!(!is_public_request(&method, "/api/v1/auth/user"));
+            assert!(!is_public_request(&method, "/api/v1/auth/cookie/login"));
+            assert!(!is_public_request(&method, "/api/v1/auth/qrcode/generate"));
+            assert!(!is_public_request(&method, "/api/v1/auth/qrcode/status"));
+            assert!(!is_public_request(&method, "/api/v1/auth/logout"));
+        }
+    }
+
+    /// 回归测试：web-auth 凭据管理端点必须要求已认证会话
+    #[test]
+    fn test_web_auth_management_endpoints_require_auth() {
+        for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+            assert!(!is_public_request(&method, "/api/v1/web-auth/password/set"));
+            assert!(!is_public_request(&method, "/api/v1/web-auth/totp/setup"));
+            assert!(!is_public_request(&method, "/api/v1/web-auth/totp/verify"));
+            assert!(!is_public_request(&method, "/api/v1/web-auth/totp/disable"));
+            assert!(!is_public_request(
+                &method,
+                "/api/v1/web-auth/recovery-codes/regenerate"
+            ));
+            assert!(!is_public_request(&method, "/api/v1/web-auth/logout"));
+        }
+    }
+
+    /// 中间件挂在顶层 Router 上，`uri().path()` 恒为绝对路径，
+    /// 因此这里只断言 `/api/v1/...` 形式（`/files` 这类相对路径是 SPA 路由，属静态资源）
+    #[test]
+    fn test_api_paths_require_auth() {
+        for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+            assert!(!is_public_request(&method, "/api/v1/files"));
+            assert!(!is_public_request(&method, "/api/v1/downloads"));
+            assert!(!is_public_request(&method, "/api/v1/uploads"));
+            assert!(!is_public_request(&method, "/api/v1/config"));
+            assert!(!is_public_request(&method, "/api/v1/autobackup/configs"));
+            // 旧版本遗漏在 api_relative_paths 里的敏感前缀
+            assert!(!is_public_request(&method, "/api/v1/accounts/list"));
+            assert!(!is_public_request(&method, "/api/v1/shares"));
+            assert!(!is_public_request(&method, "/api/v1/cloud-sync/connections"));
+            assert!(!is_public_request(&method, "/api/v1/local-files"));
+            assert!(!is_public_request(&method, "/api/v1/proxy/status"));
+            assert!(!is_public_request(&method, "/api/v1/encryption/export-keys"));
+            assert!(!is_public_request(&method, "/api/v1/fs/list"));
+            // WebSocket 同样需要令牌（通过查询参数传递）
+            assert!(!is_public_request(&method, "/api/v1/ws"));
+        }
     }
 
     #[test]
-    fn test_should_not_bypass_auth_protected_paths() {
-        // 相对路径（嵌套路由）
-        assert!(!should_bypass_auth("/files"));
-        assert!(!should_bypass_auth("/downloads"));
-        assert!(!should_bypass_auth("/uploads"));
-        assert!(!should_bypass_auth("/config"));
-        assert!(!should_bypass_auth("/autobackup/configs"));
-        // 完整路径
-        assert!(!should_bypass_auth("/api/v1/files"));
-        assert!(!should_bypass_auth("/api/v1/downloads"));
-        assert!(!should_bypass_auth("/api/v1/uploads"));
-        assert!(!should_bypass_auth("/api/v1/config"));
-        assert!(!should_bypass_auth("/api/v1/autobackup/configs"));
+    fn test_extract_token_from_ws_query() {
+        let request = Request::builder()
+            .uri("/api/v1/ws?token=ws_token_789")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(extract_access_token(&request), Some("ws_token_789".to_string()));
+    }
+
+    #[test]
+    fn test_extract_token_from_ws_query_urlencoded() {
+        let request = Request::builder()
+            .uri("/api/v1/ws?token=a%2Bb%2Fc%3D&other=1")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(extract_access_token(&request), Some("a+b/c=".to_string()));
+    }
+
+    /// 非 WebSocket 路径上的 token 查询参数必须被忽略（避免令牌出现在日志/Referer 里）
+    #[test]
+    fn test_query_token_ignored_on_other_paths() {
+        let request = Request::builder()
+            .uri("/api/v1/files?token=leaked_token")
+            .body(Body::empty())
+            .unwrap();
+        assert!(extract_access_token(&request).is_none());
     }
 
     #[test]

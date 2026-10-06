@@ -10,6 +10,30 @@ use tokio::sync::RwLock;
 /// 默认认证凭证文件路径
 pub const DEFAULT_AUTH_STORE_PATH: &str = "config/auth.json";
 
+/// 把凭证文件权限收紧到 0600（仅属主可读写）
+///
+/// 失败只告警不阻断：权限收紧失败不该让整个认证系统不可用，
+/// 但必须在日志里留下痕迹（默认 umask 下该文件会是 0644）。
+async fn restrict_to_owner(path: &Path) -> Result<(), WebAuthError> {
+    #[cfg(unix)]
+    {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = tokio::fs::set_permissions(path, Permissions::from_mode(0o600)).await {
+            tracing::warn!("无法将凭证文件权限收紧到 0600: {:?} ({})", path, e);
+            return Err(WebAuthError::StorageError(format!(
+                "设置文件权限失败: {}",
+                e
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// 认证凭证存储
 ///
 /// 负责管理 `config/auth.json` 文件的读写操作。
@@ -71,6 +95,10 @@ impl AuthStore {
 
         let mut guard = self.credentials.write().await;
         *guard = credentials;
+        drop(guard);
+
+        // 历史遗留的 0644 文件在这里被顺带收紧
+        let _ = restrict_to_owner(&self.path).await;
 
         tracing::info!("认证凭证已加载: {:?}", self.path);
         Ok(())
@@ -94,6 +122,9 @@ impl AuthStore {
         fs::write(&self.path, content)
             .await
             .map_err(|e| WebAuthError::StorageError(format!("写入凭证文件失败: {}", e)))?;
+
+        // 凭证文件含 Argon2 密码哈希与 TOTP 密钥，绝不能是全局可读
+        restrict_to_owner(&self.path).await?;
 
         tracing::info!("认证凭证已保存: {:?}", self.path);
         Ok(())
@@ -261,6 +292,42 @@ mod tests {
         assert!(!creds.has_password());
         assert!(!creds.has_totp());
         assert_eq!(creds.available_recovery_codes_count(), 0);
+    }
+
+    /// 凭证文件含密码哈希与 TOTP 密钥，权限必须是 0600
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_credentials_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, _temp) = create_test_store().await;
+        store.set_password_hash("dummy_hash".to_string()).await.unwrap();
+
+        let metadata = std::fs::metadata(&store.path).unwrap();
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o600,
+            "凭证文件权限必须为 0600，实际为 {:o}",
+            metadata.permissions().mode() & 0o777
+        );
+    }
+
+    /// 历史遗留的 0644 文件在 load 时被顺带收紧
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_load_tightens_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = AuthStore::new(&path);
+        store.load().await.unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[tokio::test]

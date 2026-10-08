@@ -1,9 +1,7 @@
 // 本地文件系统 API 封装
 
 import axios from 'axios'
-
-// 本地存储键名（与 webAuth store 保持一致）
-const WEB_AUTH_ACCESS_TOKEN_KEY = 'web_auth_access_token'
+import { addWebAuthInterceptor } from './client'
 
 const apiClient = axios.create({
   baseURL: '/api/v1',
@@ -11,16 +9,7 @@ const apiClient = axios.create({
 })
 
 // 添加 Web 认证拦截器
-apiClient.interceptors.request.use(
-    (config) => {
-      const token = localStorage.getItem(WEB_AUTH_ACCESS_TOKEN_KEY)
-      if (token) {
-        config.headers.Authorization = `Bearer ${token}`
-      }
-      return config
-    },
-    (error) => Promise.reject(error)
-)
+addWebAuthInterceptor(apiClient)
 
 export interface ApiResponse<T> {
   code: number

@@ -1,23 +1,13 @@
 import axios from 'axios'
+import { addWebAuthInterceptor } from './client'
 import type { ApiResponse, FileEntry, ListDirectoryResponse, SortField, SortOrder } from './filesystem'
-
-const WEB_AUTH_ACCESS_TOKEN_KEY = 'web_auth_access_token'
 
 const apiClient = axios.create({
     baseURL: '/api/v1',
     timeout: 30000,
 })
 
-apiClient.interceptors.request.use(
-    (config) => {
-        const token = localStorage.getItem(WEB_AUTH_ACCESS_TOKEN_KEY)
-        if (token) {
-            config.headers.Authorization = `Bearer ${token}`
-        }
-        return config
-    },
-    (error) => Promise.reject(error)
-)
+addWebAuthInterceptor(apiClient)
 
 export type { FileEntry, ListDirectoryResponse, SortField, SortOrder }
 

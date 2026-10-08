@@ -136,8 +136,12 @@ function addRefreshSubscriber(callback: (token: string) => void): void {
  * 为 axios 实例添加 Web 认证拦截器
  * 自动在请求头中添加 Authorization header
  * 处理 419 Web 认证失败，尝试刷新令牌后重试请求
+ *
+ * 所有 api 模块都必须挂这个拦截器——不只是走 createApiClient 的那些。
+ * 只挂请求头而不处理 419 的话，access token 一过期（15 分钟），
+ * 该模块的请求就会直接失败并把 419 抛给页面。
  */
-function addWebAuthInterceptor(client: AxiosInstance): void {
+export function addWebAuthInterceptor(client: AxiosInstance): void {
     // 请求拦截器：添加 Authorization header
     client.interceptors.request.use(
         (config) => {

@@ -1,12 +1,10 @@
 import axios from 'axios'
+import { addWebAuthInterceptor } from './client'
 import { ElMessage } from 'element-plus'
 import type {
   MultiAccountBudgetConfig,
   VipRecommendedConfig as MultiAccountVipRecommendedConfig,
 } from './budget'
-
-// 本地存储键名（与 webAuth store 保持一致）
-const WEB_AUTH_ACCESS_TOKEN_KEY = 'web_auth_access_token'
 
 const apiClient = axios.create({
   baseURL: '/api/v1',
@@ -14,16 +12,7 @@ const apiClient = axios.create({
 })
 
 // 添加 Web 认证拦截器
-apiClient.interceptors.request.use(
-    (config) => {
-      const token = localStorage.getItem(WEB_AUTH_ACCESS_TOKEN_KEY)
-      if (token) {
-        config.headers.Authorization = `Bearer ${token}`
-      }
-      return config
-    },
-    (error) => Promise.reject(error)
-)
+addWebAuthInterceptor(apiClient)
 
 // 响应拦截器
 apiClient.interceptors.response.use(

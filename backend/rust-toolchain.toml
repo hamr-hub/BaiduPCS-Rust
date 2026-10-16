@@ -1,3 +1,7 @@
 [toolchain]
-channel = "1.87.0"
+# 注意：这里必须写 toolchain 名字，不能写 "1.99.0"。
+# 本机 rustup 只装了 stable（其 rustc 版本为 1.99.0），写成字面版本号会让
+# rustup 去下载 `1.99.0-aarch64-unknown-linux-gnu` 并 404。CI 那边用
+# dtolnay/rust-toolchain 显式钉 1.99.0，两边指向同一个 rustc 版本。
+channel = "stable"
 components = ["rustfmt", "clippy"]

@@ -2,7 +2,7 @@
 name = "baidu-netdisk-rust"
 version = "2.2.4"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.99"
 
 [dependencies]
 # Web框架（启用 WebSocket 支持）

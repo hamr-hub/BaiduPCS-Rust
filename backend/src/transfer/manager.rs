@@ -1280,6 +1280,37 @@ let share_root = derive_share_root(task_share_root_path.as_deref(), &filtered_fi
                     .collect::<Vec<_>>()
             );
 
+            // 🔥 主动按单批文件数上限切批（2026-10-16 修复 task_errno=-30）
+            //
+            // 百度单次转存有文件数上限，超了整批被拒且不落盘（见
+            // `transfer_batch_file_limit` 的注释）。这里在发起任何请求之前就把
+            // 超限的目录组切成若干片，每片仍然投到**同一个** `relative_parent`
+            // 目标目录 —— 远端目录结构必须保持 share 里的样子，所以这里只切文件
+            // 列表、不动路径。切完的每一片就是一个独立批次，走下面完全相同的
+            // 流程（errno=2 重试、临时错误退避、失败汇总）。
+            let batch_file_limit = transfer_batch_file_limit();
+            let mut expanded_groups: Vec<(String, Vec<SharedFileInfo>)> = Vec::new();
+            for (relative_parent, files) in groups.into_iter() {
+                if files.len() <= batch_file_limit {
+                    expanded_groups.push((relative_parent, files));
+                    continue;
+                }
+                let chunk_count = files.len().div_ceil(batch_file_limit);
+                info!(
+                    "目录组 {} 有 {} 个文件，超过单批上限 {}，主动切成 {} 批提交",
+                    if relative_parent.is_empty() { "<root>" } else { &relative_parent },
+                    files.len(),
+                    batch_file_limit,
+                    chunk_count
+                );
+                for chunk in files.chunks(batch_file_limit) {
+                    expanded_groups.push((relative_parent.clone(), chunk.to_vec()));
+                }
+            }
+            // 切批后批次总数会变（日志里的「批次 x/N」要跟着变），原来那个
+            // `total_groups = groups.len()` 是按目录组数算的，不能再直接用。
+            let total_batches = expanded_groups.len();
+
             let mut all_results: Vec<(usize, String, Vec<SharedFileInfo>, Result<TransferResult>)> =
                 Vec::new();
 
@@ -1291,12 +1322,12 @@ let share_root = derive_share_root(task_share_root_path.as_deref(), &filtered_fi
                 }
             }
 
-            for (batch_idx, (relative_parent, group_files)) in groups.into_iter().enumerate() {
+            for (batch_idx, (relative_parent, group_files)) in expanded_groups.into_iter().enumerate() {
                 let batch_num = batch_idx + 1;
 
                 // 检查取消
                 if cancellation_token.is_cancelled() {
-                    warn!("分批转存被取消: batch {}/{}", batch_num, total_groups);
+                    warn!("分批转存被取消: batch {}/{}", batch_num, total_batches);
                     break;
                 }
 
@@ -1309,7 +1340,7 @@ let share_root = derive_share_root(task_share_root_path.as_deref(), &filtered_fi
                 info!(
                     "转存批次 {}/{}: {} 个文件 -> {} (原始父目录={})",
                     batch_num,
-                    total_groups,
+                    total_batches,
                     group_files.len(),
                     group_target_dir,
                     if relative_parent.is_empty() {
@@ -1393,7 +1424,7 @@ let share_root = derive_share_root(task_share_root_path.as_deref(), &filtered_fi
                     warn!(
                         "批次 {}/{} 遇到临时错误，{:?} 后第 {}/{} 次重试: {}",
                         batch_num,
-                        total_groups,
+                        total_batches,
                         backoff,
                         transient_attempt,
                         max_transient,
@@ -1426,7 +1457,7 @@ let share_root = derive_share_root(task_share_root_path.as_deref(), &filtered_fi
                             warn!(
                             "批次 {}/{} 撞到转存文件数上限，开始抓取该批子树并拆分重提: {} 个条目 -> {}",
                             batch_num,
-                            total_groups,
+                            total_batches,
                             group_files.len(),
                             group_target_dir
                         );
@@ -1476,13 +1507,13 @@ let share_root = derive_share_root(task_share_root_path.as_deref(), &filtered_fi
                 };
                 info!(
                     "批次 {}/{} 结果: success={}",
-                    batch_num, total_groups, batch_ok
+                    batch_num, total_batches, batch_ok
                 );
 
                 all_results.push((batch_num, relative_parent, group_files, result));
 
                 // 批次之间添加防抖延时
-                if batch_num < total_groups {
+                if batch_num < total_batches {
                     tokio::time::sleep(Duration::from_millis(800)).await;
                 }
             }
@@ -1492,7 +1523,80 @@ let share_root = derive_share_root(task_share_root_path.as_deref(), &filtered_fi
                 warn!("分批转存已取消，跳过结果合并");
                 (Err(anyhow::anyhow!("分批转存被用户取消")), None)
             } else {
-                let (merged, groups_info) = merge_batch_results(all_results, &save_path);
+                let (mut merged, groups_info) = merge_batch_results(all_results, &save_path);
+
+                // 🔥 分享直下 + 分批转存的 task_errno=-30 冲突恢复（2026-10-16 修复）
+                //
+                // 单文件路径的 -30 早就经 handle_transfer_error → recover_from_conflict
+                // 恢复掉了。但分批路径的子批次 Err 在 merge_batch_results 里被聚合成
+                // 「所有批次转存失败: ...」并以 Ok(merged) 返回，**完全没经过
+                // handle_transfer_error** —— 恢复逻辑一次都没跑过。
+                // 症状：share-sync 每轮固定 120 个 /bars/monthly 文件失败，
+                // 日志里既没有「分享直下模式检测到 -30 错误，尝试恢复」也没有
+                // 「从 -30 冲突恢复失败」，最终错误是原始 task_errno 串。
+                //
+                // 前提在 share_direct + batch 下是满足的：selected_files 由
+                // share_sync::submit_download_batch 填好（transfer/manager.rs
+                // 的「恢复所需的 selected_files 信息缺失」分支不会命中），
+                // 且 recover_from_conflict 本身就带 group_* 子目录扫描段。
+                //
+                // 这里只改 TransferResult：下游 start_auto_download 是拿
+                // transferred_paths 去和 file_list 做 path/文件名匹配来定位本地落点的
+                // （manager.rs:2145 附近），BatchGroupInfo 只被 is_batch 日志用到，
+                // 所以 groups_info 原样传下去即可。
+                let batch_err = merged.error.clone().unwrap_or_default();
+                if is_share_direct_download
+                    && Self::extract_task_errno(&batch_err) == Some(-30)
+                {
+                    info!(
+                        "分批转存检测到 -30 错误，尝试冲突恢复: task_id={}, error={}",
+                        task_id, batch_err
+                    );
+                    match Self::recover_from_conflict(&task, &client).await {
+                        Ok(recovered_items) => {
+                            let already: HashSet<&str> =
+                                merged.transferred_paths.iter().map(|s| s.as_str()).collect();
+                            let mut gained_paths = Vec::new();
+                            let mut gained_fs_ids = Vec::new();
+                            let mut gained_from = Vec::new();
+                            for (name, fs_id_opt, path_opt, source_share_path) in
+                                &recovered_items
+                            {
+                                // path_opt 缺失说明回查结果不自洽，跳过而不是拼个假路径
+                                let Some(path) = path_opt else {
+                                    warn!("-30 恢复项 {} 缺少远端路径，跳过", name);
+                                    continue;
+                                };
+                                // 部分成功的批次已经把路径收进 merged 了，别重复收
+                                if already.contains(path.as_str()) {
+                                    continue;
+                                }
+                                gained_paths.push(path.clone());
+                                // fs_id 用于下载；文件夹 fs_id 为 None，填 0
+                                gained_fs_ids.push(fs_id_opt.unwrap_or(0));
+                                gained_from.push(source_share_path.clone());
+                            }
+                            if gained_paths.is_empty() {
+                                warn!(
+                                    "-30 恢复未取回新文件，保持原状态: task_id={}",
+                                    task_id
+                                );
+                            } else {
+                                let gained = gained_paths.len();
+                                merged.transferred_paths.extend(gained_paths);
+                                merged.transferred_fs_ids.extend(gained_fs_ids);
+                                merged.from_paths.extend(gained_from);
+                                merged.success = true;
+                                merged.error = None;
+                                info!(
+                                    "分批转存 -30 恢复成功，补回 {} 个文件: task_id={}",
+                                    gained, task_id
+                                );
+                            }
+                        }
+                        Err(e) => warn!("分批转存 -30 恢复失败: {}", e),
+                    }
+                }
 
                 // 如果有部分失败警告，保存到内存状态并持久化
                 if merged.success {
@@ -5372,8 +5476,21 @@ fn group_files_by_parent_dir(
 ///
 /// 原 `group_files_by_parent_dir` 按每个文件的完整父目录分 group，对深 tree
 /// （year=YYYY/month=MM/day=DD/file）一个 share 产生 1000+ group、1000+ API
-/// 调用。这里改按「share_root 下一级」聚合（取 share_root 后面再剥一层，
-/// 如 weekly/year=YYYY）—— 同 year 的文件进同一 group，~36 组替代 1064 组。
+/// 调用。这里改按「share_root 下**前两级**」聚合，如 `bars/weekly/year=1996`
+/// —— 同 year 的文件进同一 group，~74 组替代上千组。
+///
+/// 为什么必须保留**两级**而不是一级（2026-10-16 修复 task_errno=-30）：
+/// 这个 share 的结构是 `bars/weekly/year=YYYY/YYYY.parquet` 与
+/// `bars/monthly/year=YYYY/YYYY.parquet`，两条兄弟子树里存在同名文件
+/// （weekly/year=1990/1990.parquet 与 monthly/year=1990/1990.parquet，全量 42 对）。
+/// 旧实现只取一级 key（`bars`），把两条子树**扁平化合并**进同一个临时目标目录
+/// `temp/UUID/bars/`，百度转存遇到同名文件直接整批拒绝：异步任务返回
+/// `task_errno=-30` 且一个文件都不落盘（症状：120 个 bars 文件每轮 100% 失败）。
+/// 取到第二级后同名文件各自落在 `bars/weekly/...` 与 `bars/monthly/...`，天然不撞。
+///
+/// 安全性：key 里保留的目录段会原样拼到临时目标目录（save_path/relative_parent），
+/// `ensure_dirs_exist` 支持逐级建嵌套目录；下载侧再按 transferred_path 的相对父目录
+/// 还原本地结构，所以多保留一层不影响最终落盘布局。
 ///
 /// 适用条件：`share_root` 非空（即 share-direct 模式，从临时目录出发）。
 /// 普通转存走原 `group_files_by_parent_dir`，保留完整目录结构。
@@ -5393,12 +5510,13 @@ fn group_files_by_top_level(
         } else {
             parent.trim_start_matches('/').to_string()
         };
-        // 3) 取「share_root 下一级」作为 group key
-        //    例：share_root=/.bpr_share_temp/UUID, rel_parent=weekly/year=1996/month=06/day=14
-        //        → group_key = weekly/year=1996（剥到第二个 / 后）
-        //    没有 / 时（如 rel_parent 为 weekly 或空）→ 整个 rel_parent 当 group key
-        let group_key = match rel_parent.find('/') {
-            Some(idx) => rel_parent[..idx].to_string(),
+        // 3) 取「share_root 下前两级」作为 group key。
+        //    例：rel_parent=bars/weekly/year=1996/month=06 → bars/weekly/year=1996
+        //    不足两级时（bars、bars/weekly 或空）→ 整个 rel_parent 当 key。
+        //    必须保留两级：只取一级会把 weekly/monthly 等同名兄弟子树扁平化合并，
+        //    转存时因同名文件冲突整批 task_errno=-30（见函数头注释）。
+        let group_key = match rel_parent.match_indices('/').nth(1).map(|(i, _)| i) {
+            Some(second_slash) => rel_parent[..second_slash].to_string(),
             None => rel_parent,
         };
         groups
@@ -5430,6 +5548,27 @@ fn transfer_file_limit() -> usize {
 /// 判断转存失败信息是否为「转存文件数超过上限」（对应 errno=12 + target_file_nums 超限）。
 fn is_file_limit_exceeded(err: &str) -> bool {
     err.contains("转存文件数") && err.contains("超过上限")
+}
+
+/// 单次转存请求允许的最大文件数，可用 `BAIDUPCS_TRANSFER_BATCH_FILE_LIMIT` 覆盖。
+///
+/// 百度对「一次转存」有文件数上限，超了**整批被拒**：目标目录里一个文件都不落，
+/// 轮询异步任务时返回 `task_errno=-30` 且 `show_msg` 为空。实测 38 个文件的一批
+/// 能过（stk_factor/fina 全成功），120 个的一批 120 个全废（weekly/bars）。
+///
+/// 为什么必须主动切而不是靠失败驱动：`split_over_limit_batch` 那套惰性拆分
+/// （上面的 `is_file_limit_exceeded`）认的是百度「转存文件数超过上限」的中文文案，
+/// 而 -30 这条错误的 `show_msg` 是空的，两个关键字一个都不出现，永远命中不了。
+/// 结果就是每一轮都拿同样一批超限的文件去撞墙、同样地全灭。
+///
+/// 50 是留了余量的保守值（Baidu 未公开准确上限，且不同账号/会员等级不同）。
+/// 账号侧额度不同就调这个环境变量，不要去改代码。
+fn transfer_batch_file_limit() -> usize {
+    std::env::var("BAIDUPCS_TRANSFER_BATCH_FILE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(50)
 }
 
 /// 用某个批次「展开后的实际单元数」修正进度条分母。

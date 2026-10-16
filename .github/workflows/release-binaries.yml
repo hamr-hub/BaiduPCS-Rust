@@ -72,14 +72,16 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.87.0
+          toolchain: 1.99.0
           targets: ${{ matrix.target }}
 
       - name: Install cargo-zigbuild
         if: matrix.use_zigbuild == true
         run: |
           pip3 install ziglang
-          # Pin to a version compatible with the pinned rustc (1.87); 0.23+ requires rustc 1.88
+          # 注意：rustc pin 已升到 1.99.0（time 0.3.47 / cookie_store 0.22.1 要求 >=1.88），
+          # 这个 0.21.8 的 pin 现在只为保守起见保留，未验证是否仍能在 1.99 上编译。
+          # 若 CI 报 cargo-zigbuild 编译失败，先把它放开到 0.23+ 再重跑。
           cargo install cargo-zigbuild --version 0.21.8 --locked
           # Verify installation by checking if command exists
           command -v cargo-zigbuild || which cargo-zigbuild || echo "cargo-zigbuild installed"

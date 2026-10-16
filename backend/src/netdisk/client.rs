@@ -1201,7 +1201,10 @@ impl NetdiskClient {
 
     /// 获取Locate下载链接（单次尝试，不含重试）
     async fn get_locate_download_url_once(&self, path: &str) -> Result<Vec<String>> {
-        info!("获取Locate下载链接: path={}", path);
+        // 请求级日志（每个文件都会打一条）。share-sync 以 ~20 RPS 连续跑几小时，
+        // 之前这两条用 info! 会产生约 10 亿行 / 144 GB 日志 —— 降到 debug!。
+        // 失败路径的 error! 不受影响，仍然照常输出。
+        debug!("获取Locate下载链接: path={}", path);
 
         // 1. 检查 UID
         if self.uid() == 0 {
@@ -1260,7 +1263,7 @@ impl NetdiskClient {
         };
 
         let status = response.status();
-        info!("Locate 请求响应状态: {} (path={})", status, path);
+        debug!("Locate 请求响应状态: {} (path={})", status, path);
 
         // 5. 检查响应状态
         if !status.is_success() {

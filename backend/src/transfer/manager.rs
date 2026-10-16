@@ -3098,11 +3098,19 @@ let share_root = derive_share_root(task_share_root_path.as_deref(), &filtered_fi
     }
 
     fn share_sync_download_failure_retry_max() -> u32 {
+        // 这是「任务级」失败重试：下载层已在单个任务内部把 chunk 连续失败重试到
+        // MAX_AUTO_REQUEUE(5) 次硬终态 Failed 之后，本 watcher 才会看到 Failed 并
+        // resume 整个任务重来。因此这里的每 1 次都隐含下载层的 5 次 requeue。
+        //
+        // 旧默认 20 → 单个持续失败的文件（百度对转存临时文件长时间不返回可用 dlink）
+        // 会被重试 20×5=100 次、横跨几十分钟，期间 run 一直收不了尾、backend.log 被
+        // 同一条错误刷爆。这种失败不是偶发抖动，短时间重试不会恢复，取 2 作为
+        // 「跨任务重建」的小额兜底即可；确需更激进可通过环境变量调大。
         std::env::var("BAIDUPCS_SHARE_SYNC_DOWNLOAD_FAILURE_RETRY_MAX")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(20)
+            .unwrap_or(2)
     }
 
     async fn restart_failed_downloads_once(

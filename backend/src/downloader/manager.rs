@@ -1075,6 +1075,10 @@ impl DownloadManager {
         backup_notification_tx: Option<tokio::sync::mpsc::UnboundedSender<BackupTransferNotification>>,
         // 🔥 文件夹子任务终态失败必须回告 FolderDownloadManager（见函数尾部说明）
         chunk_scheduler: ChunkScheduler,
+        // true = 调用方已耗尽另一套重试预算（目前只有 auto_requeue_task 的
+        // MAX_AUTO_REQUEUE），跳过 start_retry_count 启动重试直接落终态，
+        // 避免两套独立预算互相续命造成无限重试。prepare/register 失败传 false。
+        force_terminal: bool,
     ) {
         // 🔥 一次性读取需要的字段，避免持锁过久
         let (
@@ -1112,7 +1116,18 @@ impl DownloadManager {
 
         // 🔥 文件夹子任务或备份任务：有重试机会，走 start_retry_count 循环
         //    与 0 延迟路径保持一致，避免出现"prepare/register 失败无限重入队"
-        if (is_folder_subtask || is_backup) && start_retry_count < MAX_START_RETRIES {
+        //
+        // `force_terminal`：调用方（auto_requeue_task 耗尽 MAX_AUTO_REQUEUE 时）已判定
+        // 这是「下载阶段反复失败」的硬终态。这里**不得**再走 start_retry_count 重试
+        // 分支——那是另一套独立预算（prepare/register 阶段），数据路径失败时它恒为 0。
+        // 旧实现只看 start_retry_count，导致「下载失败 5 次 → requeue 耗尽 → 这里
+        // 又给 3 次启动重试 → 每次 register 成功清零 start_retry_count → 再下载失败
+        // 5 次……」永不进入 Failed：任务烧槽位刷日志几十分钟，所属 run/文件夹也永远
+        // 到不了终态。force_terminal=true 时跳过该分支，直接落终态。
+        if !force_terminal
+            && (is_folder_subtask || is_backup)
+            && start_retry_count < MAX_START_RETRIES
+        {
             warn!(
                 "任务 {} 启动失败（{}），放回等待队列等待重试 (重试 {}/{}, is_backup={}, is_folder_subtask={})",
                 task_id,
@@ -1149,10 +1164,16 @@ impl DownloadManager {
             return;
         }
 
-        // 🔥 进入此分支的三种情形：
+        // 🔥 进入此分支的四种情形：
         //    1) 普通单文件任务（is_folder_subtask=false 且 is_backup=false） → 直接失败
         //    2) 文件夹子任务 / 备份任务但 start_retry_count >= MAX_START_RETRIES → 达上限失败
-        if (is_folder_subtask || is_backup) && start_retry_count >= MAX_START_RETRIES {
+        //    3) force_terminal=true（下载阶段 requeue 预算耗尽）→ 硬终态，不再启动重试
+        if force_terminal {
+            error!(
+                "任务 {} 下载重试次数已达上限 ({})，标记为失败（不再重启）",
+                task_id, MAX_AUTO_REQUEUE
+            );
+        } else if (is_folder_subtask || is_backup) && start_retry_count >= MAX_START_RETRIES {
             error!(
                 "任务 {} 启动重试次数已达上限 ({})，标记为失败",
                 task_id, MAX_START_RETRIES
@@ -1236,6 +1257,29 @@ impl DownloadManager {
 
         // 移除取消令牌
         cancellation_tokens.write().await.remove(&task_id);
+
+        // 🔥 终态必须从等待队列里摘除。
+        //
+        // 走到这里的任务此前可能已经被放回等待队列（auto_requeue 每次退回都 push_back，
+        // 而队列消费点 try_start_waiting_tasks 只看槽位/冷却，不检查任务是否已是终态）。
+        // 只 mark_failed 不出队，下一轮 poll 会把一个 Failed 任务重新拉起走 prepare，
+        // prepare 过程中再撞失败 → 又回到这里：日志上表现为同一个 task_id 每 ~2s
+        // 刷一条「下载重试次数已达上限，标记为失败」，且永远烧着槽位。
+        // start-retry 分支在上方已提前 return（它会重新 push_back），所以这里
+        // 无条件移除不会误伤仍应重试的任务。
+        {
+            let mut queue = waiting_queue.write().await;
+            let before = queue.len();
+            queue.retain(|id| id != &task_id);
+            if queue.len() != before {
+                debug!(
+                    "handle_task_failure: 已将终态任务 {} 移出等待队列 ({} -> {})",
+                    task_id,
+                    before,
+                    queue.len()
+                );
+            }
+        }
     }
 
     /// 🔥 按持有方式释放任务槽位（统一入口，供 auto_requeue / 失败回滚等场景调用）
@@ -1336,6 +1380,28 @@ impl DownloadManager {
             }
         };
 
+        // 🔥 终态幂等闸：任务已 Failed / Completed / Decrypting 时，绝不能再退回重排。
+        //
+        // scheduler 的「死锁慢路」在 active_chunk_count==0 时无条件发 AutoRequeueRequest，
+        // 而一个被标记 Failed 的任务其 chunk 循环可能还在跑（分片回调线程尚未全部退出），
+        // 于是反复触发本函数 → 终态之后又被复活。这里是唯一能拦住所有 requeue 来源
+        // （快路阈值 + 慢路死锁）的单点：已终态直接返回，不重置状态、不入队、不发失败通知。
+        //
+        // （Decrypting 原本由下面的收尾窗口保护覆盖，这里一并显式列出更清晰。）
+        {
+            let t = task.lock().await;
+            if matches!(
+                t.status,
+                TaskStatus::Failed | TaskStatus::Completed | TaskStatus::Decrypting
+            ) {
+                debug!(
+                    "auto_requeue_task: 任务 {} 已为终态 {:?}，忽略退回重排请求（防止终态被复活造成无限重试）",
+                    task_id, t.status
+                );
+                return Ok(());
+            }
+        }
+
         // 🔥 收尾/解密窗口保护：任务已下完（downloaded==total）、已 spawn 收尾协程、
         //   或已进入 Decrypting 时，绝不退回重排——否则会把一个其实已完成的任务
         //   重新下载/重新调度，触发"双 finalize 抢同一临时文件"（错误一）以及新旧
@@ -1383,6 +1449,7 @@ impl DownloadManager {
                     Arc::clone(&self.folder_manager),
                     self.backup_notification_tx.read().await.clone(),
                     self.chunk_scheduler.clone(),
+                    true, // requeue 预算耗尽，硬终态，不再走启动重试
                 )
                     .await;
                 return Ok(());
@@ -2146,6 +2213,7 @@ impl DownloadManager {
                                 folder_manager_arc_clone.clone(),
                                 backup_notification_tx,
                                 chunk_scheduler_for_failure,
+                                false,
                             )
                                 .await;
                         }
@@ -2169,6 +2237,7 @@ impl DownloadManager {
                         folder_manager_arc_clone.clone(),
                         backup_notification_tx,
                         chunk_scheduler_for_failure,
+                        false,
                     )
                         .await;
                 }
@@ -2624,6 +2693,7 @@ impl DownloadManager {
                                 folder_manager_arc_clone.clone(),
                                 backup_notification_tx,
                                 chunk_scheduler_for_failure,
+                                false,
                             )
                             .await;
 
@@ -2649,6 +2719,7 @@ impl DownloadManager {
                         folder_manager_arc_clone.clone(),
                         backup_notification_tx,
                         chunk_scheduler_for_failure,
+                        false,
                     )
                     .await;
 
@@ -2730,6 +2801,7 @@ impl DownloadManager {
                         is_folder_subtask,
                         try_start_group_id,
                         next_retry_at,
+                        is_terminal,
                     ) = {
                         if let Some(task) = self.tasks.read().await.get(&id).cloned() {
                             let t = task.lock().await;
@@ -2739,6 +2811,7 @@ impl DownloadManager {
                                 t.group_id.is_some(),
                                 t.group_id.clone(),
                                 t.next_retry_at,
+                                matches!(t.status, TaskStatus::Failed | TaskStatus::Completed),
                             )
                         } else {
                             // 任务不存在，跳过
@@ -2746,6 +2819,17 @@ impl DownloadManager {
                             continue;
                         }
                     };
+                    // 🔥 终态任务（失败/完成）绝不能再被拉起。它本应在
+                    // handle_task_failure / handle_task_completion 时出队，但任何路径
+                    // 漏删都会让一个 Failed 任务被反复重新 prepare，造成无限重试。
+                    // 这里是最后一道闸：直接丢弃。
+                    if is_terminal {
+                        warn!(
+                            "try_start_waiting_tasks: 等待队列中的任务 {} 已为终态，丢弃不重启",
+                            id
+                        );
+                        continue; // pop_front 已取出，不 push_back 即完成丢弃
+                    }
                     // 🔥 注意：touch_slot 的 owner 选择必须延后到"槽位类型已确定"之后
                     //   - 文件夹 fixed/borrowed 槽位：pool owner = group_id
                     //   - 普通全局 fixed 槽位 / backup 槽位：pool owner = task_id
@@ -3092,6 +3176,15 @@ impl DownloadManager {
                             // 获取任务
                             let task = tasks.read().await.get(&id).cloned();
                             if let Some(task) = task {
+                                // 🔥 终态任务（失败/完成）绝不能再被拉起：pop 出来后不 push_back
+                                //    即丢弃。任何失败/完成路径漏出队都会导致同一任务被无限重启。
+                                if {
+                                    let t = task.lock().await;
+                                    matches!(t.status, TaskStatus::Failed | TaskStatus::Completed)
+                                } {
+                                    warn!("waiting-queue-monitor: 等待队列中的任务 {} 已为终态，丢弃不重启", id);
+                                    continue;
+                                }
                                 // 🔥 获取任务信息：是否需要槽位、是否为备份任务、是否为文件夹子任务、group_id
                                 // 文件夹固定槽位子任务（uses_folder_fixed_slot=true）不需要再申请槽位
                                 let (needs_slot, is_backup, is_folder_subtask, monitor_group_id) = {
@@ -3449,6 +3542,15 @@ impl DownloadManager {
                             // 获取任务
                             let task = tasks.read().await.get(&id).cloned();
                             if let Some(task) = task {
+                                // 🔥 终态任务（失败/完成）绝不能再被拉起：pop 出来后不 push_back
+                                //    即丢弃。任何失败/完成路径漏出队都会导致同一任务被无限重启。
+                                if {
+                                    let t = task.lock().await;
+                                    matches!(t.status, TaskStatus::Failed | TaskStatus::Completed)
+                                } {
+                                    warn!("zero-delay-trigger: 等待队列中的任务 {} 已为终态，丢弃不重启", id);
+                                    continue;
+                                }
                                 // 🔥 获取任务信息：是否需要槽位、是否为备份任务、是否为文件夹子任务、group_id
                                 // 文件夹固定槽位子任务（uses_folder_fixed_slot=true）不需要再申请槽位
                                 let (needs_slot, is_backup, is_folder_subtask, zero_delay_group_id) = {
@@ -4390,6 +4492,13 @@ impl DownloadManager {
                     // 🔥 允许从失败状态重试：重置错误信息
                     old_status = "failed".to_string();
                     t.error = None;
+                    // 🔥 从 Failed 重新拉起 = 一次全新的「任务级重试」，必须重置下载层的
+                    //    chunk requeue 预算，否则 resume 后第一个 chunk 失败就会因为
+                    //    requeue_count 仍 >= MAX_AUTO_REQUEUE 而立刻再次硬终态
+                    //    （日志上表现为同一任务反复刷「下载重试次数已达上限」）。
+                    //    任务级重试总次数由上层（如 share-sync watcher 的
+                    //    BAIDUPCS_SHARE_SYNC_DOWNLOAD_FAILURE_RETRY_MAX）另行封顶。
+                    t.requeue_count = 0;
                 }
                 _ => {
                     anyhow::bail!("任务当前状态不支持恢复: {:?}", t.status);

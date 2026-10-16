@@ -822,6 +822,32 @@ impl ChunkScheduler {
                         continue;
                     }
 
+                    // 🔥 终态守卫：任务已 Failed / Completed 时，调度循环必须立即停止为它派发分片。
+                    //
+                    // 背景：任务因连续 chunk 失败被标记 Failed（或已完成）后，调度主循环可能还没到
+                    // 移除它的分支，残留轮询仍会 select_next_chunk + spawn_chunk_download，产生大量
+                    // 无意义的失败/恢复探测日志，甚至与状态机竞争。auto_requeue_task 虽已对终态幂等
+                    // 拒绝（不再复活），但 scheduler 这里也不该再调度终态任务。
+                    {
+                        let t_status = task_info.task.lock().await.status.clone();
+                        if matches!(
+                            t_status,
+                            crate::downloader::TaskStatus::Failed
+                                | crate::downloader::TaskStatus::Completed
+                        ) {
+                            debug!(
+                                "任务 {} 已为终态 {:?}，从调度器移除，不再派发分片",
+                                task_id, t_status
+                            );
+                            active_tasks.write().await.remove(task_id);
+                            consecutive_empty_rounds += 1;
+                            if consecutive_empty_rounds >= task_count {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+
                     // 🔥 检查任务级并发限制
                     let task_active = task_info.active_chunk_count.load(Ordering::SeqCst);
                     if task_active >= task_info.max_concurrent_chunks {
